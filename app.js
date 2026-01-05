@@ -2726,8 +2726,9 @@ async function handleFileChunk(chunk) {
     updateReceivingProgress(Math.min(99.9, progress));
     
     // Log every 100th chunk or when close to completion to avoid spam
-    if (currentChunkIndex % 100 === 0 || progress > 90) {
-        console.log(`📥 Chunk #${currentChunkIndex}: ${chunkSize} bytes. Total: ${receivingBytesReceived}/${receivingFileSize} (${progress.toFixed(1)}%)`);
+    // NOTE: currentChunkIndex is already incremented, so this shows the NEXT chunk number
+    if ((currentChunkIndex - 1) % 100 === 0 || progress > 90) {
+        console.log(`📥 Chunk #${currentChunkIndex - 1}: ${chunkSize} bytes. Total: ${receivingBytesReceived}/${receivingFileSize} (${progress.toFixed(1)}%), Buffer: ${chunkBuffer.length} chunks`);
     }
     
     // Always check completion when a chunk arrives (especially if signal was received)
@@ -2792,11 +2793,16 @@ async function checkAndCompleteFile() {
     
     completionCheckAttempts++;
     
+    // CRITICAL: Flush any remaining chunks from buffer before checking
+    await flushChunkBuffer();
+    
     // CRITICAL: Verify we received all bytes - read from IndexedDB
     let totalReceived = 0;
+    let chunkCount = 0;
     try {
-        const { totalBytes } = await getTotalBytesFromIndexedDB(receivingFile.name);
-        totalReceived = totalBytes;
+        const result = await getTotalBytesFromIndexedDB(receivingFile.name);
+        totalReceived = result.totalBytes;
+        chunkCount = result.chunkCount;
     } catch (error) {
         console.error('❌ Error reading from IndexedDB:', error);
         // Fallback to tracked counter
@@ -2811,7 +2817,7 @@ async function checkAndCompleteFile() {
     
     // Log every 10th attempt to avoid spam, or if we're close to completion
     if (completionCheckAttempts % 10 === 0 || totalReceived >= receivingFileSize * 0.9) {
-        console.log(`[${completionCheckAttempts}] Checking: ${totalReceived}/${receivingFileSize} bytes (${percentComplete}%), Missing: ${missingBytes}, Signal: ${fileCompleteSignalReceived}, BytesMatch: ${bytesMatch}`);
+        console.log(`[${completionCheckAttempts}] Checking: ${totalReceived}/${receivingFileSize} bytes (${percentComplete}%), Missing: ${missingBytes}, Signal: ${fileCompleteSignalReceived}, BytesMatch: ${bytesMatch}, ChunksInDB: ${chunkCount}, ChunkCounter: ${currentChunkIndex}, BufferSize: ${chunkBuffer.length}`);
     }
     
     // Only proceed if we received the complete file AND got the completion signal
@@ -2822,7 +2828,22 @@ async function checkAndCompleteFile() {
         
         if (fileCompleteSignalReceived && timeSinceLastChunk > STALE_CHUNK_THRESHOLD && completionCheckAttempts > 50) {
             // Signal received, but no chunks for 5+ seconds and we've checked 50+ times
-            console.warn(`No chunks received for ${(timeSinceLastChunk/1000).toFixed(1)}s. Missing ${missingBytes} bytes. Connection may be dead.`);
+            console.warn(`⚠️ No chunks received for ${(timeSinceLastChunk/1000).toFixed(1)}s. Missing ${missingBytes} bytes. Connection may be dead.`);
+            console.warn(`⚠️ Stats: IndexedDB has ${chunkCount} chunks, Counter shows ${currentChunkIndex} chunks, Buffer has ${chunkBuffer.length} chunks`);
+            
+            // Try to request missing chunks from sender (resume from current position)
+            if (dataChannel && dataChannel.readyState === 'open' && missingBytes > 0) {
+                console.log(`🔄 Requesting resume from byte ${totalReceived} (missing ${missingBytes} bytes)`);
+                try {
+                    dataChannel.send(JSON.stringify({
+                        type: 'resume',
+                        fileName: receivingFile.name,
+                        offset: totalReceived
+                    }));
+                } catch (error) {
+                    console.error('❌ Error sending resume request:', error);
+                }
+            }
         }
         
         // Keep checking - chunks might still be arriving
