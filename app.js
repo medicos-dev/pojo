@@ -47,13 +47,13 @@ const WS_URL = getWebSocketURL();
 console.log('WebSocket URL:', WS_URL);
 // Optimized for 200GB+ files: battle-tested stable values
 // Trading 2-5% speed for much higher stability (critical for long transfers)
-const INITIAL_CHUNK_SIZE = 256 * 1024; // 256KB initial chunk size
-const MIN_CHUNK_SIZE = 64 * 1024; // 64KB min chunk size
+const INITIAL_CHUNK_SIZE = 512 * 1024; // 512KB initial chunk size (increased for better throughput on large files)
+const MIN_CHUNK_SIZE = 128 * 1024; // 128KB min chunk size (increased for 200GB+ files)
 // MAX_CHUNK_SIZE will be set dynamically based on SCTP maxMessageSize
 let MAX_CHUNK_SIZE = 2 * 1024 * 1024; // 2MB default (safer than 4MB for stability)
-const BACKPRESSURE_THRESHOLD = 16 * 1024 * 1024; // 16MB backpressure threshold (safer for stability)
-const MAX_BUFFERED_AMOUNT = 32 * 1024 * 1024; // 32MB max - don't send if buffer exceeds this
-const CHUNK_SIZE_ADJUST_INTERVAL = 1000; // Adjust chunk size every second
+const BACKPRESSURE_THRESHOLD = 24 * 1024 * 1024; // 24MB backpressure threshold (increased for large files)
+const MAX_BUFFERED_AMOUNT = 48 * 1024 * 1024; // 48MB max - don't send if buffer exceeds this (increased for 200GB+)
+const CHUNK_SIZE_ADJUST_INTERVAL = 2000; // Adjust chunk size every 2 seconds (less frequent for stability)
 
 // Mobile device detection - for conservative chunk sizing
 const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
@@ -150,21 +150,62 @@ function showUserMessage(message) {
     alert(message);
 }
 
-// CRITICAL: Handle connection loss - treat as connection failure, not file failure
+    // CRITICAL: Handle connection loss - treat as connection failure, not file failure
 // Define this BEFORE it's used (near top of file)
 function handleConnectionLoss(reason = "unknown") {
     // Guard against double-calls (important)
-    if (connectionLostHandled) return;
-    connectionLostHandled = true;
+    if (connectionLostHandled) {
+        console.log("⚠️ Connection loss already handled, ignoring duplicate call");
+        return;
+    }
     
-    console.warn("🚨 Connection lost:", reason);
+    // For large files, be more lenient with transient disconnections
+    const fileSize = currentFile?.size || receivingFileSize || 0;
+    const fileSizeGB = fileSize / (1024 * 1024 * 1024);
+    const isLargeFile = fileSizeGB > 1; // Files over 1GB
+    
+    console.warn("🚨 Connection lost:", reason, isLargeFile ? `(Large file: ${fileSizeGB.toFixed(2)}GB - being lenient)` : "");
+    
+    // For large files and transient disconnections, don't immediately mark as handled
+    // This allows automatic reconnection attempts
+    if (reason === "datachannel-closed" && isLargeFile && dataChannel?.readyState === 'closed') {
+        // Check if WebSocket is still connected - if so, this might be recoverable
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            console.log("🔄 WebSocket still connected, DataChannel closed - attempting recovery...");
+            // Don't mark as handled yet - allow reconnection attempt
+            transferPaused = true;
+            // Try to recreate DataChannel if we're the initiator
+            if (isInitiator && peerConnection && peerConnection.connectionState === 'connected') {
+                console.log("🔄 Attempting to recreate DataChannel...");
+                try {
+                    createDataChannel();
+                    // Reset the flag after a delay to allow recovery
+                    setTimeout(() => {
+                        if (dataChannel && dataChannel.readyState === 'open') {
+                            console.log("✅ DataChannel recovered!");
+                            connectionLostHandled = false;
+                            transferPaused = false;
+                            return; // Don't proceed with error handling
+                        }
+                    }, 2000);
+                } catch (error) {
+                    console.error("❌ Failed to recreate DataChannel:", error);
+                }
+            }
+        }
+    }
+    
+    // Mark as handled now (unless recovery attempt above succeeds)
+    connectionLostHandled = true;
     
     // Set pause flag - do NOT abort transfer immediately
     // Transfer must pause, not abort, to allow resume
     transferPaused = true;
     
     // Only abort if it's a definitive failure (not just disconnected)
-    if (reason === "ice-failed" || reason === "ice-disconnected-timeout") {
+    // For large files, be even more conservative
+    const shouldAbort = reason === "ice-failed" || (reason === "ice-disconnected-timeout" && !isLargeFile);
+    if (shouldAbort) {
         transferAborted = true;
         
         // Only cancel readers if we're actually aborting (not just pausing)
@@ -228,8 +269,14 @@ function handleConnectionLoss(reason = "unknown") {
     updateConnectionStatus('disconnected', 'Connection interrupted');
     
     // Show user-friendly message - different for pause vs abort
+    // For large files, show more encouraging message
     if (transferPaused && !transferAborted) {
-        showUserMessage("Connection interrupted. Waiting for reconnection…");
+        const fileSizeGB = (currentFile?.size || receivingFileSize || 0) / (1024 * 1024 * 1024);
+        if (fileSizeGB > 1) {
+            showUserMessage(`Connection interrupted (${fileSizeGB.toFixed(2)}GB file). Waiting for reconnection… Large files may experience brief interruptions.`);
+        } else {
+            showUserMessage("Connection interrupted. Waiting for reconnection…");
+        }
     } else if (currentFile || (receivingFile && receivingBytesReceived > 0)) {
         showUserMessage("Connection lost. Transfer paused. You can retry or resume when peer reconnects.");
     }
@@ -623,26 +670,39 @@ function createPeerConnection() {
         checkRelayStatus();
         
         if (state === "disconnected") {
-            // Wait before declaring failure - transient disconnections are common
+            // Wait before declaring failure - transient disconnections are common, especially for large files
+            // Use longer timeout for large file transfers (200GB+ files need more patience)
             if (!disconnectedTimer) {
+                // Calculate timeout based on file size - larger files get more time
+                const fileSize = currentFile?.size || receivingFileSize || 0;
+                const fileSizeGB = fileSize / (1024 * 1024 * 1024);
+                
+                // Base timeout: 30 seconds for small files, up to 60 seconds for 200GB+ files
+                const baseTimeout = 30000; // 30 seconds base
+                const largeFileTimeout = Math.min(60000, baseTimeout + (fileSizeGB * 150)); // +150ms per GB, max 60s
+                const timeout = fileSizeGB > 1 ? largeFileTimeout : baseTimeout;
+                
+                console.log(`⏳ ICE disconnected - waiting ${(timeout/1000).toFixed(0)}s before action (file: ${(fileSizeGB).toFixed(2)}GB)`);
+                
                 disconnectedTimer = setTimeout(async () => {
                     console.warn("ICE still disconnected after timeout");
                     
-                    // OPTIONAL: Try ICE restart before giving up (often saves mobile connections)
+                    // OPTIONAL: Try ICE restart before giving up (often saves mobile connections and Render deployments)
                     try {
                         console.log("🔄 Attempting ICE restart...");
                         await peerConnection.restartIce();
                         console.log("✅ ICE restart initiated");
-                        // Give it a bit more time after restart
+                        // Give it more time after restart for large files
+                        const restartTimeout = fileSizeGB > 1 ? 20000 : 15000; // 20s for large files, 15s for small
                         disconnectedTimer = setTimeout(() => {
                             console.warn("ICE still disconnected after restart");
                             handleConnectionLoss("ice-disconnected-timeout");
-                        }, 10000); // 10 more seconds after restart
+                        }, restartTimeout);
                     } catch (error) {
                         console.error("❌ ICE restart failed:", error);
                         handleConnectionLoss("ice-disconnected-timeout");
                     }
-                }, 15000); // Wait 15 seconds before declaring failure
+                }, timeout);
             }
         }
         
@@ -1204,11 +1264,24 @@ async function streamFile(file, startOffset = 0) {
                 throw new Error('TRANSFER_ABORTED');
             } else {
                 // Transfer paused - wait for reconnection
-                console.warn('⏸️ Transfer paused - waiting for reconnection...');
-                // Wait a bit and check again
-                await new Promise(resolve => setTimeout(resolve, 1000));
-                // Continue loop to check again
-                continue;
+                // For large files, wait longer and check connection state
+                const fileSizeGB = (file.size || 0) / (1024 * 1024 * 1024);
+                const waitTime = fileSizeGB > 10 ? 2000 : 1000; // 2s for very large files, 1s for normal
+                
+                console.warn(`⏸️ Transfer paused - waiting for reconnection... (checking every ${waitTime}ms)`);
+                
+                // Check if connection is actually restored
+                if (dataChannel && dataChannel.readyState === 'open' && !connectionLostHandled) {
+                    console.log('✅ Connection appears restored, resuming transfer...');
+                    transferPaused = false;
+                    connectionLostHandled = false;
+                    // Continue with transfer
+                } else {
+                    // Wait and check again
+                    await new Promise(resolve => setTimeout(resolve, waitTime));
+                    // Continue loop to check again
+                    continue;
+                }
             }
         }
         
@@ -1235,9 +1308,24 @@ async function streamFile(file, startOffset = 0) {
             
             if (timeDiff > 0) {
                 const currentSpeed = bytesDiff / timeDiff;
-                // Increase chunk size if we're sending fast and no backpressure
-                if (currentSpeed > 10 * 1024 * 1024 && dataChannel.bufferedAmount < BACKPRESSURE_THRESHOLD / 2) {
-                    chunkSize = Math.min(MAX_CHUNK_SIZE, chunkSize * 1.5);
+                const fileSize = currentFile?.size || 0;
+                const fileSizeGB = fileSize / (1024 * 1024 * 1024);
+                
+                // For large files (200GB+), be more aggressive with chunk size increases
+                // But also more conservative with backpressure threshold
+                if (fileSizeGB > 10) {
+                    // Very large files: increase chunk size more aggressively if speed is good
+                    if (currentSpeed > 8 * 1024 * 1024 && dataChannel.bufferedAmount < BACKPRESSURE_THRESHOLD / 3) {
+                        chunkSize = Math.min(MAX_CHUNK_SIZE, chunkSize * 1.3);
+                    } else if (currentSpeed < 2 * 1024 * 1024) {
+                        // Slow down if speed drops
+                        chunkSize = Math.max(MIN_CHUNK_SIZE, chunkSize * 0.9);
+                    }
+                } else {
+                    // Normal files: standard behavior
+                    if (currentSpeed > 10 * 1024 * 1024 && dataChannel.bufferedAmount < BACKPRESSURE_THRESHOLD / 2) {
+                        chunkSize = Math.min(MAX_CHUNK_SIZE, chunkSize * 1.5);
+                    }
                 }
             }
             
@@ -1570,9 +1658,23 @@ async function streamFileLegacy(file, startOffset = 0) {
                 console.warn('⚠️ Transfer aborted - stopping legacy transfer');
                 return;
             } else {
-                // Paused - wait and retry
-                console.warn('⏸️ Transfer paused - waiting for reconnection...');
-                setTimeout(() => readChunk(), 1000);
+                // Paused - wait for reconnection
+                // For large files, wait longer
+                const fileSizeGB = (file.size || 0) / (1024 * 1024 * 1024);
+                const waitTime = fileSizeGB > 10 ? 2000 : 1000; // 2s for very large files
+                
+                // Check if connection is actually restored
+                if (dataChannel && dataChannel.readyState === 'open' && !connectionLostHandled) {
+                    console.log('✅ Connection appears restored, resuming legacy transfer...');
+                    transferPaused = false;
+                    connectionLostHandled = false;
+                    // Continue with transfer immediately
+                    readChunk();
+                    return;
+                }
+                
+                console.warn(`⏸️ Transfer paused - waiting for reconnection... (checking in ${waitTime}ms)`);
+                setTimeout(() => readChunk(), waitTime);
                 return;
             }
         }
