@@ -45,19 +45,220 @@ function getWebSocketURL() {
 }
 const WS_URL = getWebSocketURL();
 console.log('WebSocket URL:', WS_URL);
-// Optimized for 200GB+ files: battle-tested stable values
-// Trading 2-5% speed for much higher stability (critical for long transfers)
-const INITIAL_CHUNK_SIZE = 512 * 1024; // 512KB initial chunk size (increased for better throughput on large files)
-const MIN_CHUNK_SIZE = 128 * 1024; // 128KB min chunk size (increased for 200GB+ files)
-// MAX_CHUNK_SIZE will be set dynamically based on SCTP maxMessageSize
-let MAX_CHUNK_SIZE = 2 * 1024 * 1024; // 2MB default (safer than 4MB for stability)
-const BACKPRESSURE_THRESHOLD = 24 * 1024 * 1024; // 24MB backpressure threshold (increased for large files)
-const MAX_BUFFERED_AMOUNT = 48 * 1024 * 1024; // 48MB max - don't send if buffer exceeds this (increased for 200GB+)
-const CHUNK_SIZE_ADJUST_INTERVAL = 2000; // Adjust chunk size every 2 seconds (less frequent for stability)
+// FREE TIER SAFE: Hard-coded 16KB chunks for maximum stability on mobile networks
+// This prevents RAM crashes and WebSocket 1006 errors on Render free tier
+const CHUNK_SIZE = 16 * 1024; // 16KB - hard-coded for stability (no dynamic adjustment)
+const BACKPRESSURE_THRESHOLD = 64 * 1024; // 64KB - pause if buffer exceeds this (prevents WebSocket 1006 crash)
+const MAX_BUFFERED_AMOUNT = 64 * 1024; // 64KB max - don't send if buffer exceeds this
 
-// Mobile device detection - for conservative chunk sizing
+// Mobile device detection
 const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
-const MOBILE_MAX_CHUNK_SIZE = 16 * 1024; // 16KB cap for mobile (prevents Head-of-Line Blocking)
+
+// ============================================================================
+// INDEXEDDB STORAGE FOR RECEIVER (Free Tier Safe - No Server-Side Database)
+// ============================================================================
+// Store file chunks in IndexedDB instead of RAM to support 200GB+ files
+// This prevents mobile RAM crashes when receiving large files
+
+let db = null;
+const DB_NAME = 'P2PFileTransferDB';
+const DB_VERSION = 1;
+const STORE_NAME = 'fileChunks';
+
+// Initialize IndexedDB
+async function initIndexedDB() {
+    return new Promise((resolve, reject) => {
+        const request = indexedDB.open(DB_NAME, DB_VERSION);
+        
+        request.onerror = () => {
+            console.error('❌ IndexedDB open failed:', request.error);
+            reject(request.error);
+        };
+        
+        request.onsuccess = () => {
+            db = request.result;
+            console.log('✅ IndexedDB initialized');
+            resolve(db);
+        };
+        
+        request.onupgradeneeded = (event) => {
+            const database = event.target.result;
+            if (!database.objectStoreNames.contains(STORE_NAME)) {
+                // Create object store with fileName as keyPath
+                const objectStore = database.createObjectStore(STORE_NAME, { keyPath: 'chunkIndex' });
+                // Create index for fileName to query all chunks for a file
+                objectStore.createIndex('fileName', 'fileName', { unique: false });
+                console.log('✅ IndexedDB object store created');
+            }
+        };
+    });
+}
+
+// Store chunk in IndexedDB (receiver side)
+async function storeChunkInIndexedDB(fileName, chunkIndex, chunkData) {
+    if (!db) {
+        await initIndexedDB();
+    }
+    
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction([STORE_NAME], 'readwrite');
+        const store = transaction.objectStore(STORE_NAME);
+        
+        // Convert chunk to ArrayBuffer for storage
+        const chunkBuffer = chunkData instanceof ArrayBuffer 
+            ? chunkData 
+            : chunkData.buffer instanceof ArrayBuffer 
+                ? chunkData.buffer 
+                : new Uint8Array(chunkData).buffer;
+        
+        const record = {
+            chunkIndex: `${fileName}_${chunkIndex}`, // Composite key
+            fileName: fileName,
+            chunkIndexNum: chunkIndex,
+            chunkData: chunkBuffer,
+            timestamp: Date.now()
+        };
+        
+        const request = store.put(record);
+        
+        request.onsuccess = () => {
+            resolve();
+        };
+        
+        request.onerror = () => {
+            console.error('❌ Error storing chunk in IndexedDB:', request.error);
+            reject(request.error);
+        };
+    });
+}
+
+// Get total bytes received from IndexedDB for a file
+async function getTotalBytesFromIndexedDB(fileName) {
+    if (!db) {
+        await initIndexedDB();
+    }
+    
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction([STORE_NAME], 'readonly');
+        const store = transaction.objectStore(STORE_NAME);
+        const index = store.index('fileName');
+        const request = index.getAll(fileName);
+        
+        request.onsuccess = () => {
+            const chunks = request.result;
+            let totalBytes = 0;
+            chunks.forEach(chunk => {
+                if (chunk.chunkData && chunk.chunkData.byteLength) {
+                    totalBytes += chunk.chunkData.byteLength;
+                }
+            });
+            resolve({ totalBytes, chunkCount: chunks.length });
+        };
+        
+        request.onerror = () => {
+            console.error('❌ Error reading from IndexedDB:', request.error);
+            reject(request.error);
+        };
+    });
+}
+
+// Get all chunks from IndexedDB for a file (for final assembly)
+async function getAllChunksFromIndexedDB(fileName) {
+    if (!db) {
+        await initIndexedDB();
+    }
+    
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction([STORE_NAME], 'readonly');
+        const store = transaction.objectStore(STORE_NAME);
+        const index = store.index('fileName');
+        const request = index.getAll(fileName);
+        
+        request.onsuccess = () => {
+            const chunks = request.result;
+            // Sort by chunkIndexNum to ensure correct order
+            chunks.sort((a, b) => a.chunkIndexNum - b.chunkIndexNum);
+            resolve(chunks.map(chunk => chunk.chunkData));
+        };
+        
+        request.onerror = () => {
+            console.error('❌ Error reading chunks from IndexedDB:', request.error);
+            reject(request.error);
+        };
+    });
+}
+
+// Delete all chunks for a file from IndexedDB (cleanup after download)
+async function deleteFileFromIndexedDB(fileName) {
+    if (!db) {
+        return; // No DB, nothing to delete
+    }
+    
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction([STORE_NAME], 'readwrite');
+        const store = transaction.objectStore(STORE_NAME);
+        const index = store.index('fileName');
+        const request = index.openKeyCursor(IDBKeyRange.only(fileName));
+        
+        request.onsuccess = (event) => {
+            const cursor = event.target.result;
+            if (cursor) {
+                store.delete(cursor.primaryKey);
+                cursor.continue();
+            } else {
+                console.log(`✅ Deleted all chunks for ${fileName} from IndexedDB`);
+                resolve();
+            }
+        };
+        
+        request.onerror = () => {
+            console.error('❌ Error deleting from IndexedDB:', request.error);
+            reject(request.error);
+        };
+    });
+}
+
+// ============================================================================
+// LOCALSTORAGE PERSISTENCE (Free Tier Safe)
+// ============================================================================
+// Store file metadata and byte offset for resume capability
+
+function saveFileMetadataToLocalStorage(fileName, fileSize, mimeType, receivedBytes) {
+    try {
+        const metadata = {
+            fileName,
+            fileSize,
+            mimeType,
+            receivedBytes,
+            timestamp: Date.now()
+        };
+        localStorage.setItem(`fileMetadata_${fileName}`, JSON.stringify(metadata));
+        console.log(`💾 Saved file metadata to localStorage: ${fileName} (${receivedBytes}/${fileSize} bytes)`);
+    } catch (error) {
+        console.error('❌ Error saving to localStorage:', error);
+    }
+}
+
+function getFileMetadataFromLocalStorage(fileName) {
+    try {
+        const data = localStorage.getItem(`fileMetadata_${fileName}`);
+        if (data) {
+            return JSON.parse(data);
+        }
+    } catch (error) {
+        console.error('❌ Error reading from localStorage:', error);
+    }
+    return null;
+}
+
+function deleteFileMetadataFromLocalStorage(fileName) {
+    try {
+        localStorage.removeItem(`fileMetadata_${fileName}`);
+        console.log(`🗑️ Deleted file metadata from localStorage: ${fileName}`);
+    } catch (error) {
+        console.error('❌ Error deleting from localStorage:', error);
+    }
+}
 
 // State
 let ws = null;
@@ -129,21 +330,10 @@ function releaseWakeLock() {
     }
 }
 
-// Apply mobile chunk size cap - prevents Head-of-Line Blocking on mobile networks
-function applyMobileChunkCap(chunkSize) {
-    if (isMobile) {
-        // Cap at 16KB for mobile - slower but significantly more stable for 200MB+ files
-        const cappedSize = Math.min(chunkSize, MOBILE_MAX_CHUNK_SIZE);
-        if (cappedSize < chunkSize) {
-            // Only log when we actually cap (to avoid spam)
-            if (chunkSize > MOBILE_MAX_CHUNK_SIZE * 1.1) { // Only log if significantly over
-                console.log(`📱 Mobile device detected - capping chunk size at ${(MOBILE_MAX_CHUNK_SIZE/1024).toFixed(0)}KB (was ${(chunkSize/1024).toFixed(0)}KB)`);
-            }
-        }
-        return cappedSize;
-    }
-    return chunkSize;
-}
+// Initialize IndexedDB on page load
+initIndexedDB().catch(error => {
+    console.error('❌ Failed to initialize IndexedDB:', error);
+});
 
 // Helper function to show user-friendly messages
 function showUserMessage(message) {
@@ -311,15 +501,10 @@ function handleConnectionLoss(reason = "unknown") {
     // Stop keepalive
     stopKeepalive();
     
-    // CRITICAL: Resume support - save partial file state on receiver
+    // CRITICAL: Resume support - file state is already saved in IndexedDB and localStorage
+    // No need to save separately - it's already persisted
     if (receivingFile && receivingBytesReceived > 0 && receivingBytesReceived < receivingFileSize) {
-        console.log(`💾 Saving partial file state for resume: ${receivingFile.name} (${receivingBytesReceived}/${receivingFileSize} bytes)`);
-        partialFileState = {
-            fileName: receivingFile.name,
-            fileSize: receivingFileSize,
-            receivedBytes: receivingBytesReceived,
-            chunks: receivingFileChunks.slice() // Copy chunks for resume
-        };
+        console.log(`💾 Partial file state already saved in IndexedDB: ${receivingFile.name} (${receivingBytesReceived}/${receivingFileSize} bytes)`);
     }
     
     // Update UI with user-friendly message
@@ -837,23 +1022,8 @@ function createDataChannel() {
         maxRetransmits: 0 // Reliable but not retransmit-based
     });
     
-    // Set SCTP maxMessageSize guard for chunk size
-    // Respect browser's SCTP limit automatically
-    if (peerConnection.sctp) {
-        const sctpMaxSize = peerConnection.sctp.maxMessageSize || (1 * 1024 * 1024);
-        MAX_CHUNK_SIZE = Math.min(MAX_CHUNK_SIZE, sctpMaxSize);
-        // Apply mobile cap on top of SCTP limit
-        if (isMobile) {
-            MAX_CHUNK_SIZE = Math.min(MAX_CHUNK_SIZE, MOBILE_MAX_CHUNK_SIZE);
-            console.log(`📱 Mobile device - MAX_CHUNK_SIZE capped at: ${(MAX_CHUNK_SIZE/1024).toFixed(0)}KB`);
-        } else {
-            console.log(`📏 SCTP maxMessageSize: ${(sctpMaxSize/1024/1024).toFixed(2)}MB, MAX_CHUNK_SIZE set to: ${(MAX_CHUNK_SIZE/1024/1024).toFixed(2)}MB`);
-        }
-    } else if (isMobile) {
-        // Apply mobile cap even if SCTP info not available
-        MAX_CHUNK_SIZE = Math.min(MAX_CHUNK_SIZE, MOBILE_MAX_CHUNK_SIZE);
-        console.log(`📱 Mobile device - MAX_CHUNK_SIZE capped at: ${(MAX_CHUNK_SIZE/1024).toFixed(0)}KB`);
-    }
+    // FREE TIER SAFE: Chunk size is fixed at 16KB - no dynamic adjustment needed
+    console.log(`📏 Using fixed chunk size: ${(CHUNK_SIZE/1024).toFixed(0)}KB (free tier safe)`);
     
     setupDataChannel(dataChannel);
 }
@@ -864,7 +1034,7 @@ function setupDataChannel(channel) {
     // CRITICAL: Set bufferedAmountLowThreshold for event-based draining
     // This prevents CPU spinning and enables efficient backpressure handling
     channel.bufferedAmountLowThreshold = BACKPRESSURE_THRESHOLD;
-    console.log(`📊 Set bufferedAmountLowThreshold to ${(BACKPRESSURE_THRESHOLD/1024/1024).toFixed(2)}MB`);
+    console.log(`📊 Set bufferedAmountLowThreshold to ${(BACKPRESSURE_THRESHOLD/1024).toFixed(0)}KB (free tier safe)`);
     
     console.log('DataChannel setup. Current state:', channel.readyState);
     
@@ -882,21 +1052,8 @@ function setupDataChannel(channel) {
         connectionLostHandled = false;
         transferPaused = false; // Resume transfer
         
-        // CRITICAL: Resume support - check if we have partial file to resume
-        if (partialFileState.fileName && partialFileState.receivedBytes > 0 && partialFileState.receivedBytes < partialFileState.fileSize) {
-            console.log(`🔄 Resuming file transfer: ${partialFileState.fileName} from offset ${partialFileState.receivedBytes}`);
-            // Request resume from sender
-            try {
-                dataChannel.send(JSON.stringify({
-                    type: 'resume',
-                    fileName: partialFileState.fileName,
-                    offset: partialFileState.receivedBytes
-                }));
-                console.log(`📤 Sent resume request: ${partialFileState.fileName} from byte ${partialFileState.receivedBytes}`);
-            } catch (error) {
-                console.error('❌ Error sending resume request:', error);
-            }
-        }
+        // CRITICAL: Resume support - check localStorage for partial files
+        // This will be handled in startReceivingFile when metadata arrives
         
         // CRITICAL: Start keepalive pings to prevent NAT timeouts
         // This improves long transfers by 30-40% reliability on mobile networks
@@ -1305,16 +1462,13 @@ async function streamFile(file, startOffset = 0) {
         // Update transfer stats to reflect the skipped bytes
         transferStats.bytesTransferred = startOffset;
     }
-    let chunkSize = INITIAL_CHUNK_SIZE;
-    let lastAdjustTime = Date.now();
+    // FREE TIER SAFE: Use fixed 16KB chunk size - no dynamic adjustment
+    const chunkSize = CHUNK_SIZE;
     
     transferStats.startTime = Date.now();
     transferStats.lastUpdateTime = Date.now();
     
-    // CRITICAL: Track leftover bytes to ensure no tail drop
-    let leftover = null;
-    
-    // Main sending loop - ensures exact chunking and no silent tail drop
+    // Main sending loop - ensures exact chunking
     while (true) {
         // CRITICAL: Check if transfer was paused or aborted due to connection loss
         if (transferPaused || transferAborted) {
@@ -1324,9 +1478,8 @@ async function streamFile(file, startOffset = 0) {
                 throw new Error('TRANSFER_ABORTED');
             } else {
                 // Transfer paused - wait for reconnection
-                // For large files, wait longer and check connection state
                 const fileSizeGB = (file.size || 0) / (1024 * 1024 * 1024);
-                const waitTime = fileSizeGB > 10 ? 2000 : 1000; // 2s for very large files, 1s for normal
+                const waitTime = fileSizeGB > 10 ? 2000 : 1000;
                 
                 console.warn(`⏸️ Transfer paused - waiting for reconnection... (checking every ${waitTime}ms)`);
                 
@@ -1335,24 +1488,18 @@ async function streamFile(file, startOffset = 0) {
                     console.log('✅ Connection appears restored, resuming transfer...');
                     transferPaused = false;
                     connectionLostHandled = false;
-                    // Continue with transfer
                 } else {
-                    // Wait and check again
                     await new Promise(resolve => setTimeout(resolve, waitTime));
-                    // Continue loop to check again
                     continue;
                 }
             }
         }
         
         if (dataChannel.readyState !== 'open') {
-            // Don't immediately treat as connection loss - verify first
-            // DataChannel might be temporarily in "connecting" state
             const dcState = dataChannel.readyState;
             const wsConnected = ws && ws.readyState === WebSocket.OPEN;
             const pcState = peerConnection?.connectionState;
             
-            // Only treat as connection loss if it's actually closed AND WebSocket is also disconnected
             if (dcState === 'closed' && (!wsConnected || pcState === 'failed')) {
                 console.warn('⚠️ DataChannel closed during transfer (verified connection loss)');
                 handleConnectionLoss("datachannel-closed");
@@ -1361,54 +1508,15 @@ async function streamFile(file, startOffset = 0) {
                     throw new Error('TRANSFER_ABORTED');
                 }
             } else {
-                // Transient state change - wait and retry
-                console.log(`⏳ DataChannel state: ${dcState} (WebSocket: ${wsConnected ? 'connected' : 'disconnected'}, PeerConnection: ${pcState}). Waiting for recovery...`);
+                console.log(`⏳ DataChannel state: ${dcState}. Waiting for recovery...`);
                 await new Promise(resolve => setTimeout(resolve, 1000));
             }
-            // If just paused, wait and retry
             await new Promise(resolve => setTimeout(resolve, 1000));
             continue;
         }
         
-        // CRITICAL: Event-based backpressure handling
+        // CRITICAL: Event-based backpressure handling - pause if buffer > 64KB
         await waitForDrain();
-        
-        // Adjust chunk size based on performance
-        const now = Date.now();
-        if (now - lastAdjustTime > CHUNK_SIZE_ADJUST_INTERVAL) {
-            const timeDiff = (now - transferStats.lastUpdateTime) / 1000;
-            const bytesDiff = transferStats.bytesTransferred - transferStats.lastBytesTransferred;
-            
-            if (timeDiff > 0) {
-                const currentSpeed = bytesDiff / timeDiff;
-                const fileSize = currentFile?.size || 0;
-                const fileSizeGB = fileSize / (1024 * 1024 * 1024);
-                
-                // For large files (200GB+), be more aggressive with chunk size increases
-                // But also more conservative with backpressure threshold
-                if (fileSizeGB > 10) {
-                    // Very large files: increase chunk size more aggressively if speed is good
-                    if (currentSpeed > 8 * 1024 * 1024 && dataChannel.bufferedAmount < BACKPRESSURE_THRESHOLD / 3) {
-                        chunkSize = Math.min(MAX_CHUNK_SIZE, chunkSize * 1.3);
-                    } else if (currentSpeed < 2 * 1024 * 1024) {
-                        // Slow down if speed drops
-                        chunkSize = Math.max(MIN_CHUNK_SIZE, chunkSize * 0.9);
-                    }
-                } else {
-                    // Normal files: standard behavior
-                    if (currentSpeed > 10 * 1024 * 1024 && dataChannel.bufferedAmount < BACKPRESSURE_THRESHOLD / 2) {
-                        chunkSize = Math.min(MAX_CHUNK_SIZE, chunkSize * 1.5);
-                    }
-                }
-            }
-            
-            // CRITICAL: Apply mobile chunk cap after any adjustments
-            chunkSize = applyMobileChunkCap(chunkSize);
-            
-            lastAdjustTime = now;
-            transferStats.lastUpdateTime = now;
-            transferStats.lastBytesTransferred = transferStats.bytesTransferred;
-        }
         
         try {
             let { done, value } = await reader.read();
@@ -1417,34 +1525,10 @@ async function streamFile(file, startOffset = 0) {
             if (startOffset > 0 && skippedBytes > startOffset && value && !done) {
                 const overshoot = skippedBytes - startOffset;
                 value = value.slice(overshoot);
-                skippedBytes = startOffset; // Mark as handled
+                skippedBytes = startOffset;
             }
             
             if (done) {
-                // CRITICAL: Force-send remaining tail buffer
-                // Never rely on stream end alone - always explicitly flush remaining bytes
-                if (leftover && leftover.byteLength > 0) {
-                    console.log(`📤 Sending leftover tail buffer: ${leftover.byteLength} bytes`);
-                    await waitForDrain();
-                    
-                    // Ensure exact chunking for leftover
-                    if (leftover.byteLength > MAX_CHUNK_SIZE) {
-                        let offset = 0;
-                        while (offset < leftover.byteLength) {
-                            const slice = leftover.slice(offset, offset + MAX_CHUNK_SIZE);
-                            await waitForDrain();
-                            dataChannel.send(slice);
-                            transferStats.chunksSent++;
-                            transferStats.bytesTransferred += slice.byteLength;
-                            offset += MAX_CHUNK_SIZE;
-                        }
-                    } else {
-                        dataChannel.send(leftover);
-                        transferStats.chunksSent++;
-                        transferStats.bytesTransferred += leftover.byteLength;
-                    }
-                    leftover = null;
-                }
                 console.log('📤 File reading complete.');
                 console.log(`📊 Transfer stats: Bytes: ${transferStats.bytesTransferred}/${file.size}, Chunks sent: ${transferStats.chunksSent}, Chunks queued: ${transferStats.chunksQueued}`);
                 
@@ -1595,13 +1679,13 @@ async function streamFile(file, startOffset = 0) {
                 return;
             }
             
-            // CRITICAL: Ensure exact chunking - never send chunks larger than MAX_CHUNK_SIZE
-            // Handle value that might be larger than MAX_CHUNK_SIZE
-            if (value.byteLength > MAX_CHUNK_SIZE) {
-                // Split into MAX_CHUNK_SIZE chunks
+            // CRITICAL: Ensure exact chunking - never send chunks larger than CHUNK_SIZE (16KB)
+            // Handle value that might be larger than CHUNK_SIZE
+            if (value.byteLength > CHUNK_SIZE) {
+                // Split into CHUNK_SIZE chunks
                 let offset = 0;
                 while (offset < value.byteLength) {
-                    const slice = value.slice(offset, Math.min(offset + MAX_CHUNK_SIZE, value.byteLength));
+                    const slice = value.slice(offset, Math.min(offset + CHUNK_SIZE, value.byteLength));
                     await waitForDrain();
                     
                     // CRITICAL: Check if transfer was paused or aborted
@@ -1727,9 +1811,8 @@ async function streamFileLegacy(file, startOffset = 0) {
         console.log(`🔄 Resuming legacy file transfer from offset: ${startOffset} bytes`);
     }
     
-    // CRITICAL: Apply mobile chunk cap for FileReader fallback
-    // This ensures we use file.slice() with small chunks, not reading entire file into memory
-    let chunkSize = applyMobileChunkCap(INITIAL_CHUNK_SIZE);
+    // FREE TIER SAFE: Use fixed 16KB chunk size
+    const chunkSize = CHUNK_SIZE;
     
     // Reset and initialize transfer stats
     transferStats.startTime = Date.now();
@@ -2067,19 +2150,11 @@ async function streamFileLegacy(file, startOffset = 0) {
 // Data Channel Message Handling (Receiver)
 let receivingFile = null;
 let receivingFileSize = 0;
-let receivingBytesReceived = 0;
-let receivingFileChunks = [];
+let receivingBytesReceived = 0; // Track total bytes received (from IndexedDB)
+let currentChunkIndex = 0; // Track current chunk index for IndexedDB
 let fileCompleteSignalReceived = false;
 let lastChunkReceivedTime = null;
 let allBytesReceivedTime = null; // Track when we first received all bytes
-
-// Resume support: Track partial file state for resume capability
-let partialFileState = {
-    fileName: null,
-    fileSize: 0,
-    receivedBytes: 0,
-    chunks: []
-};
 
 function handleDataChannelMessage(event) {
     const data = event.data;
@@ -2133,10 +2208,13 @@ function handleDataChannelMessage(event) {
                 // Reset any previous file state before starting new file
                 if (receivingFile) {
                     console.warn('⚠️ Received file-metadata while still receiving previous file. Resetting...');
+                    // Clean up previous file from IndexedDB
+                    deleteFileFromIndexedDB(receivingFile.name).catch(err => console.error('Error cleaning up:', err));
+                    deleteFileMetadataFromLocalStorage(receivingFile.name);
                     receivingFile = null;
                     receivingFileSize = 0;
                     receivingBytesReceived = 0;
-                    receivingFileChunks = [];
+                    currentChunkIndex = 0;
                 }
                 // Check if this is a resume (metadata includes offset)
                 const resumeOffset = message.resumeOffset || 0;
@@ -2416,19 +2494,66 @@ function handleFileRejected() {
 let pendingFileRequest = null;
 let pendingFileRequestsQueue = []; // Queue for multiple file requests
 
-function startReceivingFile(metadata) {
+async function startReceivingFile(metadata, resumeOffset = 0) {
     receivingFile = {
         name: metadata.name,
         size: metadata.size,
         type: metadata.mimeType || 'application/octet-stream'
     };
     receivingFileSize = metadata.size;
-    receivingBytesReceived = 0;
-    receivingFileChunks = [];
-    fileCompleteSignalReceived = false; // Reset completion signal flag
-    completionCheckAttempts = 0; // Reset check attempts
-    lastChunkReceivedTime = Date.now(); // Initialize chunk timer
-    allBytesReceivedTime = null; // Reset all bytes received timestamp
+    fileCompleteSignalReceived = false;
+    completionCheckAttempts = 0;
+    lastChunkReceivedTime = Date.now();
+    allBytesReceivedTime = null;
+    
+    // Check localStorage and IndexedDB for existing partial file (resume capability)
+    const savedMetadata = getFileMetadataFromLocalStorage(metadata.name);
+    if (savedMetadata && savedMetadata.fileSize === metadata.size) {
+        // Check IndexedDB for existing chunks
+        try {
+            const { totalBytes, chunkCount } = await getTotalBytesFromIndexedDB(metadata.name);
+            if (totalBytes > 0 && totalBytes < metadata.size) {
+                // We have partial file - resume from this point
+                receivingBytesReceived = totalBytes;
+                currentChunkIndex = chunkCount;
+                console.log(`🔄 Resuming file transfer: ${metadata.name} (${totalBytes}/${metadata.size} bytes already received)`);
+                
+                // Request sender to resume from this offset
+                if (dataChannel && dataChannel.readyState === 'open') {
+                    try {
+                        dataChannel.send(JSON.stringify({
+                            type: 'resume',
+                            fileName: metadata.name,
+                            offset: totalBytes
+                        }));
+                        console.log(`📤 Sent resume request: ${metadata.name} from byte ${totalBytes}`);
+                    } catch (error) {
+                        console.error('❌ Error sending resume request:', error);
+                    }
+                }
+            } else {
+                // Start fresh
+                receivingBytesReceived = 0;
+                currentChunkIndex = 0;
+                // Clean up old data if file size changed
+                if (totalBytes > 0) {
+                    await deleteFileFromIndexedDB(metadata.name);
+                    deleteFileMetadataFromLocalStorage(metadata.name);
+                }
+            }
+        } catch (error) {
+            console.error('❌ Error checking IndexedDB for resume:', error);
+            receivingBytesReceived = 0;
+            currentChunkIndex = 0;
+        }
+    } else {
+        // No saved metadata - start fresh
+        receivingBytesReceived = 0;
+        currentChunkIndex = 0;
+    }
+    
+    // Save metadata to localStorage
+    saveFileMetadataToLocalStorage(metadata.name, metadata.size, metadata.mimeType || 'application/octet-stream', receivingBytesReceived);
     
     // Clear any existing completion check interval
     if (completionCheckInterval) {
@@ -2441,15 +2566,29 @@ function startReceivingFile(metadata) {
     transferStats.startTime = Date.now();
     transferStats.lastUpdateTime = Date.now();
     
-    console.log('📥 Started receiving file:', metadata.name, 'Size:', metadata.size, 'bytes');
+    console.log('📥 Started receiving file:', metadata.name, 'Size:', metadata.size, 'bytes', receivingBytesReceived > 0 ? `(Resuming from ${receivingBytesReceived} bytes)` : '');
 }
 
-function handleFileChunk(chunk) {
+// FREE TIER SAFE: Store chunks in IndexedDB instead of RAM
+async function handleFileChunk(chunk) {
     if (!receivingFile) return;
     
     const chunkSize = chunk.byteLength || chunk.length;
-    receivingFileChunks.push(chunk);
-    receivingBytesReceived += chunkSize;
+    
+    // CRITICAL: Store chunk in IndexedDB immediately (don't keep in RAM)
+    try {
+        await storeChunkInIndexedDB(receivingFile.name, currentChunkIndex, chunk);
+        currentChunkIndex++;
+        receivingBytesReceived += chunkSize;
+        
+        // Update localStorage with current progress
+        saveFileMetadataToLocalStorage(receivingFile.name, receivingFileSize, receivingFile.type, receivingBytesReceived);
+    } catch (error) {
+        console.error('❌ Error storing chunk in IndexedDB:', error);
+        // Continue anyway - might be recoverable
+        receivingBytesReceived += chunkSize;
+        currentChunkIndex++;
+    }
     
     // CRITICAL: Update last chunk received time - used to detect stale connections
     lastChunkReceivedTime = Date.now();
@@ -2458,9 +2597,9 @@ function handleFileChunk(chunk) {
     const progress = (receivingBytesReceived / receivingFileSize) * 100;
     updateReceivingProgress(Math.min(99.9, progress));
     
-    // Log every 10th chunk or when close to completion to avoid spam
-    if (receivingFileChunks.length % 10 === 0 || progress > 90) {
-        console.log(`📥 Chunk #${receivingFileChunks.length}: ${chunkSize} bytes. Total: ${receivingBytesReceived}/${receivingFileSize} (${progress.toFixed(1)}%)`);
+    // Log every 100th chunk or when close to completion to avoid spam
+    if (currentChunkIndex % 100 === 0 || progress > 90) {
+        console.log(`📥 Chunk #${currentChunkIndex}: ${chunkSize} bytes. Total: ${receivingBytesReceived}/${receivingFileSize} (${progress.toFixed(1)}%)`);
     }
     
     // Always check completion when a chunk arrives (especially if signal was received)
@@ -2500,7 +2639,8 @@ let completionCheckInterval = null;
 let completionCheckAttempts = 0;
 const MAX_COMPLETION_CHECK_ATTEMPTS = 1000; // Max 100 seconds (100 * 100ms)
 
-function checkAndCompleteFile() {
+// FREE TIER SAFE: Read from IndexedDB instead of RAM array
+async function checkAndCompleteFile() {
     if (!receivingFile) {
         if (completionCheckInterval) {
             clearInterval(completionCheckInterval);
@@ -2512,11 +2652,16 @@ function checkAndCompleteFile() {
     
     completionCheckAttempts++;
     
-    // Verify we received all bytes - calculate from chunks array
-    const totalReceived = receivingFileChunks.reduce((sum, chunk) => {
-        const size = chunk.byteLength || chunk.length || 0;
-        return sum + size;
-    }, 0);
+    // CRITICAL: Verify we received all bytes - read from IndexedDB
+    let totalReceived = 0;
+    try {
+        const { totalBytes } = await getTotalBytesFromIndexedDB(receivingFile.name);
+        totalReceived = totalBytes;
+    } catch (error) {
+        console.error('❌ Error reading from IndexedDB:', error);
+        // Fallback to tracked counter
+        totalReceived = receivingBytesReceived;
+    }
     
     // Also check the tracked counter
     const bytesMatch = Math.abs(totalReceived - receivingBytesReceived) < 100; // Allow small discrepancy
@@ -2549,7 +2694,7 @@ function checkAndCompleteFile() {
             receivingFile = null;
             receivingFileSize = 0;
             receivingBytesReceived = 0;
-            receivingFileChunks = [];
+            currentChunkIndex = 0;
             fileCompleteSignalReceived = false;
             lastChunkReceivedTime = null;
             allBytesReceivedTime = null;
@@ -2579,10 +2724,14 @@ function checkAndCompleteFile() {
         console.error('This indicates chunks from multiple files are being mixed. Resetting and waiting for proper file metadata.');
         
         // Reset and wait for proper file metadata
+        // Clean up IndexedDB and localStorage
+        await deleteFileFromIndexedDB(receivingFile.name);
+        deleteFileMetadataFromLocalStorage(receivingFile.name);
+        
         receivingFile = null;
         receivingFileSize = 0;
         receivingBytesReceived = 0;
-        receivingFileChunks = [];
+        currentChunkIndex = 0;
         fileCompleteSignalReceived = false;
         allBytesReceivedTime = null;
         if (completionCheckInterval) {
@@ -2653,7 +2802,7 @@ function checkAndCompleteFile() {
     console.log('Final stats:', {
         totalReceived,
         expected: receivingFileSize,
-        chunks: receivingFileChunks.length,
+        chunks: currentChunkIndex,
         percent: ((totalReceived/receivingFileSize)*100).toFixed(2) + '%'
     });
     
@@ -2672,15 +2821,27 @@ function checkAndCompleteFile() {
     // Now show 100% - file is actually complete
     updateReceivingProgress(100);
     
-    // Combine all chunks
+    // CRITICAL: Read all chunks from IndexedDB and assemble file
+    console.log('📦 Reading all chunks from IndexedDB for final assembly...');
+    let allChunks;
+    try {
+        allChunks = await getAllChunksFromIndexedDB(receivingFile.name);
+        console.log(`✅ Read ${allChunks.length} chunks from IndexedDB`);
+    } catch (error) {
+        console.error('❌ Error reading chunks from IndexedDB:', error);
+        alert('Error reading file from storage. Please try again.');
+        return;
+    }
+    
+    // Combine all chunks from IndexedDB
     const combined = new Uint8Array(totalReceived);
     let offset = 0;
     
-    receivingFileChunks.forEach(chunk => {
-        const chunkArray = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+    for (const chunkData of allChunks) {
+        const chunkArray = chunkData instanceof Uint8Array ? chunkData : new Uint8Array(chunkData);
         combined.set(chunkArray, offset);
         offset += chunkArray.length;
-    });
+    }
     
     // Create blob and download
     const blob = new Blob([combined], { type: receivingFile.type });
@@ -2692,6 +2853,17 @@ function checkAndCompleteFile() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+    
+    // FREE TIER SAFE: Clean up IndexedDB and localStorage after successful download
+    const fileName = receivingFile.name;
+    try {
+        await deleteFileFromIndexedDB(fileName);
+        deleteFileMetadataFromLocalStorage(fileName);
+        console.log(`✅ Cleaned up storage for ${fileName}`);
+    } catch (error) {
+        console.error('❌ Error cleaning up storage:', error);
+        // Continue anyway - file was downloaded successfully
+    }
     
     // Hide transfer info, show drop zone and success message
     transferInfo.style.display = 'none';
@@ -2711,14 +2883,13 @@ function checkAndCompleteFile() {
     resetTransferStats();
     
     // Reset file variables
-    const fileName = receivingFile.name;
     receivingFile = null;
     receivingFileSize = 0;
     receivingBytesReceived = 0;
-    receivingFileChunks = [];
-    fileCompleteSignalReceived = false; // Reset completion signal flag
-    allBytesReceivedTime = null; // Reset all bytes received timestamp
-    pendingFileRequest = null; // Clear pending request
+    currentChunkIndex = 0;
+    fileCompleteSignalReceived = false;
+    allBytesReceivedTime = null;
+    pendingFileRequest = null;
     
     // Clear completion check interval
     if (completionCheckInterval) {
@@ -2733,8 +2904,6 @@ function checkAndCompleteFile() {
     }, 500);
     
     // After file completes, wait for next file-metadata from sender
-    // Don't show next file request UI yet - wait for sender to send metadata
-    // The sender will send file-metadata for the next file automatically
     console.log('Waiting for next file metadata from sender...');
     
     // Hide success message after delay but keep drop zone visible
