@@ -1892,13 +1892,14 @@ async function streamFileLegacy(file, startOffset = 0) {
                                 await waitForDrain();
                                 
                                 console.log('📨 Sending file-complete signal...');
-                                // Send completion message with file size
+                                // Send completion message with file size AND name for proper matching
                                 try {
                                     dataChannel.send(JSON.stringify({ 
                                         type: 'file-complete',
-                                        size: file.size 
+                                        size: file.size,
+                                        fileName: file.name // Include file name for proper matching in bulk transfers
                                     }));
-                                    console.log('✅ File-complete signal sent (size:', file.size, 'bytes). Waiting for receiver confirmation...');
+                                    console.log('✅ File-complete signal sent (file:', file.name, ', size:', file.size, 'bytes). Waiting for receiver confirmation...');
                                 } catch (error) {
                                     console.error('❌ Error sending completion signal:', error);
                                     alert('Error sending completion signal: ' + error.message);
@@ -2026,16 +2027,42 @@ function handleDataChannelMessage(event) {
                 const resumeOffset = message.resumeOffset || 0;
                 startReceivingFile(message, resumeOffset);
             } else if (message.type === 'file-complete') {
+                // CRITICAL: Match file-complete signal to the correct file
+                // In bulk transfers, signals can arrive out of order or for wrong files
+                const signalFileName = message.fileName || null;
+                const signalFileSize = message.size || null;
+                
+                // If we have a receiving file, verify the signal matches it
+                if (receivingFile) {
+                    // Check if signal matches current file (by name or size)
+                    const nameMatches = signalFileName && signalFileName === receivingFile.name;
+                    const sizeMatches = signalFileSize && signalFileSize === receivingFileSize;
+                    
+                    if (!nameMatches && !sizeMatches && signalFileSize) {
+                        // Signal doesn't match current file - likely from previous/next file
+                        console.warn(`⚠️ File-complete signal ignored: size ${signalFileSize} doesn't match current file "${receivingFile.name}" (${receivingFileSize} bytes). This is likely from another file in the queue.`);
+                        return; // Ignore this signal
+                    }
+                    
+                    // Signal matches - process it
+                    console.log(`📨 File-complete signal received for "${receivingFile.name}". Expected size: ${signalFileSize || receivingFileSize} bytes`);
+                } else {
+                    // No receiving file - this signal is orphaned
+                    console.warn(`⚠️ File-complete signal received but no active file transfer. Size: ${signalFileSize || 'unknown'}. Ignoring.`);
+                    return; // Ignore orphaned signal
+                }
+                
                 // CRITICAL: Do NOT finalize immediately on file-complete
                 // Wait for all bytes to arrive - file-complete just signals sender is done sending
-                console.log(`📨 File-complete signal received. Expected size: ${message.size || receivingFileSize} bytes`);
                 fileCompleteSignalReceived = true;
                 
-                // Store expected size from sender if provided
-                if (message.size && message.size !== receivingFileSize) {
-                    console.warn(`⚠️ Size mismatch: sender says ${message.size}, we expected ${receivingFileSize}`);
+                // Store expected size from sender if provided and it matches
+                if (signalFileSize && signalFileSize === receivingFileSize) {
+                    // Size matches - all good
+                } else if (signalFileSize && signalFileSize !== receivingFileSize) {
+                    console.warn(`⚠️ Size mismatch: sender says ${signalFileSize}, we expected ${receivingFileSize}. Using sender's size as authoritative.`);
                     // Use sender's size as authoritative
-                    receivingFileSize = message.size;
+                    receivingFileSize = signalFileSize;
                 }
                 
                 // Start checking for completion - don't finalize yet
@@ -2308,6 +2335,9 @@ function handleFileChunk(chunk) {
     const chunkSize = chunk.byteLength || chunk.length;
     receivingFileChunks.push(chunk);
     receivingBytesReceived += chunkSize;
+    
+    // CRITICAL: Update last chunk received time - used to detect stale connections
+    lastChunkReceivedTime = Date.now();
     
     // Calculate progress but cap at 99.9% until actually complete
     const progress = (receivingBytesReceived / receivingFileSize) * 100;
