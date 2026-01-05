@@ -1280,6 +1280,13 @@ function addFilesToQueue(files) {
     console.log(`Added ${files.length} file(s) to queue. Total in queue: ${fileQueue.length}`);
     
     // Send all file requests at once (bulk)
+    // CRITICAL: Verify DataChannel is open before sending
+    if (dataChannel.readyState !== 'open') {
+        console.error(`❌ Cannot send file requests: DataChannel state is ${dataChannel.readyState}, not 'open'`);
+        alert(`Cannot send files. DataChannel is not ready (state: ${dataChannel.readyState}). Please wait for connection.`);
+        return;
+    }
+    
     files.forEach((file, index) => {
         const request = {
             type: 'file-request',
@@ -1292,11 +1299,14 @@ function addFilesToQueue(files) {
         
         try {
             dataChannel.send(JSON.stringify(request));
-            console.log(`File transfer request ${index + 1}/${files.length} sent:`, file.name);
+            console.log(`📤 File transfer request ${index + 1}/${files.length} sent:`, file.name, `(${formatFileSize(file.size)})`);
         } catch (error) {
-            console.error(`Error sending file request for ${file.name}:`, error);
+            console.error(`❌ Error sending file request for ${file.name}:`, error);
+            alert(`Error sending file request: ${error.message}`);
         }
     });
+    
+    console.log(`✅ All ${files.length} file request(s) sent successfully`);
     
     // Start processing the first file
     if (!isProcessingQueue && fileQueue.length > 0) {
@@ -2168,6 +2178,7 @@ function handleDataChannelMessage(event) {
                 }
                 return;
             } else if (message.type === 'file-request') {
+                console.log('📨 Received file-request message:', message);
                 handleFileRequest(message);
             } else if (message.type === 'file-accepted') {
                 handleFileAccepted();
@@ -2270,10 +2281,17 @@ function handleDataChannelMessage(event) {
 
 // File Request Handling
 function handleFileRequest(request) {
-    console.log('File transfer request received:', request.name);
+    console.log('📥 File transfer request received:', request.name, 'Size:', request.size);
+    
+    // CRITICAL: Ensure transferSection is visible
+    if (transferSection) {
+        transferSection.style.display = 'block';
+        console.log('✅ Transfer section is now visible');
+    }
     
     // Add to pending requests queue
     pendingFileRequestsQueue.push(request);
+    console.log(`📋 Total pending requests: ${pendingFileRequestsQueue.length}`);
     
     // If we're already receiving a file, just queue it
     if (receivingFile || pendingFileRequest) {
@@ -2287,6 +2305,7 @@ function handleFileRequest(request) {
 
 function showFileRequestUI() {
     if (pendingFileRequestsQueue.length === 0) {
+        console.warn('⚠️ showFileRequestUI called but no pending requests');
         return;
     }
     
@@ -2294,20 +2313,61 @@ function showFileRequestUI() {
     const totalFiles = pendingFileRequestsQueue.length;
     const totalSize = pendingFileRequestsQueue.reduce((sum, req) => sum + (req.size || 0), 0);
     
+    console.log(`📋 Showing file request UI: ${firstRequest.name}, Total files: ${totalFiles}, Total size: ${formatFileSize(totalSize)}`);
+    
+    // CRITICAL: Ensure transferSection is visible
+    if (transferSection) {
+        transferSection.style.display = 'block';
+    }
+    
     // Hide drop zone, show file request UI
-    dropZone.style.display = 'none';
-    fileRequest.style.display = 'block';
+    if (dropZone) {
+        dropZone.style.display = 'none';
+    }
+    
+    if (fileRequest) {
+        fileRequest.style.display = 'block';
+        console.log('✅ File request UI is now visible');
+    } else {
+        console.error('❌ fileRequest element not found!');
+    }
     
     // Show first file name + X more files
-    if (totalFiles > 1) {
-        requestFileName.textContent = `${firstRequest.name} +${totalFiles - 1} more file${totalFiles - 1 > 1 ? 's' : ''}`;
+    if (requestFileName) {
+        if (totalFiles > 1) {
+            requestFileName.textContent = `${firstRequest.name} +${totalFiles - 1} more file${totalFiles - 1 > 1 ? 's' : ''}`;
+        } else {
+            requestFileName.textContent = firstRequest.name;
+        }
     } else {
-        requestFileName.textContent = firstRequest.name;
+        console.error('❌ requestFileName element not found!');
     }
-    requestFileSize.textContent = formatFileSize(totalSize);
+    
+    if (requestFileSize) {
+        requestFileSize.textContent = formatFileSize(totalSize);
+    } else {
+        console.error('❌ requestFileSize element not found!');
+    }
+    
+    // Ensure buttons are enabled
+    if (acceptFileBtn) {
+        acceptFileBtn.disabled = false;
+        console.log('✅ Accept button enabled');
+    } else {
+        console.error('❌ acceptFileBtn element not found!');
+    }
+    
+    if (rejectFileBtn) {
+        rejectFileBtn.disabled = false;
+        console.log('✅ Reject button enabled');
+    } else {
+        console.error('❌ rejectFileBtn element not found!');
+    }
     
     // Store first request as current (for backward compatibility)
     pendingFileRequest = firstRequest;
+    
+    console.log('✅ File request UI displayed successfully');
 }
 
 function handleAcceptFile() {
