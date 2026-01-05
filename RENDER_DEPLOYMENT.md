@@ -111,7 +111,7 @@ Once deployed, Render will provide:
 ### WebSocket Not Connecting
 
 1. Verify you're using `wss://` (not `ws://`)
-2. Check browser console for WebSocket errors~
+2. Check browser console for WebSocket errors
 3. Ensure Render service is running (not spun down)
 
 ### Files Not Transferring
