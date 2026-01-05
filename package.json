@@ -1,0 +1,25 @@
+{
+  "name": "p2p-file-transfer",
+  "version": "1.0.0",
+  "description": "Peer-to-peer file transfer using WebRTC DataChannels",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "keywords": [
+    "webrtc",
+    "p2p",
+    "file-transfer",
+    "datachannel"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.14.2"
+  }
+}
+
