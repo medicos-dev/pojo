@@ -152,7 +152,30 @@ function showUserMessage(message) {
 
     // CRITICAL: Handle connection loss - treat as connection failure, not file failure
 // Define this BEFORE it's used (near top of file)
+// Track connection loss attempts to avoid false positives
+let connectionLossCheckCount = 0;
+let lastConnectionLossCheck = 0;
+const CONNECTION_LOSS_GRACE_PERIOD = 3000; // 3 seconds grace period on mobile
+const CONNECTION_LOSS_CHECK_INTERVAL = 1000; // Check every 1 second
+
 function handleConnectionLoss(reason = "unknown") {
+    const now = Date.now();
+    
+    // On mobile, add grace period before showing alert
+    // Brief disconnections are common on mobile networks
+    if (isMobile && (now - lastConnectionLossCheck) < CONNECTION_LOSS_GRACE_PERIOD) {
+        console.log(`⏳ Mobile grace period: ignoring brief connection loss (${reason})`);
+        connectionLossCheckCount++;
+        
+        // Only proceed if we've seen multiple connection loss events
+        if (connectionLossCheckCount < 3) {
+            lastConnectionLossCheck = now;
+            return; // Ignore transient disconnections
+        }
+    }
+    
+    lastConnectionLossCheck = now;
+    
     // Guard against double-calls (important)
     if (connectionLostHandled) {
         console.log("⚠️ Connection loss already handled, ignoring duplicate call");
@@ -164,11 +187,20 @@ function handleConnectionLoss(reason = "unknown") {
     const fileSizeGB = fileSize / (1024 * 1024 * 1024);
     const isLargeFile = fileSizeGB > 1; // Files over 1GB
     
-    console.warn("🚨 Connection lost:", reason, isLargeFile ? `(Large file: ${fileSizeGB.toFixed(2)}GB - being lenient)` : "");
+    // On mobile, be even more lenient - check if connection is actually dead
+    if (isMobile) {
+        // Check if DataChannel is actually closed or just temporarily unavailable
+        if (dataChannel && dataChannel.readyState !== 'closed' && peerConnection && peerConnection.connectionState !== 'failed') {
+            console.log(`📱 Mobile: Connection appears active (DataChannel: ${dataChannel.readyState}, PeerConnection: ${peerConnection.connectionState}) - ignoring transient loss`);
+            return; // Don't treat as connection loss on mobile if connection is still active
+        }
+    }
+    
+    console.warn("🚨 Connection lost:", reason, isLargeFile ? `(Large file: ${fileSizeGB.toFixed(2)}GB - being lenient)` : "", isMobile ? "(Mobile - being extra lenient)" : "");
     
     // For large files and transient disconnections, don't immediately mark as handled
     // This allows automatic reconnection attempts
-    if (reason === "datachannel-closed" && isLargeFile && dataChannel?.readyState === 'closed') {
+    if (reason === "datachannel-closed" && (isLargeFile || isMobile) && dataChannel?.readyState === 'closed') {
         // Check if WebSocket is still connected - if so, this might be recoverable
         if (ws && ws.readyState === WebSocket.OPEN) {
             console.log("🔄 WebSocket still connected, DataChannel closed - attempting recovery...");
@@ -185,6 +217,7 @@ function handleConnectionLoss(reason = "unknown") {
                             console.log("✅ DataChannel recovered!");
                             connectionLostHandled = false;
                             transferPaused = false;
+                            connectionLossCheckCount = 0; // Reset counter
                             return; // Don't proceed with error handling
                         }
                     }, 2000);
@@ -197,14 +230,15 @@ function handleConnectionLoss(reason = "unknown") {
     
     // Mark as handled now (unless recovery attempt above succeeds)
     connectionLostHandled = true;
+    connectionLossCheckCount = 0; // Reset counter
     
     // Set pause flag - do NOT abort transfer immediately
     // Transfer must pause, not abort, to allow resume
     transferPaused = true;
     
     // Only abort if it's a definitive failure (not just disconnected)
-    // For large files, be even more conservative
-    const shouldAbort = reason === "ice-failed" || (reason === "ice-disconnected-timeout" && !isLargeFile);
+    // For large files and mobile, be even more conservative
+    const shouldAbort = reason === "ice-failed" || (reason === "ice-disconnected-timeout" && !isLargeFile && !isMobile);
     if (shouldAbort) {
         transferAborted = true;
         
@@ -269,11 +303,14 @@ function handleConnectionLoss(reason = "unknown") {
     updateConnectionStatus('disconnected', 'Connection interrupted');
     
     // Show user-friendly message - different for pause vs abort
-    // For large files, show more encouraging message
+    // For large files and mobile, show more encouraging message
     if (transferPaused && !transferAborted) {
         const fileSizeGB = (currentFile?.size || receivingFileSize || 0) / (1024 * 1024 * 1024);
-        if (fileSizeGB > 1) {
-            showUserMessage(`Connection interrupted (${fileSizeGB.toFixed(2)}GB file). Waiting for reconnection… Large files may experience brief interruptions.`);
+        if (fileSizeGB > 1 || isMobile) {
+            const message = isMobile 
+                ? "Connection interrupted. Waiting for reconnection… Mobile networks may experience brief interruptions."
+                : `Connection interrupted (${fileSizeGB.toFixed(2)}GB file). Waiting for reconnection… Large files may experience brief interruptions.`;
+            showUserMessage(message);
         } else {
             showUserMessage("Connection interrupted. Waiting for reconnection…");
         }
@@ -1483,14 +1520,15 @@ async function streamFile(file, startOffset = 0) {
                 console.log('🔄 Final buffer drain before file-complete signal...');
                 await waitForDrain();
                 
-                // Send completion message with file size
+                // Send completion message with file size AND name for proper matching
                 console.log('📨 Sending file-complete signal...');
                 try {
                     dataChannel.send(JSON.stringify({ 
                         type: 'file-complete',
-                        size: file.size 
+                        size: file.size,
+                        fileName: file.name // Include file name for proper matching in bulk transfers
                     }));
-                    console.log('✅ File-complete signal sent (size:', file.size, 'bytes). Waiting for receiver confirmation...');
+                    console.log('✅ File-complete signal sent (file:', file.name, ', size:', file.size, 'bytes). Waiting for receiver confirmation...');
                 } catch (error) {
                     console.error('❌ Error sending completion signal:', error);
                     alert('Error sending completion signal: ' + error.message);
