@@ -161,14 +161,36 @@ const CONNECTION_LOSS_CHECK_INTERVAL = 1000; // Check every 1 second
 function handleConnectionLoss(reason = "unknown") {
     const now = Date.now();
     
-    // On mobile, add grace period before showing alert
-    // Brief disconnections are common on mobile networks
-    if (isMobile && (now - lastConnectionLossCheck) < CONNECTION_LOSS_GRACE_PERIOD) {
-        console.log(`⏳ Mobile grace period: ignoring brief connection loss (${reason})`);
+    // CRITICAL: Verify connection is actually dead before showing alert
+    // Check multiple conditions to avoid false positives
+    const wsConnected = ws && ws.readyState === WebSocket.OPEN;
+    const dcState = dataChannel?.readyState || 'unknown';
+    const pcState = peerConnection?.connectionState || 'unknown';
+    const iceState = peerConnection?.iceConnectionState || 'unknown';
+    
+    // If WebSocket is still connected, this is likely a transient issue
+    // Only treat as connection loss if WebSocket is also closed/failed
+    if (wsConnected && reason !== "ice-failed") {
+        // WebSocket is still connected - this is likely a transient DataChannel state change
+        // Wait and verify before treating as connection loss
+        console.log(`⏳ Transient state change detected (${reason}). WebSocket still connected. Verifying...`);
+        console.log(`   DataChannel: ${dcState}, PeerConnection: ${pcState}, ICE: ${iceState}`);
+        
+        // Only proceed if DataChannel is actually closed AND PeerConnection is failed
+        if (dcState !== 'closed' || pcState !== 'failed') {
+            console.log(`✅ Connection appears active - ignoring transient state change`);
+            return; // Don't treat as connection loss if connection is still active
+        }
+    }
+    
+    // On mobile/broadband, add grace period before showing alert
+    // Brief disconnections are common even on stable connections
+    if ((now - lastConnectionLossCheck) < CONNECTION_LOSS_GRACE_PERIOD) {
+        console.log(`⏳ Grace period: ignoring brief connection loss (${reason})`);
         connectionLossCheckCount++;
         
         // Only proceed if we've seen multiple connection loss events
-        if (connectionLossCheckCount < 3) {
+        if (connectionLossCheckCount < 5) { // Increased from 3 to 5 for more stability
             lastConnectionLossCheck = now;
             return; // Ignore transient disconnections
         }
@@ -187,13 +209,14 @@ function handleConnectionLoss(reason = "unknown") {
     const fileSizeGB = fileSize / (1024 * 1024 * 1024);
     const isLargeFile = fileSizeGB > 1; // Files over 1GB
     
-    // On mobile, be even more lenient - check if connection is actually dead
-    if (isMobile) {
-        // Check if DataChannel is actually closed or just temporarily unavailable
-        if (dataChannel && dataChannel.readyState !== 'closed' && peerConnection && peerConnection.connectionState !== 'failed') {
-            console.log(`📱 Mobile: Connection appears active (DataChannel: ${dataChannel.readyState}, PeerConnection: ${peerConnection.connectionState}) - ignoring transient loss`);
-            return; // Don't treat as connection loss on mobile if connection is still active
-        }
+    // Final verification: Only treat as connection loss if connection is actually dead
+    // Check if WebSocket is closed AND (DataChannel is closed OR PeerConnection is failed)
+    const isActuallyDead = !wsConnected && (dcState === 'closed' || pcState === 'failed' || iceState === 'failed');
+    
+    if (!isActuallyDead && reason !== "ice-failed") {
+        console.log(`✅ Connection verification: Not actually dead. WebSocket: ${wsConnected ? 'connected' : 'disconnected'}, DataChannel: ${dcState}, PeerConnection: ${pcState}, ICE: ${iceState}`);
+        console.log(`   Ignoring false positive connection loss (${reason})`);
+        return; // Don't treat as connection loss if connection is still active
     }
     
     console.warn("🚨 Connection lost:", reason, isLargeFile ? `(Large file: ${fileSizeGB.toFixed(2)}GB - being lenient)` : "", isMobile ? "(Mobile - being extra lenient)" : "");
@@ -1323,11 +1346,24 @@ async function streamFile(file, startOffset = 0) {
         }
         
         if (dataChannel.readyState !== 'open') {
-            console.warn('⚠️ DataChannel closed during transfer');
-            handleConnectionLoss("datachannel-closed");
-            if (transferAborted) {
-                reader.cancel();
-                throw new Error('TRANSFER_ABORTED');
+            // Don't immediately treat as connection loss - verify first
+            // DataChannel might be temporarily in "connecting" state
+            const dcState = dataChannel.readyState;
+            const wsConnected = ws && ws.readyState === WebSocket.OPEN;
+            const pcState = peerConnection?.connectionState;
+            
+            // Only treat as connection loss if it's actually closed AND WebSocket is also disconnected
+            if (dcState === 'closed' && (!wsConnected || pcState === 'failed')) {
+                console.warn('⚠️ DataChannel closed during transfer (verified connection loss)');
+                handleConnectionLoss("datachannel-closed");
+                if (transferAborted) {
+                    reader.cancel();
+                    throw new Error('TRANSFER_ABORTED');
+                }
+            } else {
+                // Transient state change - wait and retry
+                console.log(`⏳ DataChannel state: ${dcState} (WebSocket: ${wsConnected ? 'connected' : 'disconnected'}, PeerConnection: ${pcState}). Waiting for recovery...`);
+                await new Promise(resolve => setTimeout(resolve, 1000));
             }
             // If just paused, wait and retry
             await new Promise(resolve => setTimeout(resolve, 1000));
@@ -1579,11 +1615,21 @@ async function streamFile(file, startOffset = 0) {
                         }
                     }
                     
-                    // Check channel is still open
+                    // Check channel is still open - verify before treating as connection loss
                     if (dataChannel.readyState !== 'open') {
-                        handleConnectionLoss("datachannel-closed");
-                        if (transferAborted) {
-                            throw new Error('TRANSFER_ABORTED');
+                        const dcState = dataChannel.readyState;
+                        const wsConnected = ws && ws.readyState === WebSocket.OPEN;
+                        const pcState = peerConnection?.connectionState;
+                        
+                        // Only treat as connection loss if it's actually closed AND WebSocket is also disconnected
+                        if (dcState === 'closed' && (!wsConnected || pcState === 'failed')) {
+                            handleConnectionLoss("datachannel-closed");
+                            if (transferAborted) {
+                                throw new Error('TRANSFER_ABORTED');
+                            }
+                        } else {
+                            // Transient state change - wait and retry
+                            console.log(`⏳ DataChannel state: ${dcState}. Waiting for recovery...`);
                         }
                         // If just paused, wait and retry
                         await new Promise(resolve => setTimeout(resolve, 1000));
@@ -1621,11 +1667,21 @@ async function streamFile(file, startOffset = 0) {
                     }
                 }
                 
-                // Check channel is still open
+                // Check channel is still open - verify before treating as connection loss
                 if (dataChannel.readyState !== 'open') {
-                    handleConnectionLoss("datachannel-closed");
-                    if (transferAborted) {
-                        throw new Error('TRANSFER_ABORTED');
+                    const dcState = dataChannel.readyState;
+                    const wsConnected = ws && ws.readyState === WebSocket.OPEN;
+                    const pcState = peerConnection?.connectionState;
+                    
+                    // Only treat as connection loss if it's actually closed AND WebSocket is also disconnected
+                    if (dcState === 'closed' && (!wsConnected || pcState === 'failed')) {
+                        handleConnectionLoss("datachannel-closed");
+                        if (transferAborted) {
+                            throw new Error('TRANSFER_ABORTED');
+                        }
+                    } else {
+                        // Transient state change - wait and retry
+                        console.log(`⏳ DataChannel state: ${dcState}. Waiting for recovery...`);
                     }
                     // If just paused, wait and retry
                     await new Promise(resolve => setTimeout(resolve, 1000));
@@ -1718,9 +1774,20 @@ async function streamFileLegacy(file, startOffset = 0) {
         }
         
         if (dataChannel.readyState !== 'open') {
-            handleConnectionLoss("datachannel-closed");
-            if (transferAborted) {
-                return;
+            // Don't immediately treat as connection loss - verify first
+            const dcState = dataChannel.readyState;
+            const wsConnected = ws && ws.readyState === WebSocket.OPEN;
+            const pcState = peerConnection?.connectionState;
+            
+            // Only treat as connection loss if it's actually closed AND WebSocket is also disconnected
+            if (dcState === 'closed' && (!wsConnected || pcState === 'failed')) {
+                handleConnectionLoss("datachannel-closed");
+                if (transferAborted) {
+                    return;
+                }
+            } else {
+                // Transient state change - wait and retry
+                console.log(`⏳ DataChannel state: ${dcState}. Waiting for recovery...`);
             }
             // If just paused, wait and retry
             setTimeout(() => readChunk(), 1000);
@@ -1759,11 +1826,21 @@ async function streamFileLegacy(file, startOffset = 0) {
                     }
                 }
                 
-                // Check channel is still open before sending
+                // Check channel is still open before sending - verify before treating as connection loss
                 if (dataChannel.readyState !== 'open') {
-                    handleConnectionLoss("datachannel-closed");
-                    if (transferAborted) {
-                        return;
+                    const dcState = dataChannel.readyState;
+                    const wsConnected = ws && ws.readyState === WebSocket.OPEN;
+                    const pcState = peerConnection?.connectionState;
+                    
+                    // Only treat as connection loss if it's actually closed AND WebSocket is also disconnected
+                    if (dcState === 'closed' && (!wsConnected || pcState === 'failed')) {
+                        handleConnectionLoss("datachannel-closed");
+                        if (transferAborted) {
+                            return;
+                        }
+                    } else {
+                        // Transient state change - wait and retry
+                        console.log(`⏳ DataChannel state: ${dcState}. Waiting for recovery...`);
                     }
                     // If just paused, wait and retry
                     setTimeout(() => sendWithBackpressure(), 1000);
