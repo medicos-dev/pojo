@@ -1023,8 +1023,8 @@ function createDataChannel() {
         maxRetransmits: 0 // Reliable but not retransmit-based
     });
     
-    // FREE TIER SAFE: Chunk size is fixed at 16KB - no dynamic adjustment needed
-    console.log(`📏 Using fixed chunk size: ${(CHUNK_SIZE/1024).toFixed(0)}KB (free tier safe)`);
+    // DYNAMIC SLIDING WINDOW: Start with 16KB, will switch to 128KB once connected
+    console.log(`📏 Using dynamic chunk size: ${(INITIAL_CHUNK_SIZE/1024).toFixed(0)}KB initial, ${(CONNECTED_CHUNK_SIZE/1024).toFixed(0)}KB when connected`);
     
     setupDataChannel(dataChannel);
 }
@@ -2138,10 +2138,25 @@ let allBytesReceivedTime = null; // Track when we first received all bytes
 function handleDataChannelMessage(event) {
     const data = event.data;
     
+    // DEBUG: Log ALL incoming messages to help diagnose issues
+    console.log('📥 DataChannel message received:', typeof data === 'string' ? data.substring(0, 100) : `Binary data (${data.byteLength} bytes)`);
+    
     // Check if it's a JSON message (metadata or control)
     if (typeof data === 'string') {
+        let message;
         try {
-            const message = JSON.parse(data);
+            message = JSON.parse(data);
+            console.log('📨 Parsed message type:', message.type, message);
+        } catch (parseError) {
+            console.error('❌ Failed to parse JSON message:', parseError);
+            console.error('❌ Raw message data:', data);
+            return; // Don't process invalid JSON
+        }
+        
+        if (!message || !message.type) {
+            console.error('❌ Message missing type field:', message);
+            return;
+        }
             
             if (message.type === 'ping') {
                 // Receiver ignores ping - just acknowledge it's received
@@ -2179,6 +2194,14 @@ function handleDataChannelMessage(event) {
                 return;
             } else if (message.type === 'file-request') {
                 console.log('📨 Received file-request message:', message);
+                console.log('🔍 About to call handleFileRequest. Current state:', {
+                    transferSection: !!transferSection,
+                    fileRequest: !!fileRequest,
+                    requestFileName: !!requestFileName,
+                    acceptFileBtn: !!acceptFileBtn,
+                    rejectFileBtn: !!rejectFileBtn,
+                    pendingFileRequestsQueueLength: pendingFileRequestsQueue.length
+                });
                 handleFileRequest(message);
             } else if (message.type === 'file-accepted') {
                 handleFileAccepted();
@@ -2262,11 +2285,11 @@ function handleDataChannelMessage(event) {
                         completeSendingFile();
                     }, 500);
                 }
+            } else {
+                // Unknown message type - log it for debugging
+                console.warn('⚠️ Unknown message type received:', message.type, message);
             }
             return;
-        } catch (e) {
-            // Not JSON, treat as binary data
-        }
     }
     
     // Handle binary file data - ONLY if we're actively receiving a file
@@ -2282,29 +2305,60 @@ function handleDataChannelMessage(event) {
 // File Request Handling
 function handleFileRequest(request) {
     console.log('📥 File transfer request received:', request.name, 'Size:', request.size);
+    console.log('🔍 handleFileRequest called. Full request:', request);
     
-    // CRITICAL: Ensure transferSection is visible
-    if (transferSection) {
-        transferSection.style.display = 'block';
-        console.log('✅ Transfer section is now visible');
+    // Validate request
+    if (!request || !request.name) {
+        console.error('❌ Invalid file request received:', request);
+        return;
     }
     
+    // CRITICAL: Ensure transferSection is visible FIRST
+    if (!transferSection) {
+        console.error('❌ transferSection element not found! Cannot show file request UI.');
+        return;
+    }
+    
+    transferSection.style.display = 'block';
+    transferSection.style.visibility = 'visible';
+    console.log('✅ Transfer section is now visible (display: block, visibility: visible)');
+    
     // Add to pending requests queue
+    if (!pendingFileRequestsQueue) {
+        pendingFileRequestsQueue = [];
+    }
     pendingFileRequestsQueue.push(request);
     console.log(`📋 Total pending requests: ${pendingFileRequestsQueue.length}`);
     
     // If we're already receiving a file, just queue it
     if (receivingFile || pendingFileRequest) {
-        console.log(`File request queued. Total pending: ${pendingFileRequestsQueue.length}`);
+        console.log(`⏸️ File request queued (already receiving). Total pending: ${pendingFileRequestsQueue.length}`);
+        // Still show UI if not already showing
+        if (fileRequest && fileRequest.style.display === 'none') {
+            showFileRequestUI();
+        }
         return;
     }
     
     // Show the first file request with bulk info
+    console.log('🎯 Calling showFileRequestUI...');
     showFileRequestUI();
 }
 
 function showFileRequestUI() {
-    if (pendingFileRequestsQueue.length === 0) {
+    console.log('🎨 showFileRequestUI called');
+    console.log('🔍 Current state:', {
+        pendingFileRequestsQueueLength: pendingFileRequestsQueue?.length || 0,
+        transferSection: !!transferSection,
+        fileRequest: !!fileRequest,
+        dropZone: !!dropZone,
+        requestFileName: !!requestFileName,
+        requestFileSize: !!requestFileSize,
+        acceptFileBtn: !!acceptFileBtn,
+        rejectFileBtn: !!rejectFileBtn
+    });
+    
+    if (!pendingFileRequestsQueue || pendingFileRequestsQueue.length === 0) {
         console.warn('⚠️ showFileRequestUI called but no pending requests');
         return;
     }
@@ -2316,58 +2370,90 @@ function showFileRequestUI() {
     console.log(`📋 Showing file request UI: ${firstRequest.name}, Total files: ${totalFiles}, Total size: ${formatFileSize(totalSize)}`);
     
     // CRITICAL: Ensure transferSection is visible
-    if (transferSection) {
-        transferSection.style.display = 'block';
+    if (!transferSection) {
+        console.error('❌ transferSection element not found!');
+        return;
     }
+    transferSection.style.display = 'block';
+    transferSection.style.visibility = 'visible';
+    console.log('✅ Transfer section forced visible');
     
     // Hide drop zone, show file request UI
     if (dropZone) {
         dropZone.style.display = 'none';
+        console.log('✅ Drop zone hidden');
+    } else {
+        console.warn('⚠️ dropZone element not found');
     }
     
-    if (fileRequest) {
-        fileRequest.style.display = 'block';
-        console.log('✅ File request UI is now visible');
+    if (!fileRequest) {
+        console.error('❌ fileRequest element not found! Cannot show UI.');
+        // Try to re-query it
+        const fileRequestRetry = document.getElementById('fileRequest');
+        if (fileRequestRetry) {
+            console.log('✅ Found fileRequest on retry');
+            fileRequestRetry.style.display = 'block';
+            fileRequestRetry.style.visibility = 'visible';
+        } else {
+            console.error('❌ fileRequest still not found after retry');
+            return;
+        }
     } else {
-        console.error('❌ fileRequest element not found!');
+        fileRequest.style.display = 'block';
+        fileRequest.style.visibility = 'visible';
+        console.log('✅ File request UI is now visible (display: block, visibility: visible)');
     }
     
     // Show first file name + X more files
-    if (requestFileName) {
+    if (!requestFileName) {
+        console.error('❌ requestFileName element not found!');
+    } else {
         if (totalFiles > 1) {
             requestFileName.textContent = `${firstRequest.name} +${totalFiles - 1} more file${totalFiles - 1 > 1 ? 's' : ''}`;
         } else {
             requestFileName.textContent = firstRequest.name;
         }
-    } else {
-        console.error('❌ requestFileName element not found!');
+        console.log('✅ File name set:', requestFileName.textContent);
     }
     
-    if (requestFileSize) {
-        requestFileSize.textContent = formatFileSize(totalSize);
-    } else {
+    if (!requestFileSize) {
         console.error('❌ requestFileSize element not found!');
+    } else {
+        requestFileSize.textContent = formatFileSize(totalSize);
+        console.log('✅ File size set:', requestFileSize.textContent);
     }
     
-    // Ensure buttons are enabled
-    if (acceptFileBtn) {
-        acceptFileBtn.disabled = false;
-        console.log('✅ Accept button enabled');
-    } else {
+    // Ensure buttons are enabled and visible
+    if (!acceptFileBtn) {
         console.error('❌ acceptFileBtn element not found!');
+    } else {
+        acceptFileBtn.disabled = false;
+        acceptFileBtn.style.display = 'block';
+        acceptFileBtn.style.visibility = 'visible';
+        console.log('✅ Accept button enabled and visible');
     }
     
-    if (rejectFileBtn) {
-        rejectFileBtn.disabled = false;
-        console.log('✅ Reject button enabled');
-    } else {
+    if (!rejectFileBtn) {
         console.error('❌ rejectFileBtn element not found!');
+    } else {
+        rejectFileBtn.disabled = false;
+        rejectFileBtn.style.display = 'block';
+        rejectFileBtn.style.visibility = 'visible';
+        console.log('✅ Reject button enabled and visible');
     }
     
     // Store first request as current (for backward compatibility)
     pendingFileRequest = firstRequest;
     
-    console.log('✅ File request UI displayed successfully');
+    // Force a reflow to ensure visibility
+    void fileRequest.offsetHeight;
+    
+    console.log('✅ File request UI displayed successfully. Final check:', {
+        fileRequestDisplay: fileRequest?.style.display,
+        fileRequestVisibility: fileRequest?.style.visibility,
+        acceptBtnDisabled: acceptFileBtn?.disabled,
+        rejectBtnDisabled: rejectFileBtn?.disabled
+    });
 }
 
 function handleAcceptFile() {
