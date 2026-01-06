@@ -1930,8 +1930,8 @@ async function streamFileLegacy(file, startOffset = 0) {
                     console.log('✅ Connection appears restored, resuming legacy transfer...');
                     transferPaused = false;
                     connectionLostHandled = false;
-                    // Continue with transfer immediately
-                    readChunk();
+                    // ✅ FIX: Use setTimeout to break call stack (prevent stack overflow)
+                    setTimeout(() => readChunk(), 0);
                     return;
                 }
                 
@@ -1971,7 +1971,8 @@ async function streamFileLegacy(file, startOffset = 0) {
         
         // HIGH-WATER MARK THROTTLING: Fill buffer up to 4MB before waiting
         if (dataChannel.bufferedAmount >= HIGH_WATER_MARK) {
-            waitForDrain().then(() => readChunk());
+            // ✅ FIX: Use setTimeout to break call stack (prevent stack overflow)
+            waitForDrain().then(() => setTimeout(() => readChunk(), 0));
             return;
         }
         
@@ -2019,14 +2020,16 @@ async function streamFileLegacy(file, startOffset = 0) {
                 
                 // CRITICAL: Event-based backpressure handling
                 if (dataChannel.bufferedAmount > BACKPRESSURE_THRESHOLD) {
-                    waitForDrain().then(() => sendWithBackpressure());
+                    // ✅ FIX: Use setTimeout to break call stack (prevent stack overflow)
+                    waitForDrain().then(() => setTimeout(() => sendWithBackpressure(), 0));
                     return;
                 }
                 
                 // Double-check before sending
                 if (dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
                     console.warn(`Buffer exceeds max (${(dataChannel.bufferedAmount/1024/1024).toFixed(2)}MB), waiting...`);
-                    waitForDrain().then(() => sendWithBackpressure());
+                    // ✅ FIX: Use setTimeout to break call stack (prevent stack overflow)
+                    waitForDrain().then(() => setTimeout(() => sendWithBackpressure(), 0));
                     return;
                 }
                 
@@ -2100,7 +2103,8 @@ async function streamFileLegacy(file, startOffset = 0) {
                 updateProgress(Math.min(99.9, progress));
                 
                 if (offset < file.size) {
-                    readChunk();
+                    // ✅ FIX: Use setTimeout to break call stack (prevent stack overflow)
+                    setTimeout(() => readChunk(), 0);
                 } else {
                     console.log('📤 File reading complete (legacy).');
                     console.log(`📊 Transfer stats: Bytes: ${transferStats.bytesTransferred}/${file.size}, Chunks sent: ${transferStats.chunksSent}, Chunks queued: ${transferStats.chunksQueued}`);
