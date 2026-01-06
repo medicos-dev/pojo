@@ -1108,15 +1108,14 @@ function createPeerConnection() {
 }
 
 function createDataChannel() {
+    // 🔴 Fully reliable, ordered delivery - let SCTP handle retransmits
+    // Do NOT set maxRetransmits or maxPacketLifeTime (even as null) - Chrome treats null as "present"
+    // The real fix for send credit exhaustion is: small wire chunks (≤16KB) + yielding + sliding window
     dataChannel = peerConnection.createDataChannel('fileTransfer', {
-        ordered: true,
-        // 🔴 Use fully reliable, ordered delivery. Let SCTP handle retransmits.
-        // This reduces browser-side batching unpredictability when combined with our own flow control.
-        maxRetransmits: null,
-        // 🔴 Disable SCTP coalescing (Chrome quirk) - prevents send credit exhaustion
-        maxPacketLifeTime: null
+        ordered: true
     });
     
+    console.log('📡 DataChannel created (reliable, ordered)');
     console.log(`📏 Using fixed chunk size: ${(CONNECTED_CHUNK_SIZE/1024).toFixed(0)}KB for entire transfer`);
     
     setupDataChannel(dataChannel);
