@@ -46,8 +46,9 @@ function getWebSocketURL() {
 const WS_URL = getWebSocketURL();
 console.log('WebSocket URL:', WS_URL);
 // DYNAMIC SLIDING WINDOW: Optimized for 200GB+ files
-const INITIAL_CHUNK_SIZE = 16 * 1024; // 16KB for initial handshake
-const CONNECTED_CHUNK_SIZE = 128 * 1024; // 128KB once connected (sweet spot for mobile stability and speed)
+// 🔴 PROTOCOL INVARIANT: Fixed chunk size per index (single CHUNK_SIZE for entire transfer)
+const INITIAL_CHUNK_SIZE = 128 * 1024; // 128KB fixed chunk size
+const CONNECTED_CHUNK_SIZE = 128 * 1024; // Must match INITIAL_CHUNK_SIZE for deterministic offsets
 const HIGH_WATER_MARK = 4 * 1024 * 1024; // 4MB - fill buffer up to this before waiting
 const BACKPRESSURE_THRESHOLD = 1024 * 1024; // 1MB - bufferedAmountLowThreshold (triggers next burst)
 const MAX_BUFFERED_AMOUNT = HIGH_WATER_MARK; // 4MB max - don't send if buffer exceeds this
@@ -298,9 +299,10 @@ let currentFileResolve = null; // Resolve function for current file promise
 
 // ✅ FIX 1: Windowed ACK tracking (not per-chunk)
 const ACK_EVERY_N_CHUNKS = 64; // ACK every 64 chunks
-let ackedChunks = new Set(); // Track which chunks receiver has ACKed (for stall detection only)
+let ackedChunks = new Set(); // Track which chunks receiver has ACKed
 let highestAckedChunkIndex = -1; // Highest chunk index that was ACKed
 let totalChunksSent = 0; // Total chunks sent for current file
+let ackedChunkCount = 0; // Total chunks ACKed (derived from windowed ACKs)
 let fileCompleteSent = false; // ✅ FIX 4: Guard against duplicate file-complete
 let senderChunkIndex = 0; // ✅ FIX 2: Immutable chunk index counter
 let fileReader = null;
@@ -326,6 +328,52 @@ let transferStats = {
     chunksQueued: 0,
     totalChunksExpected: 0
 };
+
+// Adaptive sliding-window upper bound for in-flight chunks (tuned by sender)
+let maxInFlightChunks = 128;
+let lastInFlightAdjustTs = 0;
+
+// Sender-side helper: wait until all chunks have been ACKed (MNC-grade completion gating)
+async function waitForAllAcks(expectedTotalChunks, timeoutMs = 60000) {
+    // If we don't know how many chunks to expect, skip ACK gating
+    if (!expectedTotalChunks || expectedTotalChunks <= 0) {
+        return;
+    }
+
+    const start = Date.now();
+    let lastAckedSize = ackedChunks.size;
+    let stallCount = 0;
+
+    while (ackedChunks.size < expectedTotalChunks) {
+        // Abort if transfer was cancelled
+        if (transferAborted) {
+            throw new Error('TRANSFER_ABORTED');
+        }
+
+        const now = Date.now();
+        if (now - start > timeoutMs) {
+            throw new Error(`ACK_TIMEOUT: received ACKs for ${ackedChunks.size}/${expectedTotalChunks} chunks`);
+        }
+
+        // Monotonic progress guard to avoid livelock
+        if (ackedChunks.size <= lastAckedSize) {
+            stallCount++;
+            if (stallCount > 100) { // ~10s at 100ms interval
+                throw new Error('SEND_STALLED');
+            }
+        } else {
+            stallCount = 0;
+            lastAckedSize = ackedChunks.size;
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 100));
+    }
+
+    // Explicit end-of-file validation: ensure contiguous ACKs up to final chunk
+    if (highestAckedChunkIndex + 1 !== expectedTotalChunks) {
+        throw new Error(`ACK_RANGE_MISMATCH: highestAckedChunkIndex=${highestAckedChunkIndex}, expectedTotalChunks=${expectedTotalChunks}`);
+    }
+}
 
 // Helper function to stop keepalive pings
 function stopKeepalive() {
@@ -1058,11 +1106,12 @@ function createPeerConnection() {
 function createDataChannel() {
     dataChannel = peerConnection.createDataChannel('fileTransfer', {
         ordered: true,
-        maxRetransmits: 0 // Reliable but not retransmit-based
+        // 🔴 Use fully reliable, ordered delivery. Let SCTP handle retransmits.
+        // This reduces browser-side batching unpredictability when combined with our own flow control.
+        maxRetransmits: null
     });
     
-    // DYNAMIC SLIDING WINDOW: Start with 16KB, will switch to 128KB once connected
-    console.log(`📏 Using dynamic chunk size: ${(INITIAL_CHUNK_SIZE/1024).toFixed(0)}KB initial, ${(CONNECTED_CHUNK_SIZE/1024).toFixed(0)}KB when connected`);
+    console.log(`📏 Using fixed chunk size: ${(CONNECTED_CHUNK_SIZE/1024).toFixed(0)}KB for entire transfer`);
     
     setupDataChannel(dataChannel);
 }
@@ -1466,8 +1515,8 @@ async function waitForDrain() {
 // DYNAMIC SLIDING WINDOW: Send chunks with high-water mark throttling
 // Fills buffer up to 4MB, then waits for bufferedAmountLow (1MB threshold) to trigger next burst
 async function sendNextQueuedChunk(chunkData, file, isConnected = false) {
-    // Dynamic chunk size: 16KB for initial handshake, 128KB once connected
-    const chunkSize = isConnected ? CONNECTED_CHUNK_SIZE : INITIAL_CHUNK_SIZE;
+    // 🔴 PROTOCOL: Fixed chunk size per index (use single CHUNK_SIZE for whole transfer)
+    const chunkSize = CONNECTED_CHUNK_SIZE; // INITIAL_CHUNK_SIZE === CONNECTED_CHUNK_SIZE
     
     // Split chunkData if it's larger than chunkSize
     const chunks = [];
@@ -1482,12 +1531,39 @@ async function sendNextQueuedChunk(chunkData, file, isConnected = false) {
         chunks.push(chunkData);
     }
     
-    // Send chunks in bursts until high-water mark (4MB) is reached
+    // Send chunks in bursts until high-water mark (4MB) or in-flight limit is reached
     for (const chunk of chunks) {
         // HIGH-WATER MARK THROTTLING: Fill buffer up to 4MB before waiting
         while (dataChannel.bufferedAmount >= HIGH_WATER_MARK) {
             // Buffer is full - wait for bufferedAmountLow event (1MB threshold)
             await waitForDrain();
+        }
+
+        // SLIDING WINDOW: Limit max in-flight chunks (TCP-like control)
+        // Adaptive sliding window: dynamically reduce max in-flight when we see prolonged backpressure
+        const windowStart = Date.now();
+        let localWaitCount = 0;
+        while ((totalChunksSent - highestAckedChunkIndex) > maxInFlightChunks) {
+            if (transferAborted) {
+                throw new Error('TRANSFER_ABORTED');
+            }
+            await waitForDrain();
+            localWaitCount++;
+
+            const now = Date.now();
+            const waitedMs = now - windowStart;
+            // If we've been waiting >3s or looped many times and it's been a while since last adjust,
+            // shrink the window down towards a safer lower bound for mobile radios.
+            if ((waitedMs > 3000 || localWaitCount > 30) && (now - lastInFlightAdjustTs > 5000)) {
+                if (maxInFlightChunks > 32) {
+                    const old = maxInFlightChunks;
+                    maxInFlightChunks = Math.max(32, Math.floor(maxInFlightChunks / 2));
+                    lastInFlightAdjustTs = now;
+                    console.warn(`⚠️ High RTT/backpressure detected. Reducing maxInFlightChunks from ${old} to ${maxInFlightChunks}`);
+                } else {
+                    lastInFlightAdjustTs = now;
+                }
+            }
         }
         
         // Check connection state before sending
@@ -1497,20 +1573,16 @@ async function sendNextQueuedChunk(chunkData, file, isConnected = false) {
         
         // ✅ FIX 2: Immutable chunk index - never reuse
         const chunkIndex = senderChunkIndex++;
-        
-        // ✅ FIX 2: Send chunk with index as JSON message
-        // Note: For large chunks, we send base64-encoded payload to avoid JSON size limits
+
+        // ✅ BINARY PROTOCOL: prepend 4-byte little-endian chunkIndex header to raw bytes
         const chunkArray = new Uint8Array(chunk);
-        const base64Payload = btoa(String.fromCharCode(...chunkArray));
-        
-        const chunkMessage = JSON.stringify({
-            type: 'chunk',
-            chunkIndex: chunkIndex,
-            payload: base64Payload,
-            size: chunk.byteLength
-        });
-        
-        dataChannel.send(chunkMessage);
+        const framed = new Uint8Array(4 + chunkArray.byteLength);
+        const headerView = new DataView(framed.buffer);
+        headerView.setUint32(0, chunkIndex, true); // little-endian index
+        framed.set(chunkArray, 4);
+
+        // Send pure binary ArrayBuffer (no base64 / JSON per chunk)
+        dataChannel.send(framed.buffer);
         transferStats.chunksSent++;
         totalChunksSent++;
         transferStats.bytesTransferred += chunk.byteLength;
@@ -1766,7 +1838,21 @@ async function streamFile(file, startOffset = 0) {
                 // This ensures all chunks are transmitted before signaling completion
                 console.log('🔄 Flushing buffer before sending completion signal...');
                 await waitForDrain();
-                console.log('✅ Buffer flushed - sending completion signal');
+                console.log('✅ Buffer flushed - waiting for ACKs before completion signal...');
+
+                // Wait until all chunks have been ACKed by receiver (MNC-grade gating)
+                try {
+                    await waitForAllAcks(totalChunksSent);
+                    console.log(`✅ All chunks ACKed by receiver (${totalChunksSent}/${totalChunksSent})`);
+                } catch (error) {
+                    console.error('❌ Error while waiting for ACKs before completion:', error);
+                    if (error.message === 'TRANSFER_ABORTED') {
+                        console.warn('⚠️ Transfer aborted while waiting for ACKs');
+                        return;
+                    }
+                    alert(`Error waiting for receiver ACKs: ${error.message}`);
+                    return;
+                }
                 
                 // CRITICAL: File-end must be delayed until buffer drains
                 // Wait for buffer to drain before sending file-complete
@@ -1912,340 +1998,310 @@ async function streamFileLegacy(file, startOffset = 0) {
     
     transferStats.startTime = Date.now();
     transferStats.lastUpdateTime = Date.now();
-    
-    const readChunk = () => {
-        // CRITICAL: Check if transfer was paused or aborted
+    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+    while (offset < file.size) {
+        // Paused or aborted?
         if (transferPaused || transferAborted) {
             if (transferAborted) {
                 console.warn('⚠️ Transfer aborted - stopping legacy transfer');
                 return;
+            }
+
+            const fileSizeGB = (file.size || 0) / (1024 * 1024 * 1024);
+            const waitTime = fileSizeGB > 10 ? 2000 : 1000;
+
+            if (dataChannel && dataChannel.readyState === 'open' && !connectionLostHandled) {
+                console.log('✅ Connection appears restored, resuming legacy transfer...');
+                transferPaused = false;
+                connectionLostHandled = false;
+                isConnected = true;
+                chunkSize = CONNECTED_CHUNK_SIZE;
             } else {
-                // Paused - wait for reconnection
-                // For large files, wait longer
-                const fileSizeGB = (file.size || 0) / (1024 * 1024 * 1024);
-                const waitTime = fileSizeGB > 10 ? 2000 : 1000; // 2s for very large files
-                
-                // Check if connection is actually restored
-                if (dataChannel && dataChannel.readyState === 'open' && !connectionLostHandled) {
-                    console.log('✅ Connection appears restored, resuming legacy transfer...');
-                    transferPaused = false;
-                    connectionLostHandled = false;
-                    // ✅ FIX: Use setTimeout to break call stack (prevent stack overflow)
-                    setTimeout(() => readChunk(), 0);
-                    return;
-                }
-                
                 console.warn(`⏸️ Transfer paused - waiting for reconnection... (checking in ${waitTime}ms)`);
-                setTimeout(() => readChunk(), waitTime);
-                return;
+                await sleep(waitTime);
+                continue;
             }
         }
-        
+
+        // Channel closed or unstable
         if (dataChannel.readyState !== 'open') {
-            // Don't immediately treat as connection loss - verify first
             const dcState = dataChannel.readyState;
             const wsConnected = ws && ws.readyState === WebSocket.OPEN;
             const pcState = peerConnection?.connectionState;
-            
-            // Only treat as connection loss if it's actually closed AND WebSocket is also disconnected
+
             if (dcState === 'closed' && (!wsConnected || pcState === 'failed')) {
                 handleConnectionLoss("datachannel-closed");
                 if (transferAborted) {
                     return;
                 }
             } else {
-                // Transient state change - wait and retry
                 console.log(`⏳ DataChannel state: ${dcState}. Waiting for recovery...`);
             }
-            // If just paused, wait and retry
-            setTimeout(() => readChunk(), 1000);
-            return;
+            await sleep(1000);
+            continue;
         }
-        
+
         // Update connection state for dynamic chunk sizing
         if (!isConnected && dataChannel.readyState === 'open') {
             isConnected = true;
             chunkSize = CONNECTED_CHUNK_SIZE;
             console.log('✅ Connection established - switching to 128KB chunks (legacy)');
         }
-        
-        // HIGH-WATER MARK THROTTLING: Fill buffer up to 4MB before waiting
+
+        // High-water mark throttling
         if (dataChannel.bufferedAmount >= HIGH_WATER_MARK) {
-            // ✅ FIX: Use setTimeout to break call stack (prevent stack overflow)
-            waitForDrain().then(() => setTimeout(() => readChunk(), 0));
+            await waitForDrain();
+            continue;
+        }
+
+        const blob = file.slice(offset, offset + chunkSize);
+        let chunk;
+        try {
+            const arrayBuffer = await blob.arrayBuffer();
+            chunk = new Uint8Array(arrayBuffer);
+        } catch (error) {
+            console.error('Error reading blob:', error);
+            alert('Error reading file');
             return;
         }
-        
-        const blob = file.slice(offset, offset + chunkSize);
-        
-        // ASYNC BLOBS: Use await blob.arrayBuffer() for memory efficiency
-        (async () => {
-            try {
-                const arrayBuffer = await blob.arrayBuffer();
-                const chunk = new Uint8Array(arrayBuffer);
-                
-                // Wait if backpressure is too high
-                const sendWithBackpressure = async () => {
-                // CRITICAL: Check if transfer was paused or aborted
-                if (transferPaused || transferAborted) {
+
+        const chunkLength = chunk.length;
+        transferStats.chunksQueued++;
+
+        // Backpressure-aware send loop (no recursion)
+        let sendSuccess = false;
+        let retryCount = 0;
+        const MAX_RETRIES = 20;
+
+        while (!sendSuccess && retryCount < MAX_RETRIES) {
+            if (transferPaused || transferAborted) {
+                if (transferAborted) {
+                    return;
+                }
+                const fileSizeGB = (file.size || 0) / (1024 * 1024 * 1024);
+                const waitTime = fileSizeGB > 10 ? 2000 : 1000;
+                await sleep(waitTime);
+                continue;
+            }
+
+            if (dataChannel.readyState !== 'open') {
+                const dcState = dataChannel.readyState;
+                const wsConnected = ws && ws.readyState === WebSocket.OPEN;
+                const pcState = peerConnection?.connectionState;
+
+                if (dcState === 'closed' && (!wsConnected || pcState === 'failed')) {
+                    handleConnectionLoss("datachannel-closed");
                     if (transferAborted) {
                         return;
-                    } else {
-                        // Paused - wait and retry
-                        setTimeout(() => sendWithBackpressure(), 1000);
-                        return;
                     }
-                }
-                
-                // Check channel is still open before sending - verify before treating as connection loss
-                if (dataChannel.readyState !== 'open') {
-                    const dcState = dataChannel.readyState;
-                    const wsConnected = ws && ws.readyState === WebSocket.OPEN;
-                    const pcState = peerConnection?.connectionState;
-                    
-                    // Only treat as connection loss if it's actually closed AND WebSocket is also disconnected
-                    if (dcState === 'closed' && (!wsConnected || pcState === 'failed')) {
-                        handleConnectionLoss("datachannel-closed");
-                        if (transferAborted) {
-                            return;
-                        }
-                    } else {
-                        // Transient state change - wait and retry
-                        console.log(`⏳ DataChannel state: ${dcState}. Waiting for recovery...`);
-                    }
-                    // If just paused, wait and retry
-                    setTimeout(() => sendWithBackpressure(), 1000);
-                    return;
-                }
-                
-                // CRITICAL: Event-based backpressure handling
-                if (dataChannel.bufferedAmount > BACKPRESSURE_THRESHOLD) {
-                    // ✅ FIX: Use setTimeout to break call stack (prevent stack overflow)
-                    waitForDrain().then(() => setTimeout(() => sendWithBackpressure(), 0));
-                    return;
-                }
-                
-                // Double-check before sending
-                if (dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-                    console.warn(`Buffer exceeds max (${(dataChannel.bufferedAmount/1024/1024).toFixed(2)}MB), waiting...`);
-                    // ✅ FIX: Use setTimeout to break call stack (prevent stack overflow)
-                    waitForDrain().then(() => setTimeout(() => sendWithBackpressure(), 0));
-                    return;
-                }
-                
-                // Track chunk before sending
-                const chunkLength = chunk.length;
-                transferStats.chunksQueued++;
-                let sendSuccess = false;
-                let retryCount = 0;
-                const MAX_RETRIES = 20; // Increased retries
-                
-                const attemptSend = () => {
-                    try {
-                        // Check channel state before each attempt
-                        if (dataChannel.readyState !== 'open') {
-                            console.error('DataChannel closed during send');
-                            return false;
-                        }
-                        
-                        // Check buffer before sending
-                        if (dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-                            console.warn(`Buffer too full (${(dataChannel.bufferedAmount/1024/1024).toFixed(2)}MB), waiting...`);
-                            return false; // Will retry
-                        }
-                        
-                        dataChannel.send(chunk);
-                        return true;
-                    } catch (error) {
-                        // If send fails due to queue full, will retry
-                        if (error.message && (error.message.includes('queue is full') || error.message.includes('send queue'))) {
-                            console.warn(`Send queue full (attempt ${retryCount + 1}/${MAX_RETRIES}), buffered: ${(dataChannel.bufferedAmount/1024/1024).toFixed(2)}MB`);
-                            return false; // Will retry
-                        }
-                        // Other errors - log and fail
-                        console.error('Error sending chunk:', error);
-                        return false;
-                    }
-                };
-                
-                // Retry loop
-                while (!sendSuccess && retryCount < MAX_RETRIES) {
-                    sendSuccess = attemptSend();
-                    if (!sendSuccess) {
-                        retryCount++;
-                        if (retryCount < MAX_RETRIES) {
-                            setTimeout(() => {
-                                sendWithBackpressure();
-                            }, 200);
-                            return; // Will retry via setTimeout
-                        }
-                    }
-                }
-                
-                if (!sendSuccess) {
-                    console.error(`Failed to send chunk after ${MAX_RETRIES} retries. Buffer: ${(dataChannel.bufferedAmount/1024/1024).toFixed(2)}MB`);
-                    releaseWakeLock();
-                    alert(`Failed to send chunk after ${MAX_RETRIES} retries. Transfer may be incomplete.`);
-                    return;
-                }
-                
-                transferStats.chunksSent++;
-                transferStats.bytesTransferred += chunkLength;
-                offset += chunk.length;
-                
-                // Log every 100th chunk or when close to completion
-                if (transferStats.chunksSent % 100 === 0 || transferStats.bytesTransferred > file.size * 0.95) {
-                    console.log(`📤 Sent chunk #${transferStats.chunksSent}: ${chunkLength} bytes. Total: ${transferStats.bytesTransferred}/${file.size} (${((transferStats.bytesTransferred/file.size)*100).toFixed(1)}%)`);
-                }
-                
-                // Calculate progress but cap at 99.9% until actually complete
-                const progress = (transferStats.bytesTransferred / file.size) * 100;
-                updateProgress(Math.min(99.9, progress));
-                
-                if (offset < file.size) {
-                    // ✅ FIX: Use setTimeout to break call stack (prevent stack overflow)
-                    setTimeout(() => readChunk(), 0);
                 } else {
-                    console.log('📤 File reading complete (legacy).');
-                    console.log(`📊 Transfer stats: Bytes: ${transferStats.bytesTransferred}/${file.size}, Chunks sent: ${transferStats.chunksSent}, Chunks queued: ${transferStats.chunksQueued}`);
-                    
-                    // Note: We don't check byte count here - we'll wait for receiver confirmation
-                    // The receiver's confirmation is the authoritative source of truth
-                    
-                    // Verify chunks were sent (warning only, not fatal)
-                    if (transferStats.chunksSent !== transferStats.chunksQueued) {
-                        console.warn(`⚠️ Warning: Chunks sent (${transferStats.chunksSent}) != chunks queued (${transferStats.chunksQueued}). Some chunks may have failed.`);
-                    }
-                    
-                    // Wait for all buffered data to be sent
-                    let bufferWaitAttempts = 0;
-                    const MAX_BUFFER_WAIT = 300; // Wait up to 30 seconds
-                    
-                    const waitForBuffer = () => {
-                        if (dataChannel.bufferedAmount > 0 && bufferWaitAttempts < MAX_BUFFER_WAIT) {
-                            if (bufferWaitAttempts % 20 === 0) {
-                                console.log(`⏳ Waiting for buffer to clear. Buffered: ${(dataChannel.bufferedAmount/1024/1024).toFixed(2)} MB (attempt ${bufferWaitAttempts + 1}/${MAX_BUFFER_WAIT})`);
-                            }
-                            bufferWaitAttempts++;
-                            setTimeout(waitForBuffer, 100);
-                            return;
-                        }
-                        
-                        if (dataChannel.bufferedAmount > 0) {
-                            console.warn(`⚠️ Buffer still has ${(dataChannel.bufferedAmount/1024/1024).toFixed(2)} MB after waiting, but proceeding`);
-                        } else {
-                            console.log('✅ Buffer cleared successfully');
-                        }
-                        
-                        // CRITICAL: Wait additional time for data to reach receiver (network latency)
-                        // bufferedAmount=0 means data left browser, but it may still be in transit
-                        // Calculate wait time based on file size and estimated network speed
-                        const fileSizeMB = file.size / (1024 * 1024);
-                        // Estimate: assume ~5MB/s transfer rate (conservative), add 10 seconds buffer
-                        // For very large files, cap at 30 seconds max wait
-                        // Formula: (fileSizeMB / 5) + 10, minimum 10s, maximum 30s
-                        const estimatedWaitSeconds = Math.min(30, Math.max(10, (fileSizeMB / 5) + 10));
-                        console.log(`⏳ Waiting ${estimatedWaitSeconds}s for data to reach receiver (network latency, file: ${fileSizeMB.toFixed(2)}MB)...`);
-                        
-                        // Wait with periodic checks
-                        let waitAttempts = 0;
-                        const maxWaitAttempts = estimatedWaitSeconds * 10; // Check every 100ms
-                        const waitInterval = setInterval(() => {
-                            waitAttempts++;
-                            if (dataChannel.readyState !== 'open') {
-                                console.error('❌ DataChannel closed during wait! State:', dataChannel.readyState);
-                                clearInterval(waitInterval);
-                                alert('Connection lost during file transfer. Please try again.');
-                                return;
-                            }
-                            // Check if buffer filled up again (shouldn't happen, but check anyway)
-                            if (dataChannel.bufferedAmount > 0 && waitAttempts % 50 === 0) {
-                                console.log(`⚠️ Buffer refilled during wait: ${(dataChannel.bufferedAmount/1024/1024).toFixed(2)} MB`);
-                            }
-                            if (waitAttempts >= maxWaitAttempts) {
-                                clearInterval(waitInterval);
-                                // Now proceed with sending completion signal
-                                // Verify all bytes were sent one more time
-                                const actualPercent = (transferStats.bytesTransferred / file.size) * 100;
-                                console.log(`📊 Final check: ${transferStats.bytesTransferred}/${file.size} bytes (${actualPercent.toFixed(2)}%)`);
-                                updateProgress(Math.min(99.9, actualPercent)); // Don't show 100% yet
-                                
-                            // CRITICAL: Flush buffer before sending completion signal
-                            // This ensures all chunks are transmitted before signaling completion
-                            console.log('🔄 Flushing buffer before sending completion signal...');
-                            waitForDrain().then(async () => {
-                                console.log('✅ Buffer flushed - sending completion signal');
-                                
-                                // CRITICAL: File-end must be delayed until buffer drains
-                                console.log('🔄 Final buffer drain before file-complete signal...');
-                                await waitForDrain();
-                                
-                                // 🔴 Pillar 5: Compute file hash for integrity verification
-                                let fileHash = null;
-                                try {
-                                    const fileBuffer = await file.arrayBuffer();
-                                    const hashBuffer = await crypto.subtle.digest('SHA-256', fileBuffer);
-                                    const hashArray = Array.from(new Uint8Array(hashBuffer));
-                                    fileHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-                                    console.log(`🔐 Computed file hash: ${fileHash.substring(0, 16)}...`);
-                                } catch (error) {
-                                    console.warn('⚠️ Could not compute file hash (non-critical):', error);
-                                }
-                                
-                                console.log('📨 Sending file-complete signal...');
-                                // Send completion message with file size, name, and hash
-                                try {
-                                    dataChannel.send(JSON.stringify({ 
-                                        type: 'file-complete',
-                                        size: file.size,
-                                        fileName: file.name, // Include file name for proper matching in bulk transfers
-                                        hash: fileHash // 🔴 Pillar 5: Integrity hash
-                                    }));
-                                    console.log('✅ File-complete signal sent (file:', file.name, ', size:', file.size, 'bytes, hash:', fileHash ? fileHash.substring(0, 16) + '...' : 'none', '). Waiting for receiver confirmation...');
-                                } catch (error) {
-                                    console.error('❌ Error sending completion signal:', error);
-                                    alert('Error sending completion signal: ' + error.message);
-                                    return;
-                                }
-                                
-                                // Wait for receiver confirmation that all bytes were received
-                                // Use timeout watchdog to prevent infinite hangs
-                                console.log('⏳ Waiting for receiver confirmation that all bytes were received...');
-                                try {
-                                    await waitForAckWithTimeout(file.name, 30000);
-                                    console.log('✅ Receiver confirmed file receipt');
-                                } catch (error) {
-                                    console.error(`❌ ${error.message}`);
-                                    // Continue anyway - receiver may have received the file even if ACK was lost
-                                    console.warn('⚠️ Proceeding despite ACK timeout - file may have been received');
-                                }
-                                
-                                if (dataChannel.readyState !== 'open') {
-                                    console.error('❌ DataChannel closed while waiting for confirmation!');
-                                    alert('Connection lost while waiting for transfer confirmation.');
-                                    return;
-                                }
-                                
-                                // Now mark as 100% complete
-                                updateProgress(100);
-                                setTimeout(() => completeSendingFile(), 500);
-                            });
-                        }
-                        }, 100); // Check every 100ms
-                    };
-                    waitForBuffer();
+                    console.log(`⏳ DataChannel state: ${dcState}. Waiting for recovery...`);
                 }
-            };
-            
-                sendWithBackpressure();
-            } catch (error) {
-                console.error('Error reading blob:', error);
-                alert('Error reading file');
+                await sleep(1000);
+                continue;
             }
-        })();
-    };
-    
-    readChunk();
+
+            // Event-based backpressure handling
+            if (dataChannel.bufferedAmount > BACKPRESSURE_THRESHOLD || dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+                await waitForDrain();
+                continue;
+            }
+
+            try {
+                dataChannel.send(chunk);
+                sendSuccess = true;
+            } catch (error) {
+                if (error.message && (error.message.includes('queue is full') || error.message.includes('send queue'))) {
+                    retryCount++;
+                    console.warn(`Send queue full (attempt ${retryCount}/${MAX_RETRIES}), buffered: ${(dataChannel.bufferedAmount/1024/1024).toFixed(2)}MB`);
+                    if (retryCount < MAX_RETRIES) {
+                        await sleep(200);
+                        continue;
+                    }
+                } else {
+                    console.error('Error sending chunk:', error);
+                }
+            }
+        }
+
+        if (!sendSuccess) {
+            console.error(`Failed to send chunk after ${MAX_RETRIES} retries. Buffer: ${(dataChannel.bufferedAmount/1024/1024).toFixed(2)}MB`);
+            releaseWakeLock();
+            alert(`Failed to send chunk after ${MAX_RETRIES} retries. Transfer may be incomplete.`);
+            return;
+        }
+
+        transferStats.chunksSent++;
+        transferStats.bytesTransferred += chunkLength;
+        offset += chunkLength;
+
+        if (transferStats.chunksSent % 100 === 0 || transferStats.bytesTransferred > file.size * 0.95) {
+            console.log(`📤 Sent chunk #${transferStats.chunksSent}: ${chunkLength} bytes. Total: ${transferStats.bytesTransferred}/${file.size} (${((transferStats.bytesTransferred/file.size)*100).toFixed(1)}%)`);
+        }
+
+        const progress = (transferStats.bytesTransferred / file.size) * 100;
+        updateProgress(Math.min(99.9, progress));
+
+        // Yield to the event loop to avoid call stack growth on mobile
+        await sleep(0);
+    }
+
+    console.log('📤 File reading complete (legacy).');
+    console.log(`📊 Transfer stats: Bytes: ${transferStats.bytesTransferred}/${file.size}, Chunks sent: ${transferStats.chunksSent}, Chunks queued: ${transferStats.chunksQueued}`);
+
+    if (transferStats.chunksSent !== transferStats.chunksQueued) {
+        console.warn(`⚠️ Warning: Chunks sent (${transferStats.chunksSent}) != chunks queued (${transferStats.chunksQueued}). Some chunks may have failed.`);
+    }
+
+    let bufferWaitAttempts = 0;
+    const MAX_BUFFER_WAIT = 300; // Wait up to 30 seconds
+
+    while (dataChannel.bufferedAmount > 0 && bufferWaitAttempts < MAX_BUFFER_WAIT) {
+        if (bufferWaitAttempts % 20 === 0) {
+            console.log(`⏳ Waiting for buffer to clear. Buffered: ${(dataChannel.bufferedAmount/1024/1024).toFixed(2)} MB (attempt ${bufferWaitAttempts + 1}/${MAX_BUFFER_WAIT})`);
+        }
+        bufferWaitAttempts++;
+        await sleep(100);
+    }
+
+    if (dataChannel.bufferedAmount > 0) {
+        console.warn(`⚠️ Buffer still has ${(dataChannel.bufferedAmount/1024/1024).toFixed(2)} MB after waiting, but proceeding`);
+    } else {
+        console.log('✅ Buffer cleared successfully');
+    }
+
+    const fileSizeMB = file.size / (1024 * 1024);
+    const estimatedWaitSeconds = Math.min(30, Math.max(10, (fileSizeMB / 5) + 10));
+    console.log(`⏳ Waiting ${estimatedWaitSeconds}s for data to reach receiver (network latency, file: ${fileSizeMB.toFixed(2)}MB)...`);
+
+    let waitAttempts = 0;
+    const maxWaitAttempts = estimatedWaitSeconds * 10; // Check every 100ms
+    while (waitAttempts < maxWaitAttempts) {
+        if (dataChannel.readyState !== 'open') {
+            console.error('❌ DataChannel closed during wait! State:', dataChannel.readyState);
+            alert('Connection lost during file transfer. Please try again.');
+            return;
+        }
+        if (dataChannel.bufferedAmount > 0 && waitAttempts % 50 === 0) {
+            console.log(`⚠️ Buffer refilled during wait: ${(dataChannel.bufferedAmount/1024/1024).toFixed(2)} MB`);
+        }
+        await sleep(100);
+        waitAttempts++;
+    }
+
+    let finalBufferCheckAttempts = 0;
+    let consecutiveEmptyChecks = 0;
+    const FINAL_BUFFER_CHECK = 500;
+    const REQUIRED_EMPTY_CHECKS = 100;
+
+    console.log('🔍 Starting final buffer verification...');
+    while (finalBufferCheckAttempts < FINAL_BUFFER_CHECK) {
+        const currentBuffer = dataChannel.bufferedAmount;
+        if (currentBuffer === 0) {
+            consecutiveEmptyChecks++;
+            if (consecutiveEmptyChecks >= REQUIRED_EMPTY_CHECKS) {
+                console.log(`✅ Buffer verified empty for ${(consecutiveEmptyChecks * 0.1).toFixed(1)}s - all data transmitted`);
+                break;
+            }
+        } else {
+            consecutiveEmptyChecks = 0;
+            if (finalBufferCheckAttempts % 10 === 0) {
+                console.log(`🔍 Buffer check: ${(currentBuffer/1024/1024).toFixed(2)} MB still buffered (attempt ${finalBufferCheckAttempts + 1}/${FINAL_BUFFER_CHECK})`);
+            }
+        }
+        await sleep(100);
+        finalBufferCheckAttempts++;
+    }
+
+    if (dataChannel.bufferedAmount > 0) {
+        console.error(`❌ CRITICAL: Buffer still has ${(dataChannel.bufferedAmount/1024/1024).toFixed(2)} MB after ${FINAL_BUFFER_CHECK} checks! This data may be lost.`);
+        console.error(`⚠️ Warning: Some data may not have been transmitted. Receiver may be missing ${(dataChannel.bufferedAmount/1024/1024).toFixed(2)} MB`);
+    } else if (consecutiveEmptyChecks < REQUIRED_EMPTY_CHECKS) {
+        console.warn(`⚠️ Buffer cleared but didn't stay empty for required duration. Proceeding anyway.`);
+    }
+
+    const actualPercent = (transferStats.bytesTransferred / file.size) * 100;
+    console.log(`📊 Final verification: ${transferStats.bytesTransferred}/${file.size} bytes (${actualPercent.toFixed(2)}%), Buffer: ${dataChannel.bufferedAmount} bytes, Empty checks: ${consecutiveEmptyChecks}/${REQUIRED_EMPTY_CHECKS}`);
+    updateProgress(Math.min(99.9, actualPercent));
+
+    console.log('🔄 Flushing buffer before sending completion signal...');
+    await waitForDrain();
+    console.log('✅ Buffer flushed - waiting for ACKs before completion signal...');
+
+    // Wait until all chunks have been ACKed by receiver (MNC-grade gating)
+    try {
+        await waitForAllAcks(totalChunksSent);
+        console.log(`✅ All chunks ACKed by receiver (${totalChunksSent}/${totalChunksSent})`);
+    } catch (error) {
+        console.error('❌ Error while waiting for ACKs before completion:', error);
+        if (error.message === 'TRANSFER_ABORTED') {
+            console.warn('⚠️ Transfer aborted while waiting for ACKs');
+            return;
+        }
+        alert(`Error waiting for receiver ACKs: ${error.message}`);
+        return;
+    }
+
+    console.log('🔄 Final buffer drain before file-complete signal...');
+    await waitForDrain();
+
+    if (fileCompleteSent) {
+        console.warn('⚠️ file-complete already sent, skipping duplicate');
+        return;
+    }
+
+    let fileHash = null;
+    try {
+        const fileBuffer = await file.arrayBuffer();
+        const hashBuffer = await crypto.subtle.digest('SHA-256', fileBuffer);
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        fileHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+        console.log(`🔐 Computed file hash: ${fileHash.substring(0, 16)}...`);
+    } catch (error) {
+        console.warn('⚠️ Could not compute file hash (non-critical):', error);
+    }
+
+    fileCompleteSent = true;
+
+    console.log('📨 Sending file-complete signal...');
+    try {
+        dataChannel.send(JSON.stringify({ 
+            type: 'file-complete',
+            size: file.size,
+            fileName: file.name,
+            hash: fileHash
+        }));
+        console.log('✅ File-complete signal sent (file:', file.name, ', size:', file.size, 'bytes, hash:', fileHash ? fileHash.substring(0, 16) + '...' : 'none', '). Waiting for receiver confirmation...');
+    } catch (error) {
+        console.error('❌ Error sending completion signal:', error);
+        fileCompleteSent = false;
+        alert('Error sending completion signal: ' + error.message);
+        return;
+    }
+
+    ackedChunks.clear();
+    highestAckedChunkIndex = -1;
+    totalChunksSent = 0;
+    senderChunkIndex = 0;
+
+    console.log('⏳ Waiting for receiver confirmation that all bytes were received...');
+    try {
+        await waitForAckWithTimeout(file.name, 30000);
+        console.log('✅ Receiver confirmed file receipt');
+    } catch (error) {
+        console.error(`❌ ${error.message}`);
+        console.warn('⚠️ Proceeding despite ACK timeout - file may have been received');
+    }
+
+    if (dataChannel.readyState !== 'open') {
+        console.error('❌ DataChannel closed while waiting for confirmation!');
+        alert('Connection lost while waiting for transfer confirmation.');
+        return;
+    }
+
+    updateProgress(100);
+    setTimeout(() => completeSendingFile(), 500);
 }
 
 // Data Channel Message Handling (Receiver)
@@ -2304,42 +2360,21 @@ function handleDataChannelMessage(event) {
                 // Receiver ignores ping - just acknowledge it's received
                 // This keeps the connection alive
                 return;
-            } else if (message.type === 'chunk') {
-                // ✅ FIX 2: Handle chunk with immutable index
-                const chunkIndex = message.chunkIndex;
-                const base64Payload = message.payload;
-                const chunkSize = message.size;
-                
-                if (chunkIndex === undefined || chunkIndex === null || !base64Payload) {
-                    console.error('❌ Invalid chunk message:', message);
-                    return;
-                }
-                
-                // Decode base64 payload to ArrayBuffer
-                try {
-                    const binaryString = atob(base64Payload);
-                    const bytes = new Uint8Array(binaryString.length);
-                    for (let i = 0; i < binaryString.length; i++) {
-                        bytes[i] = binaryString.charCodeAt(i);
-                    }
-                    const chunk = bytes.buffer;
-                    
-                    // Process chunk with its index
-                    handleFileChunk(chunk, chunkIndex);
-                } catch (error) {
-                    console.error('❌ Error decoding chunk payload:', error);
-                }
-                return;
             } else if (message.type === 'chunk-ack') {
-                // ✅ FIX 1: Sender receives windowed ACK from receiver (for stall detection only)
+                // ✅ FIX 1: Sender receives windowed ACK from receiver (used for completion + stall detection)
                 const highestContiguous = message.highestContiguousChunkIndex;
                 if (highestContiguous !== undefined && highestContiguous !== null) {
                     if (highestContiguous > highestAckedChunkIndex) {
+                        // Mark all chunks up to highestContiguous as ACKed
+                        for (let i = highestAckedChunkIndex + 1; i <= highestContiguous; i++) {
+                            ackedChunks.add(i);
+                        }
                         highestAckedChunkIndex = highestContiguous;
+                        ackedChunkCount = ackedChunks.size;
                     }
                     // Log every 100th ACK to avoid spam
                     if (highestContiguous % 100 === 0) {
-                        console.log(`✅ Received windowed ACK up to chunk #${highestContiguous}`);
+                        console.log(`✅ Received windowed ACK up to chunk #${highestContiguous} (acked: ${ackedChunkCount})`);
                     }
                 }
                 return;
@@ -2491,7 +2526,27 @@ function handleDataChannelMessage(event) {
     // Handle binary file data - ONLY if we're actively receiving a file
     // This prevents chunks from being processed before file metadata arrives
     if (receivingFile && receivingFileSize > 0) {
-        handleFileChunk(data);
+        // Binary chunk framing: first 4 bytes = little-endian chunkIndex, rest = payload
+        const processBinary = (buffer) => {
+            if (!buffer || buffer.byteLength <= 4) {
+                console.warn('⚠️ Received binary data too small to contain header, ignoring');
+                return;
+            }
+            const view = new DataView(buffer);
+            const chunkIndex = view.getUint32(0, true);
+            const payload = buffer.slice(4);
+            handleFileChunk(payload, chunkIndex);
+        };
+
+        if (data instanceof ArrayBuffer) {
+            processBinary(data);
+        } else if (data && typeof data.arrayBuffer === 'function') {
+            data.arrayBuffer().then(processBinary).catch(err => {
+                console.error('❌ Failed to read binary chunk data:', err);
+            });
+        } else {
+            console.warn('⚠️ Received unsupported binary data type:', typeof data);
+        }
     } else {
         // Chunk arrived but we're not ready - this shouldn't happen but log it
         console.warn('⚠️ Received chunk but no active file transfer. Waiting for file-metadata...');
@@ -3677,8 +3732,17 @@ function showReceivingFileUI(file) {
 }
 
 function updateProgress(percent) {
-    progressFill.style.width = `${Math.min(100, Math.max(0, percent))}%`;
-    progressPercent.textContent = `${Math.round(percent)}%`;
+    // Sender-side UI: prefer ACK-based progress when available
+    let percentToShow = percent;
+    
+    if (totalChunksSent > 0 && ackedChunks && ackedChunks.size > 0) {
+        const ackPercent = (ackedChunks.size / totalChunksSent) * 100;
+        // Don't over-report beyond what was actually ACKed
+        percentToShow = Math.min(100, Math.max(0, ackPercent));
+    }
+
+    progressFill.style.width = `${Math.min(100, Math.max(0, percentToShow))}%`;
+    progressPercent.textContent = `${Math.round(percentToShow)}%`;
     
     // Calculate speed and time remaining
     const now = Date.now();
