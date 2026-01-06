@@ -296,10 +296,13 @@ let fileQueue = []; // Queue for multiple files
 let isProcessingQueue = false; // Flag to prevent concurrent processing
 let currentFileResolve = null; // Resolve function for current file promise
 
-// ✅ FIX 4: Sender tracks chunk ACKs
-let ackedChunks = new Set(); // Track which chunks receiver has ACKed
+// ✅ FIX 1: Windowed ACK tracking (not per-chunk)
+const ACK_EVERY_N_CHUNKS = 64; // ACK every 64 chunks
+let ackedChunks = new Set(); // Track which chunks receiver has ACKed (for stall detection only)
 let highestAckedChunkIndex = -1; // Highest chunk index that was ACKed
 let totalChunksSent = 0; // Total chunks sent for current file
+let fileCompleteSent = false; // ✅ FIX 4: Guard against duplicate file-complete
+let senderChunkIndex = 0; // ✅ FIX 2: Immutable chunk index counter
 let fileReader = null;
 let fileStream = null;
 // Promise resolver for file transfer confirmation
@@ -1492,10 +1495,24 @@ async function sendNextQueuedChunk(chunkData, file, isConnected = false) {
             throw new Error('DataChannel closed');
         }
         
-        // Send chunk
-        dataChannel.send(chunk);
+        // ✅ FIX 2: Immutable chunk index - never reuse
+        const chunkIndex = senderChunkIndex++;
+        
+        // ✅ FIX 2: Send chunk with index as JSON message
+        // Note: For large chunks, we send base64-encoded payload to avoid JSON size limits
+        const chunkArray = new Uint8Array(chunk);
+        const base64Payload = btoa(String.fromCharCode(...chunkArray));
+        
+        const chunkMessage = JSON.stringify({
+            type: 'chunk',
+            chunkIndex: chunkIndex,
+            payload: base64Payload,
+            size: chunk.byteLength
+        });
+        
+        dataChannel.send(chunkMessage);
         transferStats.chunksSent++;
-        totalChunksSent++; // ✅ FIX 4: Track total chunks for ACK verification
+        totalChunksSent++;
         transferStats.bytesTransferred += chunk.byteLength;
         
         // Update progress
@@ -1756,22 +1773,14 @@ async function streamFile(file, startOffset = 0) {
                 console.log('🔄 Final buffer drain before file-complete signal...');
                 await waitForDrain();
                 
-                // ✅ FIX 4: Wait for highest chunk ACK before sending file-complete
-                const expectedLastChunkIndex = totalChunksSent - 1; // 0-indexed
-                console.log(`⏳ Waiting for ACK of last chunk (chunk #${expectedLastChunkIndex}, total sent: ${totalChunksSent})...`);
-                
-                // Wait up to 10 seconds for last chunk ACK
-                const ACK_TIMEOUT = 10000;
-                const startTime = Date.now();
-                while (highestAckedChunkIndex < expectedLastChunkIndex && (Date.now() - startTime) < ACK_TIMEOUT) {
-                    await new Promise(resolve => setTimeout(resolve, 100)); // Check every 100ms
+                // ✅ FIX 4: SINGLE authoritative file-complete (guard against duplicates)
+                if (fileCompleteSent) {
+                    console.warn('⚠️ file-complete already sent, skipping duplicate');
+                    return;
                 }
                 
-                if (highestAckedChunkIndex >= expectedLastChunkIndex) {
-                    console.log(`✅ Last chunk ACK received (chunk #${highestAckedChunkIndex}). Proceeding with file-complete.`);
-                } else {
-                    console.warn(`⚠️ Timeout waiting for last chunk ACK. Highest ACKed: ${highestAckedChunkIndex}, Expected: ${expectedLastChunkIndex}. Proceeding anyway.`);
-                }
+                // ✅ FIX 3: Tail chunk MUST be its own index (already handled by senderChunkIndex++)
+                // The last chunk sent already has its own unique index
                 
                 // 🔴 Pillar 5: Compute file hash for integrity verification
                 let fileHash = null;
@@ -1785,6 +1794,9 @@ async function streamFile(file, startOffset = 0) {
                     console.warn('⚠️ Could not compute file hash (non-critical):', error);
                 }
                 
+                // ✅ FIX 4: Mark as sent BEFORE sending (prevents race conditions)
+                fileCompleteSent = true;
+                
                 // Send completion message with file size, name, and hash
                 console.log('📨 Sending file-complete signal...');
                 try {
@@ -1793,12 +1805,12 @@ async function streamFile(file, startOffset = 0) {
                         size: file.size,
                         fileName: file.name, // Include file name for proper matching in bulk transfers
                         hash: fileHash, // 🔴 Pillar 5: Integrity hash
-                        totalChunks: totalChunksSent, // ✅ FIX 3: Send total chunks for verification
-                        lastAckedChunk: highestAckedChunkIndex
+                        totalChunks: totalChunksSent // ✅ FIX 5: Send total chunks for chunk-based completion
                     }));
                     console.log('✅ File-complete signal sent (file:', file.name, ', size:', file.size, 'bytes, chunks:', totalChunksSent, ', hash:', fileHash ? fileHash.substring(0, 16) + '...' : 'none', '). Waiting for receiver confirmation...');
                 } catch (error) {
                     console.error('❌ Error sending completion signal:', error);
+                    fileCompleteSent = false; // Reset on error
                     alert('Error sending completion signal: ' + error.message);
                     return;
                 }
@@ -1807,6 +1819,7 @@ async function streamFile(file, startOffset = 0) {
                 ackedChunks.clear();
                 highestAckedChunkIndex = -1;
                 totalChunksSent = 0;
+                senderChunkIndex = 0;
                 
                 // Wait for receiver confirmation that all bytes were received
                 // Use timeout watchdog to prevent infinite hangs
@@ -2287,17 +2300,42 @@ function handleDataChannelMessage(event) {
                 // Receiver ignores ping - just acknowledge it's received
                 // This keeps the connection alive
                 return;
-            } else if (message.type === 'chunk-ack') {
-                // ✅ FIX 4: Sender receives chunk ACK from receiver
+            } else if (message.type === 'chunk') {
+                // ✅ FIX 2: Handle chunk with immutable index
                 const chunkIndex = message.chunkIndex;
-                if (chunkIndex !== undefined && chunkIndex !== null) {
-                    ackedChunks.add(chunkIndex);
-                    if (chunkIndex > highestAckedChunkIndex) {
-                        highestAckedChunkIndex = chunkIndex;
+                const base64Payload = message.payload;
+                const chunkSize = message.size;
+                
+                if (chunkIndex === undefined || chunkIndex === null || !base64Payload) {
+                    console.error('❌ Invalid chunk message:', message);
+                    return;
+                }
+                
+                // Decode base64 payload to ArrayBuffer
+                try {
+                    const binaryString = atob(base64Payload);
+                    const bytes = new Uint8Array(binaryString.length);
+                    for (let i = 0; i < binaryString.length; i++) {
+                        bytes[i] = binaryString.charCodeAt(i);
+                    }
+                    const chunk = bytes.buffer;
+                    
+                    // Process chunk with its index
+                    handleFileChunk(chunk, chunkIndex);
+                } catch (error) {
+                    console.error('❌ Error decoding chunk payload:', error);
+                }
+                return;
+            } else if (message.type === 'chunk-ack') {
+                // ✅ FIX 1: Sender receives windowed ACK from receiver (for stall detection only)
+                const highestContiguous = message.highestContiguousChunkIndex;
+                if (highestContiguous !== undefined && highestContiguous !== null) {
+                    if (highestContiguous > highestAckedChunkIndex) {
+                        highestAckedChunkIndex = highestContiguous;
                     }
                     // Log every 100th ACK to avoid spam
-                    if (chunkIndex % 100 === 0) {
-                        console.log(`✅ Received ACK for chunk #${chunkIndex} (highest: ${highestAckedChunkIndex})`);
+                    if (highestContiguous % 100 === 0) {
+                        console.log(`✅ Received windowed ACK up to chunk #${highestContiguous}`);
                     }
                 }
                 return;
@@ -2410,6 +2448,16 @@ function handleDataChannelMessage(event) {
                 // Set expected size and signal flag
                 expectedFileSize = signalFileSize || receivingFileSize;
                 fileCompleteSignalReceived = true;
+                
+                // ✅ FIX 5: Store expected total chunks from sender
+                if (message.totalChunks !== undefined && message.totalChunks > 0) {
+                    expectedTotalChunks = message.totalChunks;
+                    console.log(`📊 Expected total chunks: ${expectedTotalChunks}`);
+                } else {
+                    // Estimate from file size if not provided
+                    expectedTotalChunks = Math.ceil(expectedFileSize / CONNECTED_CHUNK_SIZE);
+                    console.log(`📊 Estimated total chunks: ${expectedTotalChunks} (from size)`);
+                }
                 
                 // Check completion immediately
                 checkAndCompleteFile();
@@ -2830,6 +2878,8 @@ async function startReceivingFile(metadata, resumeOffset = 0) {
     // ✅ FIX 3: Reset chunk tracking map for new file
     receivedChunks.clear();
     lastAckedChunkIndex = -1;
+    expectedTotalChunks = 0; // ✅ FIX 5: Reset expected chunks
+    highestContiguousChunkIndex = -1; // ✅ FIX 1: Reset contiguous tracking
     
     showReceivingFileUI(receivingFile);
     resetTransferStats();
@@ -2846,8 +2896,10 @@ const BATCH_SIZE = 10; // Write every 10 chunks to reduce disk I/O bottleneck
 // ✅ FIX 3: Store chunkIndex → boolean map (enterprise pattern)
 let receivedChunks = new Map(); // chunkIndex -> chunkSize (tracks which chunks were received)
 let lastAckedChunkIndex = -1; // Track last chunk we ACKed to sender
+let expectedTotalChunks = 0; // ✅ FIX 5: Expected total chunks for completion check
+let highestContiguousChunkIndex = -1; // ✅ FIX 1: Track highest contiguous chunk for windowed ACK
 
-async function handleFileChunk(chunk) {
+async function handleFileChunk(chunk, chunkIndex) {
     // 🔹 Idempotent handler - safe to call multiple times
     if (!receivingFile || transferState === TransferState.COMPLETED) return;
     
@@ -2866,31 +2918,40 @@ async function handleFileChunk(chunk) {
     // Note: Hash verification is done at finalizeFile() from the complete assembled file
     // This ensures we verify the final file, not individual chunks
     
+    // ✅ FIX 2: Use immutable chunkIndex from sender (don't increment our own counter)
     // Add chunk to buffer (keep in memory temporarily for batching)
-    const chunkIndex = currentChunkIndex;
     chunkBuffer.push({
         chunkIndex: chunkIndex,
         chunkData: chunk
     });
-    currentChunkIndex++;
     
     // ✅ FIX 3: Track received chunks in map
     receivedChunks.set(chunkIndex, chunkSize);
     
+    // ✅ FIX 1: Update highest contiguous chunk index for windowed ACK
+    // Find highest contiguous chunk (chunks 0, 1, 2, ... N where all exist)
+    let contiguous = highestContiguousChunkIndex;
+    while (receivedChunks.has(contiguous + 1)) {
+        contiguous++;
+    }
+    highestContiguousChunkIndex = Math.max(highestContiguousChunkIndex, contiguous);
+    
     // CRITICAL: Update last chunk received time - used to detect stale connections
     lastChunkReceivedTime = Date.now();
     
-    // ✅ FIX 4: Receiver must ACK last chunk explicitly
-    // Send ACK for this chunk to sender
-    if (dataChannel && dataChannel.readyState === 'open') {
-        try {
-            dataChannel.send(JSON.stringify({
-                type: 'chunk-ack',
-                chunkIndex: chunkIndex
-            }));
-            lastAckedChunkIndex = chunkIndex;
-        } catch (error) {
-            console.warn('⚠️ Could not send chunk ACK (non-critical):', error);
+    // ✅ FIX 1: Windowed ACK (every 64 chunks) - NOT per-chunk
+    if (chunkIndex % ACK_EVERY_N_CHUNKS === 0) {
+        // Send windowed ACK with highest contiguous chunk index
+        if (dataChannel && dataChannel.readyState === 'open') {
+            try {
+                dataChannel.send(JSON.stringify({
+                    type: 'chunk-ack',
+                    highestContiguousChunkIndex: highestContiguousChunkIndex
+                }));
+                lastAckedChunkIndex = highestContiguousChunkIndex;
+            } catch (error) {
+                console.warn('⚠️ Could not send windowed ACK (non-critical):', error);
+            }
         }
     }
     
@@ -3069,9 +3130,16 @@ async function checkAndCompleteFile() {
     // Flush any remaining chunks from buffer before checking
     await flushChunkBuffer();
     
-    // Simple check: receivedBytes === expectedFileSize
-    if (receivedBytes === expectedFileSize) {
-        console.log(`✅ File complete! Received: ${receivedBytes}/${expectedFileSize} bytes`);
+    // ✅ FIX 5: Completion condition MUST be chunk-based
+    const receivedChunkCount = receivedChunks.size;
+    
+    // Primary check: receivedChunks.size === expectedTotalChunks
+    if (expectedTotalChunks > 0 && receivedChunkCount === expectedTotalChunks) {
+        console.log(`✅ File complete! Received all ${receivedChunkCount} chunks (${receivedBytes}/${expectedFileSize} bytes)`);
+        await finalizeFile();
+    } else if (receivedBytes === expectedFileSize && expectedTotalChunks === 0) {
+        // Fallback: If totalChunks not provided, use byte count
+        console.log(`✅ File complete! Received: ${receivedBytes}/${expectedFileSize} bytes, ${receivedChunkCount} chunks`);
         await finalizeFile();
     } else {
         const missing = expectedFileSize - receivedBytes;
