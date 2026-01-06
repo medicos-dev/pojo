@@ -326,11 +326,35 @@ let fileTransferConfirmationResolver = null;
 let transferAborted = false; // Flag to abort transfer on connection loss
 let transferPaused = false; // Flag to pause transfer (waiting for reconnection)
 let keepaliveInterval = null; // Keepalive ping interval
+let bytesSentThisTick = 0; // Track bytes sent in current tick
+let lastTick = performance.now(); // For rate limiting
+let currentTargetMbps = TARGET_MBPS; // Dynamic rate (can be reduced on throttling detection)
 
 // Pause transfer function (hard guard - stops sending immediately)
 function pauseTransfer(reason) {
     transferPaused = true;
     console.warn(`⏸️ Transfer paused: ${reason}`);
+}
+
+// 🧯 FIX #1: Hard sender rate limit - canSend() function (drop-in)
+// Ensure function is defined in global scope for accessibility
+window.canSend = function canSend(bytes) {
+    const now = performance.now();
+    if (now - lastTick >= TICK_MS) {
+        lastTick = now;
+        bytesSentThisTick = 0;
+    }
+    const bytesPerTick = Math.floor((currentTargetMbps * 1024 * 1024) * (TICK_MS / 1000));
+    if (bytesSentThisTick + bytes > bytesPerTick) return false;
+    bytesSentThisTick += bytes;
+    return true;
+};
+
+// 🛠️ FIX #4: Reduce send rate on SCTP throttling detection
+function reduceSendRate() {
+    const oldRate = currentTargetMbps;
+    currentTargetMbps = Math.max(1, currentTargetMbps * 0.7); // Reduce by 30%
+    console.warn(`⚠️ SCTP throttling detected - reducing send rate from ${oldRate.toFixed(1)} MBps to ${currentTargetMbps.toFixed(1)} MBps`);
 }
 let connectionLostHandled = false; // Guard against double-calls
 let reader = null; // File stream reader (for ReadableStream)
