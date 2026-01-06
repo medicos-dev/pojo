@@ -127,8 +127,14 @@ async function storeChunkInIndexedDB(fileName, chunkIndex, chunkData) {
         };
         
         request.onerror = () => {
-            console.error('❌ Error storing chunk in IndexedDB:', request.error);
+            console.error(`❌ CRITICAL: Error storing chunk ${chunkIndex} in IndexedDB:`, request.error);
             reject(request.error);
+        };
+        
+        // Handle transaction errors
+        transaction.onerror = () => {
+            console.error(`❌ CRITICAL: Transaction error while storing chunk ${chunkIndex}:`, transaction.error);
+            reject(transaction.error);
         };
     });
 }
@@ -148,12 +154,30 @@ async function getTotalBytesFromIndexedDB(fileName) {
         request.onsuccess = () => {
             const chunks = request.result;
             let totalBytes = 0;
+            const chunkIndices = [];
             chunks.forEach(chunk => {
                 if (chunk.chunkData && chunk.chunkData.byteLength) {
                     totalBytes += chunk.chunkData.byteLength;
+                    if (chunk.chunkIndexNum !== undefined) {
+                        chunkIndices.push(chunk.chunkIndexNum);
+                    }
                 }
             });
-            resolve({ totalBytes, chunkCount: chunks.length });
+            
+            // Sort indices to check for gaps
+            chunkIndices.sort((a, b) => a - b);
+            const minIndex = chunkIndices[0] || 0;
+            const maxIndex = chunkIndices[chunkIndices.length - 1] || 0;
+            
+            // Log if there are significant gaps (missing chunks)
+            if (chunkIndices.length > 0 && (maxIndex - minIndex + 1) > chunkIndices.length) {
+                const missing = (maxIndex - minIndex + 1) - chunkIndices.length;
+                if (missing > 10) { // Only log if significant number missing
+                    console.warn(`⚠️ IndexedDB has ${chunkIndices.length} chunks but range is ${minIndex}-${maxIndex} (missing ~${missing} chunks)`);
+                }
+            }
+            
+            resolve({ totalBytes, chunkCount: chunks.length, minIndex, maxIndex });
         };
         
         request.onerror = () => {
@@ -350,6 +374,12 @@ const CONNECTION_LOSS_GRACE_PERIOD = 3000; // 3 seconds grace period on mobile
 const CONNECTION_LOSS_CHECK_INTERVAL = 1000; // Check every 1 second
 
 function handleConnectionLoss(reason = "unknown") {
+    // 🔹 Update state machine on connection loss
+    if (transferState === TransferState.TRANSFERRING || transferState === TransferState.RESUMING) {
+        transferState = TransferState.PAUSED;
+        console.log(`⏸️ Transfer paused due to connection loss: ${reason}`);
+    }
+    
     const now = Date.now();
     
     // CRITICAL: Verify connection is actually dead before showing alert
@@ -504,8 +534,8 @@ function handleConnectionLoss(reason = "unknown") {
     
     // CRITICAL: Resume support - file state is already saved in IndexedDB and localStorage
     // No need to save separately - it's already persisted
-    if (receivingFile && receivingBytesReceived > 0 && receivingBytesReceived < receivingFileSize) {
-        console.log(`💾 Partial file state already saved in IndexedDB: ${receivingFile.name} (${receivingBytesReceived}/${receivingFileSize} bytes)`);
+    if (receivingFile && receivedBytes > 0 && receivedBytes < receivingFileSize) {
+        console.log(`💾 Partial file state already saved in IndexedDB: ${receivingFile.name} (${receivedBytes}/${receivingFileSize} bytes)`);
     }
     
     // Update UI with user-friendly message
@@ -523,7 +553,7 @@ function handleConnectionLoss(reason = "unknown") {
         } else {
             showUserMessage("Connection interrupted. Waiting for reconnection…");
         }
-    } else if (currentFile || (receivingFile && receivingBytesReceived > 0)) {
+    } else if (currentFile || (receivingFile && receivedBytes > 0)) {
         showUserMessage("Connection lost. Transfer paused. You can retry or resume when peer reconnects.");
     }
     
@@ -1053,8 +1083,27 @@ function setupDataChannel(channel) {
         connectionLostHandled = false;
         transferPaused = false; // Resume transfer
         
-        // CRITICAL: Resume support - check localStorage for partial files
-        // This will be handled in startReceivingFile when metadata arrives
+        // 🔴 Pillar 4: Deterministic Resume - On reconnect, request resume from receivedBytes
+        if (receivingFile && receivedBytes > 0 && receivedBytes < receivingFileSize) {
+            console.log(`🔄 Connection restored. Requesting resume from byte ${receivedBytes}/${receivingFileSize}`);
+            transferState = TransferState.RESUMING;
+            try {
+                dataChannel.send(JSON.stringify({
+                    type: 'resume-request',
+                    fileName: receivingFile.name,
+                    offset: receivedBytes
+                }));
+                console.log(`📤 Sent resume request: ${receivingFile.name} from byte ${receivedBytes}`);
+            } catch (error) {
+                console.error('❌ Error sending resume request:', error);
+            }
+        } else if (transferState === TransferState.PAUSED) {
+            // Was paused, resume transfer
+            transferState = TransferState.TRANSFERRING;
+        } else if (transferState === TransferState.IDLE) {
+            // New connection, ready for new transfer
+            transferState = TransferState.CONNECTING;
+        }
         
         // CRITICAL: Start keepalive pings to prevent NAT timeouts
         // This improves long transfers by 30-40% reliability on mobile networks
@@ -1701,15 +1750,28 @@ async function streamFile(file, startOffset = 0) {
                 console.log('🔄 Final buffer drain before file-complete signal...');
                 await waitForDrain();
                 
-                // Send completion message with file size AND name for proper matching
+                // 🔴 Pillar 5: Compute file hash for integrity verification
+                let fileHash = null;
+                try {
+                    const fileBuffer = await file.arrayBuffer();
+                    const hashBuffer = await crypto.subtle.digest('SHA-256', fileBuffer);
+                    const hashArray = Array.from(new Uint8Array(hashBuffer));
+                    fileHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+                    console.log(`🔐 Computed file hash: ${fileHash.substring(0, 16)}...`);
+                } catch (error) {
+                    console.warn('⚠️ Could not compute file hash (non-critical):', error);
+                }
+                
+                // Send completion message with file size, name, and hash
                 console.log('📨 Sending file-complete signal...');
                 try {
                     dataChannel.send(JSON.stringify({ 
                         type: 'file-complete',
                         size: file.size,
-                        fileName: file.name // Include file name for proper matching in bulk transfers
+                        fileName: file.name, // Include file name for proper matching in bulk transfers
+                        hash: fileHash // 🔴 Pillar 5: Integrity hash
                     }));
-                    console.log('✅ File-complete signal sent (file:', file.name, ', size:', file.size, 'bytes). Waiting for receiver confirmation...');
+                    console.log('✅ File-complete signal sent (file:', file.name, ', size:', file.size, 'bytes, hash:', fileHash ? fileHash.substring(0, 16) + '...' : 'none', '). Waiting for receiver confirmation...');
                 } catch (error) {
                     console.error('❌ Error sending completion signal:', error);
                     alert('Error sending completion signal: ' + error.message);
@@ -2071,15 +2133,28 @@ async function streamFileLegacy(file, startOffset = 0) {
                                 console.log('🔄 Final buffer drain before file-complete signal...');
                                 await waitForDrain();
                                 
+                                // 🔴 Pillar 5: Compute file hash for integrity verification
+                                let fileHash = null;
+                                try {
+                                    const fileBuffer = await file.arrayBuffer();
+                                    const hashBuffer = await crypto.subtle.digest('SHA-256', fileBuffer);
+                                    const hashArray = Array.from(new Uint8Array(hashBuffer));
+                                    fileHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+                                    console.log(`🔐 Computed file hash: ${fileHash.substring(0, 16)}...`);
+                                } catch (error) {
+                                    console.warn('⚠️ Could not compute file hash (non-critical):', error);
+                                }
+                                
                                 console.log('📨 Sending file-complete signal...');
-                                // Send completion message with file size AND name for proper matching
+                                // Send completion message with file size, name, and hash
                                 try {
                                     dataChannel.send(JSON.stringify({ 
                                         type: 'file-complete',
                                         size: file.size,
-                                        fileName: file.name // Include file name for proper matching in bulk transfers
+                                        fileName: file.name, // Include file name for proper matching in bulk transfers
+                                        hash: fileHash // 🔴 Pillar 5: Integrity hash
                                     }));
-                                    console.log('✅ File-complete signal sent (file:', file.name, ', size:', file.size, 'bytes). Waiting for receiver confirmation...');
+                                    console.log('✅ File-complete signal sent (file:', file.name, ', size:', file.size, 'bytes, hash:', fileHash ? fileHash.substring(0, 16) + '...' : 'none', '). Waiting for receiver confirmation...');
                                 } catch (error) {
                                     console.error('❌ Error sending completion signal:', error);
                                     alert('Error sending completion signal: ' + error.message);
@@ -2127,13 +2202,33 @@ async function streamFileLegacy(file, startOffset = 0) {
 }
 
 // Data Channel Message Handling (Receiver)
+// 🔴 Step 1: Single authoritative counter
 let receivingFile = null;
-let receivingFileSize = 0;
-let receivingBytesReceived = 0; // Track total bytes received (from IndexedDB)
-let currentChunkIndex = 0; // Track current chunk index for IndexedDB
+let receivedBytes = 0; // SINGLE SOURCE OF TRUTH - only incremented when chunks arrive
+let expectedFileSize = 0; // Set from file-complete signal
 let fileCompleteSignalReceived = false;
+
+// Keep these for IndexedDB storage (but don't use for completion logic)
+let receivingFileSize = 0; // For UI display
+let currentChunkIndex = 0; // Track current chunk index for IndexedDB
 let lastChunkReceivedTime = null;
 let allBytesReceivedTime = null; // Track when we first received all bytes
+
+// 🔹 Deterministic state machine (replaces overlapping booleans)
+const TransferState = {
+    IDLE: 'IDLE',
+    CONNECTING: 'CONNECTING',
+    TRANSFERRING: 'TRANSFERRING',
+    PAUSED: 'PAUSED',
+    RESUMING: 'RESUMING',
+    COMPLETED: 'COMPLETED',
+    FAILED: 'FAILED'
+};
+let transferState = TransferState.IDLE;
+
+// 🔴 Pillar 5: Integrity verification
+let receivedHash = null; // SHA-256 hash computed during receive
+let expectedHash = null; // Final hash from sender
 
 function handleDataChannelMessage(event) {
     const data = event.data;
@@ -2162,9 +2257,16 @@ function handleDataChannelMessage(event) {
                 // Receiver ignores ping - just acknowledge it's received
                 // This keeps the connection alive
                 return;
-            } else if (message.type === 'resume') {
-                // Sender receives resume request from receiver
+            } else if (message.type === 'resume' || message.type === 'resume-request') {
+                // 🔴 Pillar 4: Deterministic Resume - Sender receives resume request from receiver
                 console.log(`🔄 Resume request received: ${message.fileName} from offset ${message.offset}`);
+                
+                // 🔹 Idempotent handler
+                if (transferState === TransferState.COMPLETED) {
+                    console.log('⚠️ Resume request ignored - transfer already completed');
+                    return;
+                }
+                
                 // Find the file in queue or current file
                 let fileToResume = null;
                 if (currentFile && currentFile.name === message.fileName) {
@@ -2176,9 +2278,12 @@ function handleDataChannelMessage(event) {
                 
                 if (fileToResume && message.offset < fileToResume.size) {
                     console.log(`✅ Resuming file: ${message.fileName} from byte ${message.offset}`);
+                    transferState = TransferState.RESUMING;
+                    
                     // Reset transfer stats but keep offset
                     resetTransferStats();
                     transferStats.bytesTransferred = message.offset;
+                    
                     // Resume streaming from offset
                     if (fileToResume === currentFile) {
                         // Current file - resume it
@@ -2188,6 +2293,8 @@ function handleDataChannelMessage(event) {
                         currentFile = fileToResume;
                         streamFile(fileToResume, message.offset);
                     }
+                    
+                    transferState = TransferState.TRANSFERRING;
                 } else {
                     console.warn(`⚠️ Cannot resume: file not found or invalid offset`);
                 }
@@ -2216,58 +2323,51 @@ function handleDataChannelMessage(event) {
                     deleteFileMetadataFromLocalStorage(receivingFile.name);
                     receivingFile = null;
                     receivingFileSize = 0;
-                    receivingBytesReceived = 0;
+                    receivedBytes = 0;
                     currentChunkIndex = 0;
                 }
                 // Check if this is a resume (metadata includes offset)
                 const resumeOffset = message.resumeOffset || 0;
                 startReceivingFile(message, resumeOffset);
             } else if (message.type === 'file-complete') {
-                // CRITICAL: Match file-complete signal to the correct file
-                // In bulk transfers, signals can arrive out of order or for wrong files
+                // 🔴 Step 4: On file-complete signal
+                // 🔹 Idempotent handler
+                if (transferState === TransferState.COMPLETED) {
+                    console.log('⚠️ File-complete signal ignored - already completed');
+                    return;
+                }
+                
                 const signalFileName = message.fileName || null;
                 const signalFileSize = message.size || null;
+                const signalHash = message.hash || null; // 🔴 Pillar 5: Integrity hash from sender
                 
-                // If we have a receiving file, verify the signal matches it
+                // Verify signal matches current file
                 if (receivingFile) {
-                    // Check if signal matches current file (by name or size)
                     const nameMatches = signalFileName && signalFileName === receivingFile.name;
                     const sizeMatches = signalFileSize && signalFileSize === receivingFileSize;
                     
                     if (!nameMatches && !sizeMatches && signalFileSize) {
-                        // Signal doesn't match current file - likely from previous/next file
-                        console.warn(`⚠️ File-complete signal ignored: size ${signalFileSize} doesn't match current file "${receivingFile.name}" (${receivingFileSize} bytes). This is likely from another file in the queue.`);
-                        return; // Ignore this signal
+                        console.warn(`⚠️ File-complete signal ignored: size ${signalFileSize} doesn't match current file "${receivingFile.name}" (${receivingFileSize} bytes).`);
+                        return;
                     }
                     
-                    // Signal matches - process it
                     console.log(`📨 File-complete signal received for "${receivingFile.name}". Expected size: ${signalFileSize || receivingFileSize} bytes`);
+                    
+                    // Store expected hash for integrity verification
+                    if (signalHash) {
+                        expectedHash = signalHash;
+                        console.log(`🔐 Expected hash: ${signalHash.substring(0, 16)}...`);
+                    }
                 } else {
-                    // No receiving file - this signal is orphaned
-                    console.warn(`⚠️ File-complete signal received but no active file transfer. Size: ${signalFileSize || 'unknown'}. Ignoring.`);
-                    return; // Ignore orphaned signal
+                    console.warn(`⚠️ File-complete signal received but no active file transfer. Ignoring.`);
+                    return;
                 }
                 
-                // CRITICAL: Do NOT finalize immediately on file-complete
-                // Wait for all bytes to arrive - file-complete just signals sender is done sending
+                // Set expected size and signal flag
+                expectedFileSize = signalFileSize || receivingFileSize;
                 fileCompleteSignalReceived = true;
                 
-                // Store expected size from sender if provided and it matches
-                if (signalFileSize && signalFileSize === receivingFileSize) {
-                    // Size matches - all good
-                } else if (signalFileSize && signalFileSize !== receivingFileSize) {
-                    console.warn(`⚠️ Size mismatch: sender says ${signalFileSize}, we expected ${receivingFileSize}. Using sender's size as authoritative.`);
-                    // Use sender's size as authoritative
-                    receivingFileSize = signalFileSize;
-                }
-                
-                // Start checking for completion - don't finalize yet
-                if (!completionCheckInterval) {
-                    completionCheckInterval = setInterval(() => {
-                        checkAndCompleteFile();
-                    }, 100);
-                }
-                // Check immediately
+                // Check completion immediately
                 checkAndCompleteFile();
             } else if (message.type === 'file-received-confirmed') {
                 // Sender receives this confirmation from receiver
@@ -2629,7 +2729,7 @@ async function startReceivingFile(metadata, resumeOffset = 0) {
             const { totalBytes, chunkCount } = await getTotalBytesFromIndexedDB(metadata.name);
             if (totalBytes > 0 && totalBytes < metadata.size) {
                 // We have partial file - resume from this point
-                receivingBytesReceived = totalBytes;
+                receivedBytes = totalBytes;
                 currentChunkIndex = chunkCount;
                 console.log(`🔄 Resuming file transfer: ${metadata.name} (${totalBytes}/${metadata.size} bytes already received)`);
                 
@@ -2648,7 +2748,7 @@ async function startReceivingFile(metadata, resumeOffset = 0) {
                 }
             } else {
                 // Start fresh
-                receivingBytesReceived = 0;
+                receivedBytes = 0;
                 currentChunkIndex = 0;
                 // Clean up old data if file size changed
                 if (totalBytes > 0) {
@@ -2658,17 +2758,17 @@ async function startReceivingFile(metadata, resumeOffset = 0) {
             }
         } catch (error) {
             console.error('❌ Error checking IndexedDB for resume:', error);
-            receivingBytesReceived = 0;
+            receivedBytes = 0;
             currentChunkIndex = 0;
         }
     } else {
         // No saved metadata - start fresh
-        receivingBytesReceived = 0;
+        receivedBytes = 0;
         currentChunkIndex = 0;
     }
     
     // Save metadata to localStorage
-    saveFileMetadataToLocalStorage(metadata.name, metadata.size, metadata.mimeType || 'application/octet-stream', receivingBytesReceived);
+    saveFileMetadataToLocalStorage(metadata.name, metadata.size, metadata.mimeType || 'application/octet-stream', receivedBytes);
     
     // Clear any existing completion check interval
     if (completionCheckInterval) {
@@ -2676,12 +2776,19 @@ async function startReceivingFile(metadata, resumeOffset = 0) {
         completionCheckInterval = null;
     }
     
+    // 🔹 Update state machine
+    transferState = receivedBytes > 0 ? TransferState.RESUMING : TransferState.TRANSFERRING;
+    
+    // 🔴 Pillar 5: Reset hash for new file
+    receivedHash = null;
+    expectedHash = null;
+    
     showReceivingFileUI(receivingFile);
     resetTransferStats();
     transferStats.startTime = Date.now();
     transferStats.lastUpdateTime = Date.now();
     
-    console.log('📥 Started receiving file:', metadata.name, 'Size:', metadata.size, 'bytes', receivingBytesReceived > 0 ? `(Resuming from ${receivingBytesReceived} bytes)` : '');
+    console.log('📥 Started receiving file:', metadata.name, 'Size:', metadata.size, 'bytes', receivedBytes > 0 ? `(Resuming from ${receivedBytes} bytes)` : '');
 }
 
 // RECEIVER: Batched IndexedDB writes (every 10 chunks) for optimal disk I/O
@@ -2689,9 +2796,23 @@ let chunkBuffer = []; // Buffer chunks before batch write
 const BATCH_SIZE = 10; // Write every 10 chunks to reduce disk I/O bottleneck
 
 async function handleFileChunk(chunk) {
-    if (!receivingFile) return;
+    // 🔹 Idempotent handler - safe to call multiple times
+    if (!receivingFile || transferState === TransferState.COMPLETED) return;
+    
+    // Update state to TRANSFERRING if we were RESUMING
+    if (transferState === TransferState.RESUMING) {
+        transferState = TransferState.TRANSFERRING;
+    } else if (transferState === TransferState.IDLE || transferState === TransferState.CONNECTING) {
+        transferState = TransferState.TRANSFERRING;
+    }
     
     const chunkSize = chunk.byteLength || chunk.length;
+    
+    // 🔴 Step 2: Increment ONLY here - single authoritative counter
+    receivedBytes += chunkSize;
+    
+    // Note: Hash verification is done at finalizeFile() from the complete assembled file
+    // This ensures we verify the final file, not individual chunks
     
     // Add chunk to buffer (keep in memory temporarily for batching)
     chunkBuffer.push({
@@ -2699,60 +2820,88 @@ async function handleFileChunk(chunk) {
         chunkData: chunk
     });
     currentChunkIndex++;
-    receivingBytesReceived += chunkSize;
     
     // CRITICAL: Update last chunk received time - used to detect stale connections
     lastChunkReceivedTime = Date.now();
     
     // Batch write: Store chunks in IndexedDB every 10 chunks (reduces disk I/O bottleneck)
-    if (chunkBuffer.length >= BATCH_SIZE) {
+    // CRITICAL: Use smaller batches (5 chunks) when near completion to ensure all chunks are stored
+    const progressPercent = (receivedBytes / receivingFileSize) * 100;
+    const effectiveBatchSize = progressPercent > 90 ? 5 : BATCH_SIZE; // Smaller batches near completion
+    
+    if (chunkBuffer.length >= effectiveBatchSize) {
         try {
             // Write all buffered chunks in parallel for better performance
-            await Promise.all(chunkBuffer.map(item => 
+            const writePromises = chunkBuffer.map(item => 
                 storeChunkInIndexedDB(receivingFile.name, item.chunkIndex, item.chunkData)
-            ));
-            chunkBuffer = []; // Clear buffer after successful write
+            );
+            await Promise.all(writePromises);
+            
+            const flushedCount = chunkBuffer.length;
+            const firstIndex = chunkBuffer[0].chunkIndex;
+            const lastIndex = chunkBuffer[chunkBuffer.length - 1].chunkIndex;
+            
+            console.log(`💾 Stored batch of ${flushedCount} chunks to IndexedDB (chunks ${firstIndex} to ${lastIndex})`);
+            
+            chunkBuffer = []; // Clear buffer ONLY after successful write
             
             // Update localStorage with current progress (less frequently)
-            saveFileMetadataToLocalStorage(receivingFile.name, receivingFileSize, receivingFile.type, receivingBytesReceived);
+            saveFileMetadataToLocalStorage(receivingFile.name, receivingFileSize, receivingFile.type, receivedBytes);
         } catch (error) {
-            console.error('❌ Error storing chunk batch in IndexedDB:', error);
-            // Continue anyway - might be recoverable
+            console.error('❌ CRITICAL: Error storing chunk batch in IndexedDB:', error);
+            console.error(`❌ Failed to store ${chunkBuffer.length} chunks (indices ${chunkBuffer[0]?.chunkIndex} to ${chunkBuffer[chunkBuffer.length - 1]?.chunkIndex})`);
+            // DON'T clear buffer on error - keep chunks for retry
+            // Try to flush again on next batch or completion
+            alert(`Warning: Failed to store ${chunkBuffer.length} chunks. The file may be incomplete.`);
         }
     }
     
     // Calculate progress but cap at 99.9% until actually complete
-    const progress = (receivingBytesReceived / receivingFileSize) * 100;
-    updateReceivingProgress(Math.min(99.9, progress));
+    updateReceivingProgress(Math.min(99.9, progressPercent));
+    
+    // CRITICAL: If we're at or near 100%, flush buffer immediately (don't wait for batch)
+    // This ensures all chunks are stored before completion check
+    if (progressPercent >= 99.9 && chunkBuffer.length > 0) {
+        console.log(`⚠️ Near completion (${progressPercent.toFixed(1)}%) with ${chunkBuffer.length} chunks in buffer. Flushing immediately...`);
+        try {
+            await flushChunkBuffer();
+            console.log(`✅ Flushed ${chunkBuffer.length} remaining chunks to IndexedDB`);
+        } catch (error) {
+            console.error('❌ CRITICAL: Failed to flush final chunks:', error);
+        }
+    }
     
     // Log every 100th chunk or when close to completion to avoid spam
     // NOTE: currentChunkIndex is already incremented, so this shows the NEXT chunk number
-    if ((currentChunkIndex - 1) % 100 === 0 || progress > 90) {
-        console.log(`📥 Chunk #${currentChunkIndex - 1}: ${chunkSize} bytes. Total: ${receivingBytesReceived}/${receivingFileSize} (${progress.toFixed(1)}%), Buffer: ${chunkBuffer.length} chunks`);
+    if ((currentChunkIndex - 1) % 100 === 0 || progressPercent > 90) {
+        console.log(`📥 Chunk #${currentChunkIndex - 1}: ${chunkSize} bytes. Total: ${receivedBytes}/${receivingFileSize} (${progressPercent.toFixed(1)}%), Buffer: ${chunkBuffer.length} chunks`);
     }
     
-    // Always check completion when a chunk arrives (especially if signal was received)
-    // This ensures we complete as soon as we have all bytes
+    // 🔴 Step 3: Check completion when signal received
     if (fileCompleteSignalReceived) {
-        // Check immediately when a new chunk arrives
-        checkAndCompleteFile();
-    } else if (receivingBytesReceived >= receivingFileSize) {
-        // If we have all bytes but no signal yet, check anyway (signal might be delayed)
-        console.log('All bytes received but no completion signal yet. Waiting...');
         checkAndCompleteFile();
     }
 }
 
 // Flush remaining chunks from buffer (called on file completion)
 async function flushChunkBuffer() {
-    if (chunkBuffer.length > 0) {
+    if (chunkBuffer.length > 0 && receivingFile) {
+        const chunksToFlush = chunkBuffer.length;
+        const firstChunkIndex = chunkBuffer[0]?.chunkIndex;
+        const lastChunkIndex = chunkBuffer[chunkBuffer.length - 1]?.chunkIndex;
+        
         try {
+            console.log(`💾 Flushing ${chunksToFlush} chunks to IndexedDB (chunks ${firstChunkIndex} to ${lastChunkIndex})...`);
             await Promise.all(chunkBuffer.map(item => 
                 storeChunkInIndexedDB(receivingFile.name, item.chunkIndex, item.chunkData)
             ));
+            console.log(`✅ Successfully flushed ${chunksToFlush} chunks to IndexedDB`);
             chunkBuffer = [];
         } catch (error) {
-            console.error('❌ Error flushing chunk buffer:', error);
+            console.error('❌ CRITICAL: Error flushing chunk buffer:', error);
+            console.error(`❌ Lost ${chunksToFlush} chunks! This will cause file corruption.`);
+            // Don't clear buffer on error - keep for potential retry
+            throw error; // Re-throw so caller knows it failed
         }
     }
 }
@@ -2762,7 +2911,7 @@ function completeReceivingFile() {
     
     // Mark that we received the completion signal
     fileCompleteSignalReceived = true;
-    console.log('File completion signal received. Current progress:', receivingBytesReceived, '/', receivingFileSize, `(${((receivingBytesReceived/receivingFileSize)*100).toFixed(1)}%)`);
+    console.log('File completion signal received. Current progress:', receivedBytes, '/', receivingFileSize, `(${((receivedBytes/receivingFileSize)*100).toFixed(1)}%)`);
     
     // Start checking immediately and continue checking until complete
     // Don't wait - start the interval right away
@@ -2780,8 +2929,193 @@ let completionCheckInterval = null;
 let completionCheckAttempts = 0;
 const MAX_COMPLETION_CHECK_ATTEMPTS = 1000; // Max 100 seconds (100 * 100ms)
 
-// FREE TIER SAFE: Read from IndexedDB instead of RAM array
+    // 🔴 Step 3: Completion logic MUST use single authoritative counter
 async function checkAndCompleteFile() {
+    if (!receivingFile) {
+        if (completionCheckInterval) {
+            clearInterval(completionCheckInterval);
+            completionCheckInterval = null;
+        }
+        completionCheckAttempts = 0;
+        return;
+    }
+    
+    // 🔴 Step 5: REMOVE all DB-based byte checks - use single counter only
+    if (!fileCompleteSignalReceived) return;
+    
+    // Flush any remaining chunks from buffer before checking
+    await flushChunkBuffer();
+    
+    // Simple check: receivedBytes === expectedFileSize
+    if (receivedBytes === expectedFileSize) {
+        console.log(`✅ File complete! Received: ${receivedBytes}/${expectedFileSize} bytes`);
+        await finalizeFile();
+    } else {
+        const missing = expectedFileSize - receivedBytes;
+        if (completionCheckAttempts % 10 === 0) {
+            console.warn(`Waiting for bytes: ${receivedBytes}/${expectedFileSize} (missing ${missing} bytes)`);
+        }
+        completionCheckAttempts++;
+        
+        // Keep checking - chunks might still be arriving
+        if (!completionCheckInterval) {
+            completionCheckInterval = setInterval(() => {
+                checkAndCompleteFile();
+            }, 100);
+        }
+        
+        // Timeout after max attempts
+        if (completionCheckAttempts > MAX_COMPLETION_CHECK_ATTEMPTS) {
+            console.error(`Timeout: Received ${receivedBytes}/${expectedFileSize} bytes. Missing ${missing} bytes.`);
+            alert(`File transfer incomplete. Received ${receivedBytes} of ${expectedFileSize} bytes. Missing ${missing} bytes.`);
+            resetReceivingState();
+            return;
+        }
+    }
+}
+
+// Finalize file - assemble from IndexedDB and complete
+async function finalizeFile() {
+    // 🔹 Idempotent handler - safe to call multiple times
+    if (!receivingFile || transferState === TransferState.COMPLETED) {
+        console.log('⚠️ finalizeFile called but already completed or no file');
+        return;
+    }
+    
+    // Update state to prevent duplicate calls
+    transferState = TransferState.COMPLETED;
+    
+    // Clear the interval
+    if (completionCheckInterval) {
+        clearInterval(completionCheckInterval);
+        completionCheckInterval = null;
+    }
+    
+    console.log('✅ File transfer complete! All bytes received and signal confirmed.');
+    console.log(`Final stats: ${receivedBytes}/${expectedFileSize} bytes, ${currentChunkIndex} chunks`);
+    
+    // Flush any remaining buffered chunks
+    await flushChunkBuffer();
+    
+    // Read all chunks from IndexedDB and assemble file
+    console.log('📦 Reading all chunks from IndexedDB for final assembly...');
+    let allChunks;
+    try {
+        allChunks = await getAllChunksFromIndexedDB(receivingFile.name);
+        console.log(`✅ Read ${allChunks.length} chunks from IndexedDB`);
+    } catch (error) {
+        console.error('❌ Error reading chunks from IndexedDB:', error);
+        transferState = TransferState.FAILED;
+        alert('Error reading file from storage. Please try again.');
+        resetReceivingState();
+        return;
+    }
+    
+    // Sort chunks by index
+    allChunks.sort((a, b) => (a.chunkIndexNum || 0) - (b.chunkIndexNum || 0));
+    
+    // Combine all chunks
+    const totalSize = allChunks.reduce((sum, chunk) => sum + (chunk.chunkData?.byteLength || 0), 0);
+    const combined = new Uint8Array(totalSize);
+    let offset = 0;
+    
+    for (const chunk of allChunks) {
+        if (chunk.chunkData) {
+            const chunkData = chunk.chunkData instanceof ArrayBuffer 
+                ? new Uint8Array(chunk.chunkData)
+                : new Uint8Array(chunk.chunkData.buffer || chunk.chunkData);
+            combined.set(chunkData, offset);
+            offset += chunkData.length;
+        }
+    }
+    
+    // 🔴 Pillar 5: Integrity verification - compute final hash and compare
+    let computedHash = null;
+    try {
+        const hashBuffer = await crypto.subtle.digest('SHA-256', combined);
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        computedHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+        console.log(`🔐 Computed hash: ${computedHash.substring(0, 16)}...`);
+    } catch (error) {
+        console.error('❌ Error computing file hash:', error);
+    }
+    
+    // Verify hash if expected hash was provided
+    if (expectedHash && computedHash) {
+        if (computedHash !== expectedHash) {
+            console.error(`❌ CRITICAL: Hash mismatch! Computed: ${computedHash.substring(0, 16)}..., Expected: ${expectedHash.substring(0, 16)}...`);
+            transferState = TransferState.FAILED;
+            alert(`File integrity check failed! The file may be corrupted. Computed hash doesn't match expected hash.`);
+            resetReceivingState();
+            return;
+        } else {
+            console.log(`✅ Hash verification passed! File integrity confirmed.`);
+        }
+    } else if (expectedHash && !computedHash) {
+        console.warn('⚠️ Expected hash provided but could not compute hash. Skipping verification.');
+    }
+    
+    // Create blob and download
+    const blob = new Blob([combined], { type: receivingFile.type || 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = receivingFile.name;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    
+    console.log(`✅ File "${receivingFile.name}" downloaded successfully!`);
+    
+    // Send confirmation back to sender
+    try {
+        dataChannel.send(JSON.stringify({ 
+            type: 'file-received-confirmed',
+            bytesReceived: receivedBytes,
+            expectedBytes: expectedFileSize,
+            hashMatch: expectedHash ? (computedHash === expectedHash) : null
+        }));
+        console.log(`✅ Sent confirmation to sender: ${receivedBytes}/${expectedFileSize} bytes received`);
+    } catch (error) {
+        console.error('❌ Error sending confirmation to sender:', error);
+    }
+    
+    // Show 100% progress
+    updateReceivingProgress(100);
+    
+    // Clean up IndexedDB
+    await deleteFileFromIndexedDB(receivingFile.name);
+    deleteFileMetadataFromLocalStorage(receivingFile.name);
+    
+    // Reset state
+    resetReceivingState();
+    
+    // Show success message
+    showSuccessMessage(`File "${receivingFile.name}" received successfully!`);
+}
+
+// Helper to reset receiving state
+function resetReceivingState() {
+    receivingFile = null;
+    receivingFileSize = 0;
+    receivedBytes = 0;
+    expectedFileSize = 0;
+    currentChunkIndex = 0;
+    fileCompleteSignalReceived = false;
+    lastChunkReceivedTime = null;
+    allBytesReceivedTime = null;
+    if (completionCheckInterval) {
+        clearInterval(completionCheckInterval);
+        completionCheckInterval = null;
+    }
+    completionCheckAttempts = 0;
+    transferInfo.style.display = 'none';
+    dropZone.style.display = 'block';
+}
+
+// Legacy function - keeping for compatibility but simplifying
+async function checkAndCompleteFile_OLD() {
     if (!receivingFile) {
         if (completionCheckInterval) {
             clearInterval(completionCheckInterval);
@@ -2806,11 +3140,11 @@ async function checkAndCompleteFile() {
     } catch (error) {
         console.error('❌ Error reading from IndexedDB:', error);
         // Fallback to tracked counter
-        totalReceived = receivingBytesReceived;
+        totalReceived = receivedBytes;
     }
     
     // Also check the tracked counter
-    const bytesMatch = Math.abs(totalReceived - receivingBytesReceived) < 100; // Allow small discrepancy
+    const bytesMatch = Math.abs(totalReceived - receivedBytes) < 100; // Allow small discrepancy
     
     const percentComplete = ((totalReceived/receivingFileSize)*100).toFixed(1);
     const missingBytes = receivingFileSize - totalReceived;
@@ -2854,7 +3188,7 @@ async function checkAndCompleteFile() {
             // Reset everything
             receivingFile = null;
             receivingFileSize = 0;
-            receivingBytesReceived = 0;
+            receivedBytes = 0;
             currentChunkIndex = 0;
             fileCompleteSignalReceived = false;
             lastChunkReceivedTime = null;
@@ -2891,7 +3225,7 @@ async function checkAndCompleteFile() {
         
         receivingFile = null;
         receivingFileSize = 0;
-        receivingBytesReceived = 0;
+        receivedBytes = 0;
         currentChunkIndex = 0;
         fileCompleteSignalReceived = false;
         allBytesReceivedTime = null;
@@ -3049,7 +3383,7 @@ async function checkAndCompleteFile() {
     // Reset file variables
     receivingFile = null;
     receivingFileSize = 0;
-    receivingBytesReceived = 0;
+    receivedBytes = 0;
     currentChunkIndex = 0;
     fileCompleteSignalReceived = false;
     allBytesReceivedTime = null;
@@ -3171,8 +3505,8 @@ function updateReceivingProgress(percent) {
     // Calculate speed and time remaining
     const now = Date.now();
     const elapsed = (now - transferStats.startTime) / 1000;
-    const speed = receivingBytesReceived / elapsed;
-    const remaining = receivingFileSize - receivingBytesReceived;
+    const speed = receivedBytes / elapsed;
+    const remaining = receivingFileSize - receivedBytes;
     const timeRemainingSeconds = speed > 0 ? remaining / speed : 0;
     
     transferSpeed.textContent = formatSpeed(speed);
