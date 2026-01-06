@@ -3784,5 +3784,3 @@ function formatTime(seconds) {
     const minutes = Math.round((seconds % 3600) / 60);
     return `${hours}h ${minutes}m`;
 }
-
-
