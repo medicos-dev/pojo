@@ -47,17 +47,21 @@ const WS_URL = getWebSocketURL();
 console.log('WebSocket URL:', WS_URL);
 // DYNAMIC SLIDING WINDOW: Optimized for 200GB+ files
 // 🔴 PROTOCOL INVARIANT: Fixed chunk size per index (single CHUNK_SIZE for entire transfer)
-const INITIAL_CHUNK_SIZE = 256 * 1024; // 256KB fixed chunk size (speed-optimized)
-const CONNECTED_CHUNK_SIZE = 256 * 1024; // Must match INITIAL_CHUNK_SIZE for deterministic offsets
-// 🧯 HARD SPEED CAP: Intentional throttling to prevent SCTP collapse (target 4-7 MBps)
-const TARGET_MBPS = 7; // Target 4 MBps (conservative for mobile Chrome)
-const BYTES_PER_SEC = TARGET_MBPS * 1024 * 1024;
-const SEND_INTERVAL_MS = 20; // Send every 20ms
-const BYTES_PER_TICK = BYTES_PER_SEC * (SEND_INTERVAL_MS / 1000); // ~83KB per tick
+// 🛠️ FIX #2: Lock chunk size to 64KB (not 128KB) - 128KB is too aggressive for mobile SCTP
+const INITIAL_CHUNK_SIZE = 64 * 1024; // 64KB fixed chunk size (safe for mobile)
+const CONNECTED_CHUNK_SIZE = 64 * 1024; // Must match INITIAL_CHUNK_SIZE for deterministic offsets
 
-const HIGH_WATER_MARK = 2 * 1024 * 1024; // 2MB - conservative for mobile Chrome
-const BACKPRESSURE_THRESHOLD = 1 * 1024 * 1024; // 1MB - bufferedAmountLowThreshold
-const MAX_BUFFERED_AMOUNT = HIGH_WATER_MARK; // 2MB max - don't send if buffer exceeds this
+// 🧯 FIX #1: Hard sender rate limit (do NOT send "as fast as possible")
+// Recommended safe values: Desktop↔Desktop: 6-10 MBps, Mobile involved: 2-4 MBps, Long transfers: ≤3 MBps
+const TARGET_MBPS = 5; // SAFE - conservative for long transfers and mobile
+const BYTES_PER_SEC = TARGET_MBPS * 1024 * 1024;
+const TICK_MS = 20;
+const BYTES_PER_TICK = Math.floor(BYTES_PER_SEC * (TICK_MS / 1000)); // ~62KB per tick
+
+// 🛠️ FIX #3: Lower in-flight permanently (reduces retransmission pressure)
+const HIGH_WATER_MARK = 1.5 * 1024 * 1024; // 1.5MB - conservative for mobile Chrome
+const BACKPRESSURE_THRESHOLD = 0.75 * 1024 * 1024; // 0.75MB - bufferedAmountLowThreshold
+const MAX_BUFFERED_AMOUNT = HIGH_WATER_MARK; // 1.5MB max - don't send if buffer exceeds this
 // 🔴 SCTP TRANSPORT LIMIT: Never send >16KB wire payloads (prevents send credit exhaustion)
 const MAX_WIRE_CHUNK = 16 * 1024; // 16KB hard limit for stable SCTP over mobile
 
@@ -322,8 +326,6 @@ let fileTransferConfirmationResolver = null;
 let transferAborted = false; // Flag to abort transfer on connection loss
 let transferPaused = false; // Flag to pause transfer (waiting for reconnection)
 let keepaliveInterval = null; // Keepalive ping interval
-let lastSendTime = 0; // For speed throttling
-let bytesSentThisTick = 0; // Track bytes sent in current tick
 
 // Pause transfer function (hard guard - stops sending immediately)
 function pauseTransfer(reason) {
@@ -348,7 +350,8 @@ let transferStats = {
 
 // RTT-aware adaptive sliding-window: dynamically adjust based on network conditions
 // 🛟 Treat DataChannel as fragile - lower limits for stability
-let maxInFlightChunks = 32; // Conservative limit (not 128+) - Chrome mobile needs this
+// 🛠️ FIX #3: Lower in-flight permanently (reduces retransmission pressure)
+let maxInFlightChunks = 24; // Conservative limit - Chrome mobile needs this
 let lastInFlightAdjustTs = 0;
 let ackWatchdogInterval = null;
 // RTT tracking for adaptive window
@@ -1738,38 +1741,13 @@ async function frameAndSend(chunkIndex, payload) {
             await waitForDrain();
         }
 
-        // 🧯 HARD SPEED CAP: Intentional throttling (target 4 MBps)
-        const now = performance.now();
-        if (now - lastSendTime >= SEND_INTERVAL_MS) {
-            // Reset tick
-            lastSendTime = now;
-            bytesSentThisTick = 0;
-        }
-
-        // Check if we've exceeded bytes-per-tick limit
-        if (bytesSentThisTick >= BYTES_PER_TICK) {
-            // Wait until next tick
-            const waitTime = SEND_INTERVAL_MS - (now - lastSendTime);
-            if (waitTime > 0) {
-                await new Promise(resolve => setTimeout(resolve, waitTime));
-                lastSendTime = performance.now();
-                bytesSentThisTick = 0;
-            }
-        }
-
-        // Send only if under limit
+        // 🧯 FIX #1: Hard sender rate limit - wait until canSend() allows it
         const bytesToSend = framed.buffer.byteLength;
-        if (bytesSentThisTick + bytesToSend <= BYTES_PER_TICK) {
-            dataChannel.send(framed.buffer);
-            bytesSentThisTick += bytesToSend;
-        } else {
-            // Wait for next tick
-            await new Promise(resolve => setTimeout(resolve, SEND_INTERVAL_MS - (now - lastSendTime)));
-            lastSendTime = performance.now();
-            bytesSentThisTick = 0;
-            dataChannel.send(framed.buffer);
-            bytesSentThisTick += bytesToSend;
+        while (!canSend(bytesToSend)) {
+            await new Promise(r => setTimeout(r, 1));
         }
+
+        dataChannel.send(framed.buffer);
 
         offset += size;
         part++;
@@ -2603,6 +2581,10 @@ function handleDataChannelMessage(event) {
                 maxInFlightChunks = Math.min(512, Math.floor(maxInFlightChunks * 1.5));
                 console.log(`✅ Receiver requested speedUp. Window increased to ${maxInFlightChunks}`);
                 return;
+            } else if (message.type === 'reduce-rate') {
+                // 🛠️ FIX #4: SCTP throttling detected - reduce send rate immediately
+                reduceSendRate();
+                return;
             } else if (message.type === 'chunk-ack') {
                 // ✅ Sender receives cumulative ACK from receiver:
                 // - highestReceivedChunkIndex: highest index ever received (may have gaps)
@@ -2628,13 +2610,13 @@ function handleDataChannelMessage(event) {
                         highestReceivedAckedChunkIndex = highestReceived;
                         lastAckTime = Date.now();
                         
-                        // RTT-aware adaptive window
+                        // RTT-aware adaptive window (capped at conservative limits)
                         if (smoothedRTT < 150) {
-                            maxInFlightChunks = 384;
+                            maxInFlightChunks = Math.min(32, 24 * 1.5); // Cap at 32
                         } else if (smoothedRTT < 300) {
-                            maxInFlightChunks = 256;
+                            maxInFlightChunks = 24; // Base limit
                         } else {
-                            maxInFlightChunks = 128;
+                            maxInFlightChunks = Math.max(16, 24 * 0.75); // Lower for high RTT
                         }
                     }
                 }
@@ -2814,6 +2796,30 @@ function handleDataChannelMessage(event) {
             const chunkIndex = view.getUint32(0, true);
             const part = view.getUint32(4, true);
             const payload = buffer.slice(8);
+
+            // 🛠️ FIX #4: Detect SCTP throttling early - if binary data < 32KB repeatedly, signal sender
+            // Track small binary data count (outside function scope for persistence)
+            if (typeof window.smallBinaryCount === 'undefined') {
+                window.smallBinaryCount = 0;
+            }
+            const SMALL_BINARY_THRESHOLD = 32 * 1024; // 32KB
+            if (payload.byteLength < SMALL_BINARY_THRESHOLD) {
+                window.smallBinaryCount++;
+                if (window.smallBinaryCount >= 5) {
+                    // Signal sender to reduce rate immediately (do not wait for ACK timeout)
+                    if (dataChannel && dataChannel.readyState === 'open') {
+                        try {
+                            dataChannel.send(JSON.stringify({ type: 'reduce-rate' }));
+                            console.warn('⚠️ SCTP throttling detected - signaling sender to reduce rate');
+                            window.smallBinaryCount = 0; // Reset counter
+                        } catch (err) {
+                            // Non-critical
+                        }
+                    }
+                }
+            } else {
+                window.smallBinaryCount = 0; // Reset on normal-sized data
+            }
 
             // Reassemble fragmented chunks
             if (!chunkFragments.has(chunkIndex)) {
