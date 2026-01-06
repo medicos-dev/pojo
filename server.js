@@ -5,16 +5,6 @@ const path = require('path');
 
 const PORT = process.env.PORT || 8080;
 
-// Health check endpoint
-function handleHealthCheck(req, res) {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ 
-        status: 'ok', 
-        timestamp: new Date().toISOString(),
-        uptime: process.uptime()
-    }));
-}
-
 // Store active rooms and their connections
 const rooms = new Map();
 
@@ -38,25 +28,7 @@ const server = http.createServer((req, res) => {
         return; // Let WebSocket server handle it
     }
 
-    // Health check endpoint for Render
-    if (req.url === '/health' || req.url === '/healthz') {
-        handleHealthCheck(req, res);
-        return;
-    }
-
-    // CORS headers for Render
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
-    // Handle OPTIONS preflight
-    if (req.method === 'OPTIONS') {
-        res.writeHead(200);
-        res.end();
-        return;
-    }
-
-    // Parse URL - serve from root directory
+    // Parse URL
     let filePath = '.' + req.url;
     if (filePath === './') {
         filePath = './index.html';
@@ -98,8 +70,7 @@ wss.on('connection', (ws, req) => {
     let currentRoom = null;
     let isInitiator = false;
     
-    const clientIP = req.socket.remoteAddress || 'unknown';
-    console.log(`📡 New WebSocket connection from ${clientIP}`);
+    console.log('New WebSocket connection');
     
     ws.on('message', (message) => {
         try {
@@ -163,7 +134,7 @@ wss.on('connection', (ws, req) => {
         const room = rooms.get(roomId);
         room.push(ws);
         
-        console.log(`✅ Client joined room: ${roomId} (${room.length} client${room.length > 1 ? 's' : ''})`);
+        console.log(`Client joined room: ${roomId} (${room.length} clients)`);
         
         // Notify client
         ws.send(JSON.stringify({ type: 'joined', room: roomId }));
@@ -175,7 +146,6 @@ wss.on('connection', (ws, req) => {
                     client.send(JSON.stringify({ type: 'peer-joined', room: roomId }));
                 }
             });
-            console.log(`📤 Notified ${room.length - 1} peer(s) about new client in room ${roomId}`);
         }
     }
     
@@ -216,10 +186,9 @@ wss.on('connection', (ws, req) => {
             return;
         }
         
-        console.log(`📤 Forwarding SDP offer in room ${data.room} to ${room.length - 1} peer(s)`);
+        console.log(`Forwarding offer in room ${data.room} to ${room.length - 1} other client(s)`);
         
         // Forward offer to other clients in room
-        let forwarded = 0;
         room.forEach(client => {
             if (client !== ws && client.readyState === WebSocket.OPEN) {
                 client.send(JSON.stringify({
@@ -227,12 +196,9 @@ wss.on('connection', (ws, req) => {
                     offer: data.offer,
                     room: data.room
                 }));
-                forwarded++;
+                console.log('Offer forwarded');
             }
         });
-        if (forwarded > 0) {
-            console.log(`✅ SDP offer forwarded to ${forwarded} peer(s)`);
-        }
     }
     
     function handleAnswer(ws, data) {
@@ -242,10 +208,9 @@ wss.on('connection', (ws, req) => {
             return;
         }
         
-        console.log(`📤 Forwarding SDP answer in room ${data.room} to ${room.length - 1} peer(s)`);
+        console.log(`Forwarding answer in room ${data.room} to ${room.length - 1} other client(s)`);
         
         // Forward answer to other clients in room
-        let forwarded = 0;
         room.forEach(client => {
             if (client !== ws && client.readyState === WebSocket.OPEN) {
                 client.send(JSON.stringify({
@@ -253,12 +218,9 @@ wss.on('connection', (ws, req) => {
                     answer: data.answer,
                     room: data.room
                 }));
-                forwarded++;
+                console.log('Answer forwarded');
             }
         });
-        if (forwarded > 0) {
-            console.log(`✅ SDP answer forwarded to ${forwarded} peer(s)`);
-        }
     }
     
     function handleIceCandidate(ws, data) {
@@ -266,7 +228,6 @@ wss.on('connection', (ws, req) => {
         if (!room) return;
         
         // Forward ICE candidate to other clients in room
-        // (Logging every ICE candidate would be too verbose, so we skip it)
         room.forEach(client => {
             if (client !== ws && client.readyState === WebSocket.OPEN) {
                 client.send(JSON.stringify({
@@ -279,15 +240,10 @@ wss.on('connection', (ws, req) => {
     }
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Server running on port ${PORT}`);
+server.listen(PORT, () => {
+    console.log(`🚀 Server running on http://localhost:${PORT}`);
     console.log(`📡 WebSocket server ready for connections`);
-    console.log(`🏥 Health check available at /health`);
-    if (process.env.RENDER) {
-        console.log(`🌐 Render deployment detected - serving on Render's infrastructure`);
-    } else {
-        console.log(`🌐 Local development - Open http://localhost:${PORT} in your browser`);
-    }
+    console.log(`🌐 Open http://localhost:${PORT} in your browser`);
 });
 
 // Graceful shutdown
@@ -310,4 +266,3 @@ process.on('SIGINT', () => {
         });
     });
 });
-

@@ -3,120 +3,114 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>POJO | Enterprise File Transfer</title>
+    <title>P2P File Transfer</title>
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-    <div class="noise-overlay"></div>
-    
     <div class="container">
         <header class="header">
-            <div class="connection-status" id="connectionStatus">
-                <div class="status-indicator" id="statusIndicator"></div>
-                <span class="status-text" id="statusText">System Offline</span>
-            </div>
-            <h1 class="title">POJO</h1>
-            <p class="subtitle">Secure, high-speed peer-to-peer file sharing for the modern web. Transfer files of any size, directly between devices.</p>
+            <h1 class="title">P2P Transfer</h1>
+            <p class="subtitle">Direct peer-to-peer file sharing</p>
         </header>
 
-        <main class="main-content">
-            <div class="connection-info" id="connectionInfo" style="display: none;">
-                <span class="info-label">Signaling Node:</span>
-                <span class="info-value" id="serverUrl"></span>
+        <div class="connection-status" id="connectionStatus">
+            <div class="status-indicator" id="statusIndicator"></div>
+            <span class="status-text" id="statusText">Disconnected</span>
+        </div>
+        <div class="connection-info" id="connectionInfo" style="display: none;">
+            <span class="info-label">Server:</span>
+            <span class="info-value" id="serverUrl"></span>
+        </div>
+
+        <div class="room-section">
+            <button id="createRoomBtn" class="btn btn-create">Create Room</button>
+            <div class="room-controls">
+                <input type="text" id="roomId" placeholder="Enter room ID" class="room-input">
+                <button id="joinRoomBtn" class="btn btn-secondary">Join Room</button>
             </div>
-
-            <div class="room-section">
-                <button id="createRoomBtn" class="btn btn-create">Initialize Transfer Channel</button>
-                <div class="room-controls">
-                    <input type="text" id="roomId" placeholder="Enter channel ID..." class="room-input">
-                    <button id="joinRoomBtn" class="btn btn-secondary">Connect to Channel</button>
-                </div>
-                <div class="room-display" id="roomDisplay" style="display: none;">
-                    <span class="room-label">Active Channel:</span>
-                    <span class="room-value" id="currentRoom"></span>
-                    <button id="leaveRoomBtn" class="btn btn-ghost">Terminate</button>
-                </div>
+            <div class="room-display" id="roomDisplay" style="display: none;">
+                <span class="room-label">Room:</span>
+                <span class="room-value" id="currentRoom"></span>
+                <button id="leaveRoomBtn" class="btn btn-ghost">Leave</button>
             </div>
+        </div>
 
-            <div class="transfer-section" id="transferSection" style="display: none;">
-                <div class="file-drop-zone" id="dropZone">
-                    <div class="drop-zone-content">
-                        <svg class="drop-icon" width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-                            <polyline points="17 8 12 3 7 8"></polyline>
-                            <line x1="12" y1="3" x2="12" y2="15"></line>
-                        </svg>
-                        <h2 class="drop-title">Ready for Upload</h2>
-                        <p class="drop-subtitle">Drag and drop assets here or click to browse files</p>
-                        <input type="file" id="fileInput" multiple style="display: none;">
-                    </div>
-                </div>
-
-                <div class="file-request" id="fileRequest" style="display: none;">
-                    <div class="file-request-content">
-                        <svg class="file-icon" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                            <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path>
-                            <polyline points="13 2 13 9 20 9"></polyline>
-                        </svg>
-                        <div class="file-request-info">
-                            <div class="file-name" id="requestFileName"></div>
-                            <div class="file-size" id="requestFileSize"></div>
-                        </div>
-                        <div class="file-request-actions">
-                            <button id="acceptFileBtn" class="btn btn-accept">Authorize</button>
-                            <button id="rejectFileBtn" class="btn btn-reject">Decline</button>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="transfer-info" id="transferInfo" style="display: none;">
-                    <div class="file-info">
-                        <div class="file-name" id="fileName"></div>
-                        <div class="file-size" id="fileSize"></div>
-                    </div>
-                    <div class="progress-container">
-                        <div class="progress-bar">
-                            <div class="progress-fill" id="progressFill"></div>
-                        </div>
-                        <div class="progress-stats">
-                            <span class="progress-percent" id="progressPercent">0%</span>
-                            <span class="transfer-speed" id="transferSpeed">0 MB/s</span>
-                            <span class="time-remaining" id="timeRemaining">--:-- remaining</span>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="success-message" id="successMessage" style="display: none;">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                        <polyline points="20 6 9 17 4 12"></polyline>
+        <div class="transfer-section" id="transferSection" style="display: none;">
+            <div class="file-drop-zone" id="dropZone">
+                <div class="drop-zone-content">
+                    <svg class="drop-icon" width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                        <polyline points="17 8 12 3 7 8"></polyline>
+                        <line x1="12" y1="3" x2="12" y2="15"></line>
                     </svg>
-                    <span id="successText">Transmission Complete</span>
+                    <h2 class="drop-title">Drop files here</h2>
+                    <p class="drop-subtitle">or click to browse</p>
+                    <input type="file" id="fileInput" multiple style="display: none;">
                 </div>
-
-                <div class="received-files" id="receivedFiles"></div>
             </div>
 
-            <div class="warning-message" id="warningMessage" style="display: none;">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
-                    <line x1="12" y1="9" x2="12" y2="13"></line>
-                    <line x1="12" y1="17" x2="12.01" y2="17"></line>
+            <div class="file-request" id="fileRequest" style="display: none;">
+                <div class="file-request-content">
+                    <svg class="file-icon" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                        <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path>
+                        <polyline points="13 2 13 9 20 9"></polyline>
+                    </svg>
+                    <div class="file-request-info">
+                        <div class="file-name" id="requestFileName"></div>
+                        <div class="file-size" id="requestFileSize"></div>
+                    </div>
+                    <div class="file-request-actions">
+                        <button id="acceptFileBtn" class="btn btn-accept">Accept</button>
+                        <button id="rejectFileBtn" class="btn btn-reject">Reject</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="transfer-info" id="transferInfo" style="display: none;">
+                <div class="file-info">
+                    <div class="file-name" id="fileName"></div>
+                    <div class="file-size" id="fileSize"></div>
+                </div>
+                <div class="progress-container">
+                    <div class="progress-label" id="progressLabel">Uploading...</div>
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progressFill"></div>
+                    </div>
+                    <div class="progress-stats">
+                        <span class="progress-percent" id="progressPercent">0%</span>
+                        <span class="transfer-speed" id="transferSpeed">0 MB/s</span>
+                        <span class="time-remaining" id="timeRemaining">--</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="success-message" id="successMessage" style="display: none;">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="20 6 9 17 4 12"></polyline>
                 </svg>
-                <span>Relayed Connection: Bandwidth may be restricted.</span>
+                <span id="successText">File transferred successfully!</span>
             </div>
-        </main>
+
+            <div class="received-files" id="receivedFiles"></div>
+        </div>
+
+        <div class="warning-message" id="warningMessage" style="display: none;">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+                <line x1="12" y1="9" x2="12" y2="13"></line>
+                <line x1="12" y1="17" x2="12.01" y2="17"></line>
+            </svg>
+            <span>Connection is being relayed through TURN server. Transfer may be slower.</span>
+        </div>
     </div>
 
     <footer class="footer">
         <div class="footer-content">
             <div class="developer-info">
                 <img src="aiks.jpg" alt="Developer" class="developer-avatar">
-                <div class="dev-text">
-                    <span class="dev-label">ENGINEERED BY</span>
-                    <span class="developer-name">AIKS</span>
-                </div>
+                <span class="developer-name">AIKS</span>
             </div>
-            <button id="donateBtn" class="btn-donate">Support Infrastructure</button>
+                        <button id="donateBtn" class="btn-donate">Donate</button>
         </div>
     </footer>
 
