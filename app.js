@@ -299,8 +299,9 @@ let currentFileResolve = null; // Resolve function for current file promise
 
 // ✅ FIX 1: Windowed ACK tracking (not per-chunk)
 const ACK_EVERY_N_CHUNKS = 64; // ACK every 64 chunks
-let ackedChunks = new Set(); // Track which chunks receiver has ACKed
-let highestAckedChunkIndex = -1; // Highest chunk index that was ACKed
+let ackedChunks = new Set(); // Track which chunks receiver has ACKed (by index)
+let highestReceivedAckedChunkIndex = -1; // Highest index ever ACKed by receiver (may have gaps)
+let highestContiguousAckedChunkIndex = -1; // Highest contiguous index where all chunks [0..N] are ACKed
 let totalChunksSent = 0; // Total chunks sent for current file
 let ackedChunkCount = 0; // Total chunks ACKed (derived from windowed ACKs)
 let fileCompleteSent = false; // ✅ FIX 4: Guard against duplicate file-complete
@@ -371,8 +372,8 @@ async function waitForAllAcks(expectedTotalChunks, timeoutMs = 60000) {
     }
 
     // Explicit end-of-file validation: ensure contiguous ACKs up to final chunk
-    if (highestAckedChunkIndex + 1 !== expectedTotalChunks) {
-        throw new Error(`ACK_RANGE_MISMATCH: highestAckedChunkIndex=${highestAckedChunkIndex}, expectedTotalChunks=${expectedTotalChunks}`);
+    if (highestContiguousAckedChunkIndex + 1 !== expectedTotalChunks) {
+        throw new Error(`ACK_RANGE_MISMATCH: highestContiguousAckedChunkIndex=${highestContiguousAckedChunkIndex}, expectedTotalChunks=${expectedTotalChunks}`);
     }
 }
 
@@ -1157,7 +1158,12 @@ function setupDataChannel(channel) {
                     // If channel is open, buffer is low, but no ACKs for >15s → STALL_DETECTED
                     if (sinceLastAck > 15000 && dataChannel.bufferedAmount < BACKPRESSURE_THRESHOLD) {
                         console.warn(`❗ STALL_DETECTED: no ACKs for ${sinceLastAck}ms, outstanding chunks=${outstanding}, bufferedAmount=${dataChannel.bufferedAmount}`);
-                        // We don't auto-resend here; higher-level logic (timeouts / resume) will recover.
+                    }
+
+                    // Emergency unstick: if still no ACKs for >20s with low buffer, relax window
+                    if (sinceLastAck > 20000 && dataChannel.bufferedAmount < BACKPRESSURE_THRESHOLD && outstanding > 0) {
+                        console.warn('FORCING WINDOW RELAXATION');
+                        maxInFlightChunks = Math.min(maxInFlightChunks * 2, 512);
                     }
                 } catch (err) {
                     console.warn('ACK watchdog error:', err);
@@ -1572,7 +1578,8 @@ async function sendNextQueuedChunk(chunkData, file, isConnected = false) {
         // Adaptive sliding window: dynamically reduce max in-flight when we see prolonged backpressure
         const windowStart = Date.now();
         let localWaitCount = 0;
-        while ((totalChunksSent - highestAckedChunkIndex) > maxInFlightChunks) {
+        // Window is driven by ACKs (highest index ever ACKed), not contiguous correctness
+        while ((totalChunksSent - highestReceivedAckedChunkIndex) > maxInFlightChunks) {
             if (transferAborted) {
                 throw new Error('TRANSFER_ABORTED');
             }
@@ -1933,7 +1940,8 @@ async function streamFile(file, startOffset = 0) {
                 
                 // Reset ACK tracking for next file
                 ackedChunks.clear();
-                highestAckedChunkIndex = -1;
+                highestReceivedAckedChunkIndex = -1;
+                highestContiguousAckedChunkIndex = -1;
                 totalChunksSent = 0;
                 senderChunkIndex = 0;
                 
@@ -2312,7 +2320,8 @@ async function streamFileLegacy(file, startOffset = 0) {
     }
 
     ackedChunks.clear();
-    highestAckedChunkIndex = -1;
+    highestReceivedAckedChunkIndex = -1;
+    highestContiguousAckedChunkIndex = -1;
     totalChunksSent = 0;
     senderChunkIndex = 0;
 
@@ -2392,21 +2401,34 @@ function handleDataChannelMessage(event) {
                 // This keeps the connection alive
                 return;
             } else if (message.type === 'chunk-ack') {
-                // ✅ FIX 1: Sender receives windowed ACK from receiver (used for completion + stall detection)
+                // ✅ Sender receives cumulative ACK from receiver:
+                // - highestReceivedChunkIndex: highest index ever received (may have gaps)
+                // - highestContiguousChunkIndex: highest contiguous index where all [0..N] exist on receiver
+                const highestReceived = message.highestReceivedChunkIndex;
                 const highestContiguous = message.highestContiguousChunkIndex;
-                if (highestContiguous !== undefined && highestContiguous !== null) {
-                    if (highestContiguous > highestAckedChunkIndex) {
-                        // Mark all chunks up to highestContiguous as ACKed
-                        for (let i = highestAckedChunkIndex + 1; i <= highestContiguous; i++) {
-                            ackedChunks.add(i);
-                        }
-                        highestAckedChunkIndex = highestContiguous;
-                        ackedChunkCount = ackedChunks.size;
+
+                // Progress (window) is driven by highestReceived
+                if (highestReceived !== undefined && highestReceived !== null) {
+                    if (highestReceived > highestReceivedAckedChunkIndex) {
+                        highestReceivedAckedChunkIndex = highestReceived;
                         lastAckTime = Date.now();
                     }
-                    // Log every 100th ACK to avoid spam
+                }
+
+                // Integrity (contiguous) is tracked separately for final validation
+                if (highestContiguous !== undefined && highestContiguous !== null) {
+                    if (highestContiguous > highestContiguousAckedChunkIndex) {
+                        // Mark all contiguous chunks up to highestContiguous as ACKed
+                        for (let i = highestContiguousAckedChunkIndex + 1; i <= highestContiguous; i++) {
+                            ackedChunks.add(i);
+                        }
+                        highestContiguousAckedChunkIndex = highestContiguous;
+                        ackedChunkCount = ackedChunks.size;
+                    }
+
+                    // Log every 100th contiguous ACK to avoid spam
                     if (highestContiguous % 100 === 0) {
-                        console.log(`✅ Received windowed ACK up to chunk #${highestContiguous} (acked: ${ackedChunkCount})`);
+                        console.log(`✅ Received windowed ACK (contiguous) up to chunk #${highestContiguous} (acked: ${ackedChunkCount})`);
                     }
                 }
                 return;
@@ -2988,9 +3010,9 @@ const BATCH_SIZE = 10; // Write every 10 chunks to reduce disk I/O bottleneck
 let receivedChunks = new Map(); // chunkIndex -> chunkSize (tracks which chunks were received)
 let lastAckedChunkIndex = -1; // Track last chunk we ACKed to sender
 let expectedTotalChunks = 0; // ✅ FIX 5: Expected total chunks for completion check
-let highestContiguousChunkIndex = -1; // ✅ FIX 1: Track highest contiguous chunk for windowed ACK
+let highestContiguousChunkIndex = -1; // ✅ FIX 1: Track highest contiguous chunk on receiver
+let highestReceivedChunkIndex = -1; // Highest index ever received on receiver (may have gaps)
 let isChunkFlushInProgress = false;   // Background worker flag
-let lastAckTime = 0; // Sender-side: last time we received an ACK (for stall detection)
 
 async function handleFileChunk(chunk, chunkIndex) {
     // 🔹 Idempotent handler - safe to call multiple times
@@ -3020,9 +3042,11 @@ async function handleFileChunk(chunk, chunkIndex) {
     
     // ✅ FIX 3: Track received chunks in map (for completion + ACKs)
     receivedChunks.set(chunkIndex, chunkSize);
+
+    // Track highest index ever received (may have gaps)
+    highestReceivedChunkIndex = Math.max(highestReceivedChunkIndex, chunkIndex);
     
-    // ✅ FIX 1: Update highest contiguous chunk index for windowed ACK
-    // Find highest contiguous chunk (chunks 0, 1, 2, ... N where all exist)
+    // ✅ FIX 1: Update highest contiguous chunk index (0..N all present)
     let contiguous = highestContiguousChunkIndex;
     while (receivedChunks.has(contiguous + 1)) {
         contiguous++;
@@ -3034,15 +3058,17 @@ async function handleFileChunk(chunk, chunkIndex) {
     
     // ✅ FIX 1 (MNC): ACK MUST be decoupled from storage.
     // ACK on receive (after state update), not on persist. Send cumulative ACKs immediately.
-    if (highestContiguousChunkIndex >= 0 &&
-        highestContiguousChunkIndex >= lastAckedChunkIndex + ACK_EVERY_N_CHUNKS) {
+    // ACK represents highest RECEIVED index, not contiguous perfection.
+    if (highestReceivedChunkIndex >= 0 &&
+        highestReceivedChunkIndex >= lastAckedChunkIndex + ACK_EVERY_N_CHUNKS) {
         if (dataChannel && dataChannel.readyState === 'open') {
             try {
                 dataChannel.send(JSON.stringify({
                     type: 'chunk-ack',
+                    highestReceivedChunkIndex: highestReceivedChunkIndex,
                     highestContiguousChunkIndex: highestContiguousChunkIndex
                 }));
-                lastAckedChunkIndex = highestContiguousChunkIndex;
+                lastAckedChunkIndex = highestReceivedChunkIndex;
             } catch (error) {
                 console.warn('⚠️ Could not send windowed ACK (non-critical):', error);
             }
