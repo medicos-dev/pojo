@@ -300,7 +300,7 @@ let isProcessingQueue = false; // Flag to prevent concurrent processing
 let currentFileResolve = null; // Resolve function for current file promise
 
 // ✅ FIX 1: Windowed ACK tracking (not per-chunk)
-const ACK_EVERY_N_CHUNKS = 256; // ACK every 256 chunks (speed-optimized: ACK sparsity)
+const ACK_EVERY_N_CHUNKS = 64; // ACK every 64 chunks (stabilizes RTT and keeps credits flowing)
 let ackedChunks = new Set(); // Track which chunks receiver has ACKed (by index)
 let highestReceivedAckedChunkIndex = -1; // Highest index ever ACKed by receiver (may have gaps)
 let highestContiguousAckedChunkIndex = -1; // Highest contiguous index where all chunks [0..N] are ACKed
@@ -332,10 +332,14 @@ let transferStats = {
     totalChunksExpected: 0
 };
 
-// Speed-optimized sliding-window: aggressive in-flight chunks for high throughput
-let maxInFlightChunks = 1024; // allow deep pipe (speed-first)
+// RTT-aware adaptive sliding-window: dynamically adjust based on network conditions
+let maxInFlightChunks = 256; // base window, adjusted by RTT
 let lastInFlightAdjustTs = 0;
 let ackWatchdogInterval = null;
+// RTT tracking for adaptive window
+let sentAt = new Map(); // chunkIndex -> send timestamp
+let smoothedRTT = 0; // Exponential moving average of RTT
+const RTT_ALPHA = 0.125; // Smoothing factor for RTT
 
 // Sender-side helper: wait until all chunks have been ACKed (MNC-grade completion gating)
 async function waitForAllAcks(expectedTotalChunks, timeoutMs = 60000) {
@@ -399,6 +403,7 @@ async function requestWakeLock() {
         // Wake lock may fail if user denies permission or browser doesn't support it
         console.warn(`Wake Lock not available: ${err.name}, ${err.message}`);
     }
+    
 }
 
 // Release wake lock when transfer completes or fails
@@ -768,6 +773,27 @@ function setupPageUnloadHandler() {
                 ws.send(JSON.stringify({ type: 'ping', room: currentRoom }));
             } catch (e) {
                 // Ignore errors
+            }
+        }
+        
+        // Page visibility handling: reduce window when tab is hidden (prevents Chrome throttling SCTP)
+        if (document.hidden) {
+            const oldWindow = maxInFlightChunks;
+            maxInFlightChunks = Math.min(64, maxInFlightChunks);
+            if (oldWindow !== maxInFlightChunks) {
+                console.log(`📱 Tab hidden - reduced window from ${oldWindow} to ${maxInFlightChunks} to prevent Chrome throttling`);
+            }
+        } else {
+            // Restore adaptive window when tab becomes visible
+            if (smoothedRTT < 150) {
+                maxInFlightChunks = 384;
+            } else if (smoothedRTT < 300) {
+                maxInFlightChunks = 256;
+            } else {
+                maxInFlightChunks = 128;
+            }
+            if (smoothedRTT > 0) {
+                console.log(`📱 Tab visible - restored window to ${maxInFlightChunks} (RTT: ${smoothedRTT.toFixed(0)}ms)`);
             }
         }
     });
@@ -1596,10 +1622,16 @@ async function frameAndSend(chunkIndex, payload) {
             8
         );
 
-        dataChannel.send(framed.buffer);
+        // 🔴 HARD SCTP STALL BREAKER: Check state and buffer before every send
+        if (dataChannel.readyState !== 'open') {
+            throw new Error('DATACHANNEL_NOT_OPEN');
+        }
 
-        // 🔴 MANDATORY: Yield after every send to prevent Chrome batching
-        await new Promise(r => requestAnimationFrame(r));
+        if (dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+            await waitForDrain();
+        }
+
+        dataChannel.send(framed.buffer);
 
         offset += size;
         part++;
@@ -1642,14 +1674,9 @@ async function sendNextQueuedChunk(chunkData, file, isConnected = false) {
             }
         }
 
-        // SLIDING WINDOW: Limit max in-flight chunks (speed-optimized: fixed aggressive window)
-        // Allow temporary bursts up to 2048 if buffer is low and RTT is stable
-        const effectiveMaxInFlight = (bufferLow && dataChannel.bufferedAmount < (HIGH_WATER_MARK / 2)) 
-            ? Math.min(2048, maxInFlightChunks * 2) 
-            : maxInFlightChunks;
-        
+        // SLIDING WINDOW: Limit max in-flight chunks (conservative window to prevent SCTP collapse)
         // Window is driven by ACKs (highest index ever ACKed), not contiguous correctness
-        while ((totalChunksSent - highestReceivedAckedChunkIndex) > effectiveMaxInFlight) {
+        while ((totalChunksSent - highestReceivedAckedChunkIndex) > maxInFlightChunks) {
             if (transferAborted) {
                 throw new Error('TRANSFER_ABORTED');
             }
@@ -1663,6 +1690,9 @@ async function sendNextQueuedChunk(chunkData, file, isConnected = false) {
         
         // ✅ FIX 2: Immutable chunk index - never reuse
         const chunkIndex = senderChunkIndex++;
+
+        // Track send timestamp for RTT measurement
+        sentAt.set(chunkIndex, performance.now());
 
         // 🔴 SCTP TRANSPORT: Fragment payload into 16KB wire chunks (prevents send credit exhaustion)
         const chunkArray = new Uint8Array(chunk);
@@ -2450,6 +2480,16 @@ function handleDataChannelMessage(event) {
                 // Receiver ignores ping - just acknowledge it's received
                 // This keeps the connection alive
                 return;
+            } else if (message.type === 'slowDown') {
+                // Receiver-driven flow control: reduce window immediately
+                maxInFlightChunks = Math.max(64, Math.floor(maxInFlightChunks / 2));
+                console.log(`⚠️ Receiver requested slowDown. Window reduced to ${maxInFlightChunks}`);
+                return;
+            } else if (message.type === 'speedUp') {
+                // Receiver-driven flow control: increase window gradually
+                maxInFlightChunks = Math.min(512, Math.floor(maxInFlightChunks * 1.5));
+                console.log(`✅ Receiver requested speedUp. Window increased to ${maxInFlightChunks}`);
+                return;
             } else if (message.type === 'chunk-ack') {
                 // ✅ Sender receives cumulative ACK from receiver:
                 // - highestReceivedChunkIndex: highest index ever received (may have gaps)
@@ -2460,8 +2500,29 @@ function handleDataChannelMessage(event) {
                 // Progress (window) is driven by highestReceived
                 if (highestReceived !== undefined && highestReceived !== null) {
                     if (highestReceived > highestReceivedAckedChunkIndex) {
+                        // Update RTT: find oldest unacked chunk that's now ACKed
+                        for (let i = highestReceivedAckedChunkIndex + 1; i <= highestReceived; i++) {
+                            if (sentAt.has(i)) {
+                                const rtt = performance.now() - sentAt.get(i);
+                                // Exponential moving average
+                                smoothedRTT = smoothedRTT === 0 
+                                    ? rtt 
+                                    : smoothedRTT * (1 - RTT_ALPHA) + rtt * RTT_ALPHA;
+                                sentAt.delete(i); // Clean up old entries
+                            }
+                        }
+                        
                         highestReceivedAckedChunkIndex = highestReceived;
                         lastAckTime = Date.now();
+                        
+                        // RTT-aware adaptive window
+                        if (smoothedRTT < 150) {
+                            maxInFlightChunks = 384;
+                        } else if (smoothedRTT < 300) {
+                            maxInFlightChunks = 256;
+                        } else {
+                            maxInFlightChunks = 128;
+                        }
                     }
                 }
 
@@ -3145,13 +3206,18 @@ async function handleFileChunk(chunk, chunkIndex) {
     
     // ✅ FIX 1 (MNC): ACK MUST be decoupled from storage.
     // ACK on receive (after state update), not on persist. Send cumulative ACKs immediately.
-    // ACK represents highest RECEIVED index, not contiguous perfection.
+    // ACK coalescing: send ranges instead of single index (reduces signaling overhead)
     if (highestReceivedChunkIndex >= 0 &&
         highestReceivedChunkIndex >= lastAckedChunkIndex + ACK_EVERY_N_CHUNKS) {
         if (dataChannel && dataChannel.readyState === 'open') {
             try {
+                // ACK coalescing: send range from lastAckedChunkIndex+1 to highestReceivedChunkIndex
+                const ackFrom = lastAckedChunkIndex + 1;
+                const ackTo = highestReceivedChunkIndex;
                 dataChannel.send(JSON.stringify({
                     type: 'chunk-ack',
+                    from: ackFrom,
+                    to: ackTo,
                     highestReceivedChunkIndex: highestReceivedChunkIndex,
                     highestContiguousChunkIndex: highestContiguousChunkIndex
                 }));
@@ -3184,6 +3250,7 @@ async function handleFileChunk(chunk, chunkIndex) {
                     
                     const batch = chunkBuffer.slice(0, batchSize);
                     try {
+                        const writeStart = performance.now();
                         const writePromises = batch.map(item => {
                             if (!item || item.chunkIndex === undefined) {
                                 throw new Error(`❌ CRITICAL: Corrupted chunk in batch! Item: ${JSON.stringify(item)}`);
@@ -3191,8 +3258,24 @@ async function handleFileChunk(chunk, chunkIndex) {
                             return storeChunkInIndexedDB(receivingFile.name, item.chunkIndex, item.chunkData);
                         });
                         await Promise.all(writePromises);
+                        const writeLatency = performance.now() - writeStart;
                         
-                        console.log(`💾 Stored batch of ${batch.length} chunks to IndexedDB (head chunk ${batch[0].chunkIndex})`);
+                        // Receiver-driven flow control: signal sender if storage is slow
+                        if (writeLatency > 500 && dataChannel && dataChannel.readyState === 'open') {
+                            try {
+                                dataChannel.send(JSON.stringify({ type: 'slowDown' }));
+                            } catch (err) {
+                                // Non-critical
+                            }
+                        } else if (writeLatency < 50 && dataChannel && dataChannel.readyState === 'open') {
+                            try {
+                                dataChannel.send(JSON.stringify({ type: 'speedUp' }));
+                            } catch (err) {
+                                // Non-critical
+                            }
+                        }
+                        
+                        console.log(`💾 Stored batch of ${batch.length} chunks to IndexedDB (head chunk ${batch[0].chunkIndex}, latency: ${writeLatency.toFixed(1)}ms)`);
                         chunkBuffer.splice(0, batch.length);
                         saveFileMetadataToLocalStorage(receivingFile.name, receivingFileSize, receivingFile.type, receivedBytes);
                     } catch (error) {
