@@ -49,9 +49,15 @@ console.log('WebSocket URL:', WS_URL);
 // 🔴 PROTOCOL INVARIANT: Fixed chunk size per index (single CHUNK_SIZE for entire transfer)
 const INITIAL_CHUNK_SIZE = 256 * 1024; // 256KB fixed chunk size (speed-optimized)
 const CONNECTED_CHUNK_SIZE = 256 * 1024; // Must match INITIAL_CHUNK_SIZE for deterministic offsets
-const HIGH_WATER_MARK = 16 * 1024 * 1024; // 16MB - fill buffer up to this before waiting (speed-optimized)
-const BACKPRESSURE_THRESHOLD = 4 * 1024 * 1024; // 4MB - bufferedAmountLowThreshold (triggers next burst)
-const MAX_BUFFERED_AMOUNT = HIGH_WATER_MARK; // 16MB max - don't send if buffer exceeds this
+// 🧯 HARD SPEED CAP: Intentional throttling to prevent SCTP collapse (target 4-7 MBps)
+const TARGET_MBPS = 7; // Target 4 MBps (conservative for mobile Chrome)
+const BYTES_PER_SEC = TARGET_MBPS * 1024 * 1024;
+const SEND_INTERVAL_MS = 20; // Send every 20ms
+const BYTES_PER_TICK = BYTES_PER_SEC * (SEND_INTERVAL_MS / 1000); // ~83KB per tick
+
+const HIGH_WATER_MARK = 2 * 1024 * 1024; // 2MB - conservative for mobile Chrome
+const BACKPRESSURE_THRESHOLD = 1 * 1024 * 1024; // 1MB - bufferedAmountLowThreshold
+const MAX_BUFFERED_AMOUNT = HIGH_WATER_MARK; // 2MB max - don't send if buffer exceeds this
 // 🔴 SCTP TRANSPORT LIMIT: Never send >16KB wire payloads (prevents send credit exhaustion)
 const MAX_WIRE_CHUNK = 16 * 1024; // 16KB hard limit for stable SCTP over mobile
 
@@ -316,6 +322,14 @@ let fileTransferConfirmationResolver = null;
 let transferAborted = false; // Flag to abort transfer on connection loss
 let transferPaused = false; // Flag to pause transfer (waiting for reconnection)
 let keepaliveInterval = null; // Keepalive ping interval
+let lastSendTime = 0; // For speed throttling
+let bytesSentThisTick = 0; // Track bytes sent in current tick
+
+// Pause transfer function (hard guard - stops sending immediately)
+function pauseTransfer(reason) {
+    transferPaused = true;
+    console.warn(`⏸️ Transfer paused: ${reason}`);
+}
 let connectionLostHandled = false; // Guard against double-calls
 let reader = null; // File stream reader (for ReadableStream)
 let streamReader = null; // Alternative reader reference
@@ -333,7 +347,8 @@ let transferStats = {
 };
 
 // RTT-aware adaptive sliding-window: dynamically adjust based on network conditions
-let maxInFlightChunks = 256; // base window, adjusted by RTT
+// 🛟 Treat DataChannel as fragile - lower limits for stability
+let maxInFlightChunks = 32; // Conservative limit (not 128+) - Chrome mobile needs this
 let lastInFlightAdjustTs = 0;
 let ackWatchdogInterval = null;
 // RTT tracking for adaptive window
@@ -438,7 +453,7 @@ let lastConnectionLossCheck = 0;
 const CONNECTION_LOSS_GRACE_PERIOD = 3000; // 3 seconds grace period on mobile
 const CONNECTION_LOSS_CHECK_INTERVAL = 1000; // Check every 1 second
 
-function handleConnectionLoss(reason = "unknown") {
+async function handleConnectionLoss(reason = "unknown") {
     // 🔹 Update state machine on connection loss
     if (transferState === TransferState.TRANSFERRING || transferState === TransferState.RESUMING) {
         transferState = TransferState.PAUSED;
@@ -507,13 +522,24 @@ function handleConnectionLoss(reason = "unknown") {
     
     console.warn("🚨 Connection lost:", reason, isLargeFile ? `(Large file: ${fileSizeGB.toFixed(2)}GB - being lenient)` : "", isMobile ? "(Mobile - being extra lenient)" : "");
     
-    // For large files and transient disconnections, don't immediately mark as handled
-    // This allows automatic reconnection attempts
-    if (reason === "datachannel-closed" && (isLargeFile || isMobile) && dataChannel?.readyState === 'closed') {
+    // Correct logic: Check dataChannel state directly, not PC/ICE state
+    if (dataChannel && dataChannel.readyState === 'closed') {
+        console.warn('🔁 DataChannel closed — attempting recovery...');
+        try {
+            await recoverDataChannelAndResume();
+            transferPaused = false; // Resume transfer after recovery
+            return; // Recovery successful, don't abort
+        } catch (recoverErr) {
+            console.error('❌ DataChannel recovery failed:', recoverErr);
+            // Fall through to normal connection loss handling
+        }
+    }
+    
+    // Legacy handling for other connection loss reasons
+    if (reason === "datachannel-closed" && (isLargeFile || isMobile)) {
         // Check if WebSocket is still connected - if so, this might be recoverable
         if (ws && ws.readyState === WebSocket.OPEN) {
-            console.log("🔄 WebSocket still connected, DataChannel closed - attempting recovery...");
-            // Don't mark as handled yet - allow reconnection attempt
+            console.log("🔄 WebSocket still connected, attempting recovery...");
             transferPaused = true;
             // Try to recreate DataChannel if we're the initiator
             if (isInitiator && peerConnection && peerConnection.connectionState === 'connected') {
@@ -1278,8 +1304,9 @@ function setupDataChannel(channel) {
     
     // CRITICAL: Listen to DataChannel lifecycle explicitly
     dataChannel.onclose = () => {
-        console.warn('DataChannel closed. State:', dataChannel?.readyState);
-        handleConnectionLoss("datachannel-closed");
+        console.warn('🔁 DataChannel closed — will recreate on next send');
+        // 🛟 Treat DataChannel as fragile - pause transfer, will recreate on resume
+        pauseTransfer('datachannel-closed');
     };
     
     dataChannel.onerror = (error) => {
@@ -1636,10 +1663,11 @@ async function waitForChannelOpen() {
 }
 
 // DataChannel recovery: recreate channel and resume from last ACK (Rule C: Channel failure ≠ transfer failure)
-async function recoverDataChannel() {
-    console.warn('🔁 Recovering DataChannel...');
+// Mandatory recovery path (sender side) - resumes from ACK state
+async function recoverDataChannelAndResume() {
+    console.warn('🔁 DataChannel closed — recovering...');
     
-    // 1. Close old channel safely
+    // Hard rule: old channel is dead
     try {
         if (dataChannel) {
             dataChannel.close();
@@ -1650,7 +1678,7 @@ async function recoverDataChannel() {
     
     dataChannel = null;
     
-    // 2. Create NEW data channel
+    // Create new channel
     if (!peerConnection) {
         throw new Error('PeerConnection not available for recovery');
     }
@@ -1661,23 +1689,23 @@ async function recoverDataChannel() {
     
     setupDataChannel(dataChannel);
     
-    // 3. Wait for it to open
+    // Wait until OPEN
     await new Promise((resolve, reject) => {
-        const t = setTimeout(() => reject(new Error('DC_REOPEN_TIMEOUT')), 15000);
+        const timeout = setTimeout(() => reject(new Error('DC_RECOVERY_TIMEOUT')), 15000);
         dataChannel.onopen = () => {
-            clearTimeout(t);
-            console.log('✅ DataChannel re-opened');
+            clearTimeout(timeout);
+            console.log('✅ DataChannel recovered');
             resolve();
         };
         dataChannel.onerror = (err) => {
-            clearTimeout(t);
-            reject(new Error('DC_REOPEN_ERROR'));
+            clearTimeout(timeout);
+            reject(new Error('DC_RECOVERY_ERROR'));
         };
     });
     
-    // 4. Resume sending from last ACK (ACK state is source of truth - Rule B)
-    // Note: The actual resume logic is handled by the sender loop checking highestReceivedAckedChunkIndex
-    console.log(`▶️ DataChannel recovered. Will resume from chunk ${highestReceivedAckedChunkIndex + 1}`);
+    // Resume from ACK state (ACK state is source of truth - Rule B)
+    senderChunkIndex = highestReceivedAckedChunkIndex + 1;
+    console.log(`▶️ Resuming from chunk ${senderChunkIndex} (last ACKed: ${highestReceivedAckedChunkIndex})`);
 }
 
 // 🔴 SCTP TRANSPORT: Fragment large payloads into 16KB wire chunks to prevent send credit exhaustion
@@ -1700,22 +1728,47 @@ async function frameAndSend(chunkIndex, payload) {
             8
         );
 
-        // 🔴 HARD SCTP STALL BREAKER: Check state and buffer before every send
-        if (dataChannel.readyState !== 'open') {
-            await recoverDataChannel();
-            continue; // Retry after recovery
+        // 🧯 HARD GUARD: Never send when state ≠ open (stop immediately, not catch error)
+        if (!dataChannel || dataChannel.readyState !== 'open') {
+            pauseTransfer('datachannel-not-open');
+            return; // Stop sending immediately
         }
 
         if (dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
             await waitForDrain();
         }
 
-        try {
+        // 🧯 HARD SPEED CAP: Intentional throttling (target 4 MBps)
+        const now = performance.now();
+        if (now - lastSendTime >= SEND_INTERVAL_MS) {
+            // Reset tick
+            lastSendTime = now;
+            bytesSentThisTick = 0;
+        }
+
+        // Check if we've exceeded bytes-per-tick limit
+        if (bytesSentThisTick >= BYTES_PER_TICK) {
+            // Wait until next tick
+            const waitTime = SEND_INTERVAL_MS - (now - lastSendTime);
+            if (waitTime > 0) {
+                await new Promise(resolve => setTimeout(resolve, waitTime));
+                lastSendTime = performance.now();
+                bytesSentThisTick = 0;
+            }
+        }
+
+        // Send only if under limit
+        const bytesToSend = framed.buffer.byteLength;
+        if (bytesSentThisTick + bytesToSend <= BYTES_PER_TICK) {
             dataChannel.send(framed.buffer);
-        } catch (err) {
-            console.warn('⚠️ DataChannel send failed, will recover:', err);
-            await recoverDataChannel();
-            continue; // Retry after recovery
+            bytesSentThisTick += bytesToSend;
+        } else {
+            // Wait for next tick
+            await new Promise(resolve => setTimeout(resolve, SEND_INTERVAL_MS - (now - lastSendTime)));
+            lastSendTime = performance.now();
+            bytesSentThisTick = 0;
+            dataChannel.send(framed.buffer);
+            bytesSentThisTick += bytesToSend;
         }
 
         offset += size;
@@ -1727,8 +1780,8 @@ async function frameAndSend(chunkIndex, payload) {
     }
 }
 
-// SPEED-OPTIMIZED SLIDING WINDOW: Send chunks with high-water mark throttling
-// Fills buffer up to 16MB, then waits for bufferedAmountLow (4MB threshold) to trigger next burst
+// CONSERVATIVE SLIDING WINDOW: Send chunks with high-water mark throttling
+// Fills buffer up to 2MB, then waits for bufferedAmountLow (1MB threshold) to trigger next burst
 async function sendNextQueuedChunk(chunkData, file, isConnected = false) {
     // 🔴 PROTOCOL: Fixed chunk size per index (use single CHUNK_SIZE for whole transfer)
     const chunkSize = CONNECTED_CHUNK_SIZE; // INITIAL_CHUNK_SIZE === CONNECTED_CHUNK_SIZE
@@ -1746,7 +1799,7 @@ async function sendNextQueuedChunk(chunkData, file, isConnected = false) {
         chunks.push(chunkData);
     }
     
-    // Send chunks in bursts until high-water mark (16MB) or in-flight limit is reached
+    // Send chunks in bursts until high-water mark (2MB) or in-flight limit is reached
     for (const chunk of chunks) {
         // FAST-PATH: Skip throttling if buffer is very low (speed optimization)
         const bufferLow = dataChannel.bufferedAmount < (HIGH_WATER_MARK / 4);
@@ -1768,10 +1821,10 @@ async function sendNextQueuedChunk(chunkData, file, isConnected = false) {
             await waitForDrain();
         }
         
-        // Rule A: Never read file unless channel is OPEN
-        if (dataChannel.readyState !== 'open') {
-            await waitForChannelOpen();
-            continue; // Retry after channel opens
+        // 🧯 HARD GUARD: Never send when state ≠ open (stop immediately, not catch error)
+        if (!dataChannel || dataChannel.readyState !== 'open') {
+            pauseTransfer('datachannel-not-open');
+            return; // Stop sending immediately
         }
         
         // ✅ FIX 2: Immutable chunk index - never reuse
@@ -1898,30 +1951,10 @@ async function streamFile(file, startOffset = 0) {
             }
         }
         
-        // Rule A: Never read file unless channel is OPEN
-        if (dataChannel.readyState !== 'open') {
-            try {
-                await waitForChannelOpen();
-            } catch (err) {
-                // If channel can't open, try recovery
-                console.warn('⚠️ DataChannel not open, attempting recovery...');
-                try {
-                    await recoverDataChannel();
-                } catch (recoverErr) {
-                    // Only abort if recovery fails AND connection is truly lost
-                    const wsConnected = ws && ws.readyState === WebSocket.OPEN;
-                    const pcState = peerConnection?.connectionState;
-                    if (pcState === 'failed' && !wsConnected) {
-                        handleConnectionLoss("datachannel-closed");
-                        if (transferAborted) {
-                            reader.cancel();
-                            return; // Exit gracefully instead of throwing
-                        }
-                    }
-                    await new Promise(resolve => setTimeout(resolve, 1000));
-                }
-            }
-            continue; // Retry after channel opens or recovery
+        // 🧯 HARD GUARD: Never send when state ≠ open (stop immediately, not catch error)
+        if (!dataChannel || dataChannel.readyState !== 'open') {
+            pauseTransfer('datachannel-not-open');
+            return; // Stop sending immediately
         }
         
         // Update connection state for dynamic chunk sizing
@@ -2234,29 +2267,10 @@ async function streamFileLegacy(file, startOffset = 0) {
             }
         }
 
-        // Rule A: Never read file unless channel is OPEN
-        if (dataChannel.readyState !== 'open') {
-            try {
-                await waitForChannelOpen();
-            } catch (err) {
-                // If channel can't open, try recovery
-                console.warn('⚠️ DataChannel not open, attempting recovery...');
-                try {
-                    await recoverDataChannel();
-                } catch (recoverErr) {
-                    // Only abort if recovery fails AND connection is truly lost
-                    const wsConnected = ws && ws.readyState === WebSocket.OPEN;
-                    const pcState = peerConnection?.connectionState;
-                    if (pcState === 'failed' && !wsConnected) {
-                        handleConnectionLoss("datachannel-closed");
-                        if (transferAborted) {
-                            return; // Exit gracefully
-                        }
-                    }
-                    await sleep(1000);
-                }
-            }
-            continue; // Retry after channel opens or recovery
+        // 🧯 HARD GUARD: Never send when state ≠ open (stop immediately, not catch error)
+        if (!dataChannel || dataChannel.readyState !== 'open') {
+            pauseTransfer('datachannel-not-open');
+            return; // Stop sending immediately
         }
 
         // Update connection state for dynamic chunk sizing
