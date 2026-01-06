@@ -1242,7 +1242,8 @@ function setupDataChannel(channel) {
                 }));
                 console.log(`📤 Sent resume request: ${receivingFile.name} from byte ${receivedBytes}`);
             } catch (error) {
-                console.error('❌ Error sending resume request:', error);
+                console.warn('⚠️ Resume request send failed (non-critical):', error);
+                // Recovery will happen automatically on next send attempt
             }
         } else if (transferState === TransferState.PAUSED) {
             // Was paused, resume transfer
@@ -1602,6 +1603,83 @@ async function waitForDrain() {
     });
 }
 
+// Wait for DataChannel to be open (Rule A: Never read file unless channel is OPEN)
+async function waitForChannelOpen() {
+    if (dataChannel && dataChannel.readyState === 'open') {
+        return;
+    }
+    
+    return new Promise((resolve, reject) => {
+        if (!dataChannel) {
+            reject(new Error('DataChannel not created'));
+            return;
+        }
+        
+        if (dataChannel.readyState === 'open') {
+            resolve();
+            return;
+        }
+        
+        const timeout = setTimeout(() => {
+            dataChannel.removeEventListener('open', handler);
+            reject(new Error('DataChannel open timeout'));
+        }, 15000);
+        
+        const handler = () => {
+            clearTimeout(timeout);
+            dataChannel.removeEventListener('open', handler);
+            resolve();
+        };
+        
+        dataChannel.addEventListener('open', handler);
+    });
+}
+
+// DataChannel recovery: recreate channel and resume from last ACK (Rule C: Channel failure ≠ transfer failure)
+async function recoverDataChannel() {
+    console.warn('🔁 Recovering DataChannel...');
+    
+    // 1. Close old channel safely
+    try {
+        if (dataChannel) {
+            dataChannel.close();
+        }
+    } catch (err) {
+        // Ignore close errors
+    }
+    
+    dataChannel = null;
+    
+    // 2. Create NEW data channel
+    if (!peerConnection) {
+        throw new Error('PeerConnection not available for recovery');
+    }
+    
+    dataChannel = peerConnection.createDataChannel('fileTransfer', {
+        ordered: true
+    });
+    
+    setupDataChannel(dataChannel);
+    
+    // 3. Wait for it to open
+    await new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('DC_REOPEN_TIMEOUT')), 15000);
+        dataChannel.onopen = () => {
+            clearTimeout(t);
+            console.log('✅ DataChannel re-opened');
+            resolve();
+        };
+        dataChannel.onerror = (err) => {
+            clearTimeout(t);
+            reject(new Error('DC_REOPEN_ERROR'));
+        };
+    });
+    
+    // 4. Resume sending from last ACK (ACK state is source of truth - Rule B)
+    // Note: The actual resume logic is handled by the sender loop checking highestReceivedAckedChunkIndex
+    console.log(`▶️ DataChannel recovered. Will resume from chunk ${highestReceivedAckedChunkIndex + 1}`);
+}
+
 // 🔴 SCTP TRANSPORT: Fragment large payloads into 16KB wire chunks to prevent send credit exhaustion
 // This is mandatory for stable transfers on mobile Chrome
 async function frameAndSend(chunkIndex, payload) {
@@ -1624,14 +1702,21 @@ async function frameAndSend(chunkIndex, payload) {
 
         // 🔴 HARD SCTP STALL BREAKER: Check state and buffer before every send
         if (dataChannel.readyState !== 'open') {
-            throw new Error('DATACHANNEL_NOT_OPEN');
+            await recoverDataChannel();
+            continue; // Retry after recovery
         }
 
         if (dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
             await waitForDrain();
         }
 
-        dataChannel.send(framed.buffer);
+        try {
+            dataChannel.send(framed.buffer);
+        } catch (err) {
+            console.warn('⚠️ DataChannel send failed, will recover:', err);
+            await recoverDataChannel();
+            continue; // Retry after recovery
+        }
 
         offset += size;
         part++;
@@ -1683,9 +1768,10 @@ async function sendNextQueuedChunk(chunkData, file, isConnected = false) {
             await waitForDrain();
         }
         
-        // Check connection state before sending
+        // Rule A: Never read file unless channel is OPEN
         if (dataChannel.readyState !== 'open') {
-            throw new Error('DataChannel closed');
+            await waitForChannelOpen();
+            continue; // Retry after channel opens
         }
         
         // ✅ FIX 2: Immutable chunk index - never reuse
@@ -1812,24 +1898,30 @@ async function streamFile(file, startOffset = 0) {
             }
         }
         
+        // Rule A: Never read file unless channel is OPEN
         if (dataChannel.readyState !== 'open') {
-            const dcState = dataChannel.readyState;
-            const wsConnected = ws && ws.readyState === WebSocket.OPEN;
-            const pcState = peerConnection?.connectionState;
-            
-            if (dcState === 'closed' && (!wsConnected || pcState === 'failed')) {
-                console.warn('⚠️ DataChannel closed during transfer (verified connection loss)');
-                handleConnectionLoss("datachannel-closed");
-                if (transferAborted) {
-                    reader.cancel();
-                    throw new Error('TRANSFER_ABORTED');
+            try {
+                await waitForChannelOpen();
+            } catch (err) {
+                // If channel can't open, try recovery
+                console.warn('⚠️ DataChannel not open, attempting recovery...');
+                try {
+                    await recoverDataChannel();
+                } catch (recoverErr) {
+                    // Only abort if recovery fails AND connection is truly lost
+                    const wsConnected = ws && ws.readyState === WebSocket.OPEN;
+                    const pcState = peerConnection?.connectionState;
+                    if (pcState === 'failed' && !wsConnected) {
+                        handleConnectionLoss("datachannel-closed");
+                        if (transferAborted) {
+                            reader.cancel();
+                            return; // Exit gracefully instead of throwing
+                        }
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 1000));
                 }
-            } else {
-                console.log(`⏳ DataChannel state: ${dcState}. Waiting for recovery...`);
-                await new Promise(resolve => setTimeout(resolve, 1000));
             }
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            continue;
+            continue; // Retry after channel opens or recovery
         }
         
         // Update connection state for dynamic chunk sizing
@@ -2142,22 +2234,29 @@ async function streamFileLegacy(file, startOffset = 0) {
             }
         }
 
-        // Channel closed or unstable
+        // Rule A: Never read file unless channel is OPEN
         if (dataChannel.readyState !== 'open') {
-            const dcState = dataChannel.readyState;
-            const wsConnected = ws && ws.readyState === WebSocket.OPEN;
-            const pcState = peerConnection?.connectionState;
-
-            if (dcState === 'closed' && (!wsConnected || pcState === 'failed')) {
-                handleConnectionLoss("datachannel-closed");
-                if (transferAborted) {
-                    return;
+            try {
+                await waitForChannelOpen();
+            } catch (err) {
+                // If channel can't open, try recovery
+                console.warn('⚠️ DataChannel not open, attempting recovery...');
+                try {
+                    await recoverDataChannel();
+                } catch (recoverErr) {
+                    // Only abort if recovery fails AND connection is truly lost
+                    const wsConnected = ws && ws.readyState === WebSocket.OPEN;
+                    const pcState = peerConnection?.connectionState;
+                    if (pcState === 'failed' && !wsConnected) {
+                        handleConnectionLoss("datachannel-closed");
+                        if (transferAborted) {
+                            return; // Exit gracefully
+                        }
+                    }
+                    await sleep(1000);
                 }
-            } else {
-                console.log(`⏳ DataChannel state: ${dcState}. Waiting for recovery...`);
             }
-            await sleep(1000);
-            continue;
+            continue; // Retry after channel opens or recovery
         }
 
         // Update connection state for dynamic chunk sizing
@@ -3223,7 +3322,9 @@ async function handleFileChunk(chunk, chunkIndex) {
                 }));
                 lastAckedChunkIndex = highestReceivedChunkIndex;
             } catch (error) {
-                console.warn('⚠️ Could not send windowed ACK (non-critical):', error);
+                console.warn('⚠️ ACK send failed, will recover:', error);
+                // ACK failure is recoverable - channel will be recovered on next send
+                // Don't block here, just log and continue
             }
         }
     }
