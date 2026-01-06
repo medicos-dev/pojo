@@ -332,6 +332,7 @@ let transferStats = {
 // Adaptive sliding-window upper bound for in-flight chunks (tuned by sender)
 let maxInFlightChunks = 128;
 let lastInFlightAdjustTs = 0;
+let ackWatchdogInterval = null;
 
 // Sender-side helper: wait until all chunks have been ACKed (MNC-grade completion gating)
 async function waitForAllAcks(expectedTotalChunks, timeoutMs = 60000) {
@@ -1135,6 +1136,34 @@ function setupDataChannel(channel) {
     dataChannel.onopen = () => {
         console.log('✅ DataChannel opened! Ready to transfer files.');
         updateConnectionStatus('connected', 'P2P Connected - Ready');
+
+        // Start ACK watchdog to detect "looks alive but frozen" states
+        if (!ackWatchdogInterval) {
+            lastAckTime = Date.now();
+            ackWatchdogInterval = setInterval(() => {
+                try {
+                    if (!dataChannel || dataChannel.readyState !== 'open') {
+                        return;
+                    }
+                    // Only watch when we have outstanding in-flight data
+                    const outstanding = totalChunksSent - ackedChunks.size;
+                    if (outstanding <= 0) {
+                        return;
+                    }
+
+                    const now = Date.now();
+                    const sinceLastAck = now - lastAckTime;
+
+                    // If channel is open, buffer is low, but no ACKs for >15s → STALL_DETECTED
+                    if (sinceLastAck > 15000 && dataChannel.bufferedAmount < BACKPRESSURE_THRESHOLD) {
+                        console.warn(`❗ STALL_DETECTED: no ACKs for ${sinceLastAck}ms, outstanding chunks=${outstanding}, bufferedAmount=${dataChannel.bufferedAmount}`);
+                        // We don't auto-resend here; higher-level logic (timeouts / resume) will recover.
+                    }
+                } catch (err) {
+                    console.warn('ACK watchdog error:', err);
+                }
+            }, 2000);
+        }
         
         // Reset connection lost flag on successful connection
         connectionLostHandled = false;
@@ -1662,6 +1691,7 @@ async function streamFile(file, startOffset = 0) {
     }
     transferStats.startTime = Date.now();
     transferStats.lastUpdateTime = Date.now();
+    lastAckTime = Date.now();
     
     // Track connection state for dynamic chunk sizing
     let isConnected = dataChannel && dataChannel.readyState === 'open';
@@ -1998,6 +2028,7 @@ async function streamFileLegacy(file, startOffset = 0) {
     
     transferStats.startTime = Date.now();
     transferStats.lastUpdateTime = Date.now();
+    lastAckTime = Date.now();
     const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
     while (offset < file.size) {
@@ -2371,6 +2402,7 @@ function handleDataChannelMessage(event) {
                         }
                         highestAckedChunkIndex = highestContiguous;
                         ackedChunkCount = ackedChunks.size;
+                        lastAckTime = Date.now();
                     }
                     // Log every 100th ACK to avoid spam
                     if (highestContiguous % 100 === 0) {
@@ -2949,7 +2981,7 @@ async function startReceivingFile(metadata, resumeOffset = 0) {
 }
 
 // RECEIVER: Batched IndexedDB writes (every 10 chunks) for optimal disk I/O
-let chunkBuffer = []; // Buffer chunks before batch write
+let chunkBuffer = []; // Buffer chunks before batch write (in-memory queue, flushed by background worker)
 const BATCH_SIZE = 10; // Write every 10 chunks to reduce disk I/O bottleneck
 
 // ✅ FIX 3: Store chunkIndex → boolean map (enterprise pattern)
@@ -2957,6 +2989,8 @@ let receivedChunks = new Map(); // chunkIndex -> chunkSize (tracks which chunks 
 let lastAckedChunkIndex = -1; // Track last chunk we ACKed to sender
 let expectedTotalChunks = 0; // ✅ FIX 5: Expected total chunks for completion check
 let highestContiguousChunkIndex = -1; // ✅ FIX 1: Track highest contiguous chunk for windowed ACK
+let isChunkFlushInProgress = false;   // Background worker flag
+let lastAckTime = 0; // Sender-side: last time we received an ACK (for stall detection)
 
 async function handleFileChunk(chunk, chunkIndex) {
     // 🔹 Idempotent handler - safe to call multiple times
@@ -2978,13 +3012,13 @@ async function handleFileChunk(chunk, chunkIndex) {
     // This ensures we verify the final file, not individual chunks
     
     // ✅ FIX 2: Use immutable chunkIndex from sender (don't increment our own counter)
-    // Add chunk to buffer (keep in memory temporarily for batching)
+    // Add chunk to in-memory buffer queue for async storage
     chunkBuffer.push({
         chunkIndex: chunkIndex,
         chunkData: chunk
     });
     
-    // ✅ FIX 3: Track received chunks in map
+    // ✅ FIX 3: Track received chunks in map (for completion + ACKs)
     receivedChunks.set(chunkIndex, chunkSize);
     
     // ✅ FIX 1: Update highest contiguous chunk index for windowed ACK
@@ -2998,9 +3032,10 @@ async function handleFileChunk(chunk, chunkIndex) {
     // CRITICAL: Update last chunk received time - used to detect stale connections
     lastChunkReceivedTime = Date.now();
     
-    // ✅ FIX 1: Windowed ACK (every 64 chunks) - NOT per-chunk
-    if (chunkIndex % ACK_EVERY_N_CHUNKS === 0) {
-        // Send windowed ACK with highest contiguous chunk index
+    // ✅ FIX 1 (MNC): ACK MUST be decoupled from storage.
+    // ACK on receive (after state update), not on persist. Send cumulative ACKs immediately.
+    if (highestContiguousChunkIndex >= 0 &&
+        highestContiguousChunkIndex >= lastAckedChunkIndex + ACK_EVERY_N_CHUNKS) {
         if (dataChannel && dataChannel.readyState === 'open') {
             try {
                 dataChannel.send(JSON.stringify({
@@ -3014,74 +3049,59 @@ async function handleFileChunk(chunk, chunkIndex) {
         }
     }
     
-    // Batch write: Store chunks in IndexedDB every 10 chunks (reduces disk I/O bottleneck)
-    // CRITICAL: Use smaller batches (5 chunks) when near completion to ensure all chunks are stored
-    const progressPercent = (receivedBytes / receivingFileSize) * 100;
-    const effectiveBatchSize = progressPercent > 90 ? 5 : BATCH_SIZE; // Smaller batches near completion
-    
-    if (chunkBuffer.length >= effectiveBatchSize) {
-        // ✅ FIX 2: Two-phase commit - copy buffer BEFORE clearing
-        const batch = [...chunkBuffer]; // Create copy for atomic operation
-        
-        try {
-            // Write all buffered chunks in parallel for better performance
-            const writePromises = batch.map(item => {
-                if (!item || item.chunkIndex === undefined) {
-                    throw new Error(`❌ CRITICAL: Corrupted chunk in batch! Item: ${JSON.stringify(item)}`);
-                }
-                return storeChunkInIndexedDB(receivingFile.name, item.chunkIndex, item.chunkData);
-            });
-            await Promise.all(writePromises);
-            
-            const flushedCount = batch.length;
-            const firstIndex = batch[0].chunkIndex;
-            const lastIndex = batch[batch.length - 1].chunkIndex;
-            
-            console.log(`💾 Stored batch of ${flushedCount} chunks to IndexedDB (chunks ${firstIndex} to ${lastIndex})`);
-            
-            // ✅ FIX 2: Clear buffer ONLY after DB confirms success
-            chunkBuffer.splice(0, batch.length); // Remove only the successfully stored chunks
-            
-            // Update localStorage with current progress (less frequently)
-            saveFileMetadataToLocalStorage(receivingFile.name, receivingFileSize, receivingFile.type, receivedBytes);
-        } catch (error) {
-            console.error('❌ CRITICAL: Error storing chunk batch in IndexedDB:', error);
-            console.error(`❌ Failed to store ${batch.length} chunks (indices ${batch[0]?.chunkIndex} to ${batch[batch.length - 1]?.chunkIndex})`);
-            
-            // ✅ FIX 5: Hard stop on corrupted batch
-            if (error.message && error.message.includes('Corrupted chunk')) {
-                console.error('❌ CRITICAL: Corrupted batch detected! Aborting transfer.');
-                transferState = TransferState.FAILED;
-                alert('CRITICAL ERROR: Internal receiver corruption detected. Transfer aborted. Please restart.');
-                resetReceivingState();
-                return;
-            }
-            
-            // DON'T clear buffer on error - keep chunks for retry
-            // Buffer remains intact for retry
-            console.warn('⚠️ Batch store failed, will retry on next batch or completion');
-        }
-    }
-    
     // Calculate progress but cap at 99.9% until actually complete
+    const progressPercent = (receivedBytes / receivingFileSize) * 100;
     updateReceivingProgress(Math.min(99.9, progressPercent));
     
-    // CRITICAL: If we're at or near 100%, flush buffer immediately (don't wait for batch)
-    // This ensures all chunks are stored before completion check
-    if (progressPercent >= 99.9 && chunkBuffer.length > 0) {
-        console.log(`⚠️ Near completion (${progressPercent.toFixed(1)}%) with ${chunkBuffer.length} chunks in buffer. Flushing immediately...`);
-        try {
-            await flushChunkBuffer();
-            console.log(`✅ Flushed ${chunkBuffer.length} remaining chunks to IndexedDB`);
-        } catch (error) {
-            console.error('❌ CRITICAL: Failed to flush final chunks:', error);
-        }
-    }
-    
     // Log every 100th chunk or when close to completion to avoid spam
-    // NOTE: currentChunkIndex is already incremented, so this shows the NEXT chunk number
     if ((currentChunkIndex - 1) % 100 === 0 || progressPercent > 90) {
         console.log(`📥 Chunk #${currentChunkIndex - 1}: ${chunkSize} bytes. Total: ${receivedBytes}/${receivingFileSize} (${progressPercent.toFixed(1)}%), Buffer: ${chunkBuffer.length} chunks`);
+    }
+    
+    // Kick off background storage worker (non-blocking)
+    if (!isChunkFlushInProgress && chunkBuffer.length > 0) {
+        // Fire-and-forget; worker yields between batches to keep event loop alive
+        (async () => {
+            isChunkFlushInProgress = true;
+            try {
+                while (chunkBuffer.length && receivingFile && transferState !== TransferState.FAILED) {
+                    const progress = (receivedBytes / receivingFileSize) * 100;
+                    const effectiveBatchSize = progress > 90 ? 5 : BATCH_SIZE;
+                    const batchSize = Math.min(effectiveBatchSize, chunkBuffer.length);
+                    
+                    const batch = chunkBuffer.slice(0, batchSize);
+                    try {
+                        const writePromises = batch.map(item => {
+                            if (!item || item.chunkIndex === undefined) {
+                                throw new Error(`❌ CRITICAL: Corrupted chunk in batch! Item: ${JSON.stringify(item)}`);
+                            }
+                            return storeChunkInIndexedDB(receivingFile.name, item.chunkIndex, item.chunkData);
+                        });
+                        await Promise.all(writePromises);
+                        
+                        console.log(`💾 Stored batch of ${batch.length} chunks to IndexedDB (head chunk ${batch[0].chunkIndex})`);
+                        chunkBuffer.splice(0, batch.length);
+                        saveFileMetadataToLocalStorage(receivingFile.name, receivingFileSize, receivingFile.type, receivedBytes);
+                    } catch (error) {
+                        console.error('❌ CRITICAL: Error storing chunk batch in IndexedDB (background):', error);
+                        if (error.message && error.message.includes('Corrupted chunk')) {
+                            console.error('❌ CRITICAL: Corrupted batch detected! Aborting transfer.');
+                            transferState = TransferState.FAILED;
+                            alert('CRITICAL ERROR: Internal receiver corruption detected. Transfer aborted. Please restart.');
+                            resetReceivingState();
+                            break;
+                        }
+                        console.warn('⚠️ Batch store failed in background, will retry later');
+                        await new Promise(resolve => setTimeout(resolve, 500));
+                    }
+                    
+                    // Yield to event loop between batches
+                    await new Promise(resolve => setTimeout(resolve, 0));
+                }
+            } finally {
+                isChunkFlushInProgress = false;
+            }
+        })();
     }
     
     // 🔴 Step 3: Check completion when signal received
@@ -3116,10 +3136,10 @@ async function flushChunkBuffer() {
         }
     }
     
-    const firstChunkIndex = batch[0].chunkIndex;
-    const lastChunkIndex = batch[batch.length - 1].chunkIndex;
-    
     try {
+        const firstChunkIndex = batch[0].chunkIndex;
+        const lastChunkIndex = batch[batch.length - 1].chunkIndex;
+        
         console.log(`💾 Flushing ${chunksToFlush} chunks to IndexedDB (chunks ${firstChunkIndex} to ${lastChunkIndex})...`);
         
         // Write all chunks in parallel
