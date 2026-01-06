@@ -52,6 +52,8 @@ const CONNECTED_CHUNK_SIZE = 128 * 1024; // Must match INITIAL_CHUNK_SIZE for de
 const HIGH_WATER_MARK = 4 * 1024 * 1024; // 4MB - fill buffer up to this before waiting
 const BACKPRESSURE_THRESHOLD = 1024 * 1024; // 1MB - bufferedAmountLowThreshold (triggers next burst)
 const MAX_BUFFERED_AMOUNT = HIGH_WATER_MARK; // 4MB max - don't send if buffer exceeds this
+// 🔴 SCTP TRANSPORT LIMIT: Never send >16KB wire payloads (prevents send credit exhaustion)
+const MAX_WIRE_CHUNK = 16 * 1024; // 16KB hard limit for stable SCTP over mobile
 
 // Mobile device detection
 const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
@@ -1110,7 +1112,9 @@ function createDataChannel() {
         ordered: true,
         // 🔴 Use fully reliable, ordered delivery. Let SCTP handle retransmits.
         // This reduces browser-side batching unpredictability when combined with our own flow control.
-        maxRetransmits: null
+        maxRetransmits: null,
+        // 🔴 Disable SCTP coalescing (Chrome quirk) - prevents send credit exhaustion
+        maxPacketLifeTime: null
     });
     
     console.log(`📏 Using fixed chunk size: ${(CONNECTED_CHUNK_SIZE/1024).toFixed(0)}KB for entire transfer`);
@@ -1164,6 +1168,32 @@ function setupDataChannel(channel) {
                     if (sinceLastAck > 20000 && dataChannel.bufferedAmount < BACKPRESSURE_THRESHOLD && outstanding > 0) {
                         console.warn('FORCING WINDOW RELAXATION');
                         maxInFlightChunks = Math.min(maxInFlightChunks * 2, 512);
+                    }
+
+                    // 🔴 SCTP STALL RECOVERY: If no ACK AND no bufferedAmount growth for 20s, restart DataChannel
+                    const lastBufferedAmount = dataChannel.bufferedAmount || 0;
+                    if (sinceLastAck > 20000 && dataChannel.readyState === 'open' && outstanding > 0) {
+                        // Check if bufferedAmount hasn't changed (SCTP credit exhaustion)
+                        setTimeout(() => {
+                            if (dataChannel && dataChannel.readyState === 'open') {
+                                const currentBufferedAmount = dataChannel.bufferedAmount || 0;
+                                if (Math.abs(currentBufferedAmount - lastBufferedAmount) < 1000) {
+                                    console.warn('🚨 SCTP STALL — no ACKs and no bufferedAmount growth. Restarting DataChannel...');
+                                    try {
+                                        dataChannel.close();
+                                        // Trigger ICE restart and DataChannel recreation
+                                        if (peerConnection) {
+                                            peerConnection.restartIce();
+                                            setTimeout(() => {
+                                                createDataChannel();
+                                            }, 500);
+                                        }
+                                    } catch (err) {
+                                        console.error('Error restarting DataChannel:', err);
+                                    }
+                                }
+                            }
+                        }, 100);
                     }
                 } catch (err) {
                     console.warn('ACK watchdog error:', err);
@@ -1547,6 +1577,40 @@ async function waitForDrain() {
     });
 }
 
+// 🔴 SCTP TRANSPORT: Fragment large payloads into 16KB wire chunks to prevent send credit exhaustion
+// This is mandatory for stable transfers on mobile Chrome
+async function frameAndSend(chunkIndex, payload) {
+    let offset = 0;
+    let part = 0;
+    const totalParts = Math.ceil(payload.byteLength / MAX_WIRE_CHUNK);
+
+    while (offset < payload.byteLength) {
+        const size = Math.min(MAX_WIRE_CHUNK, payload.byteLength - offset);
+        const framed = new Uint8Array(8 + size);
+
+        const view = new DataView(framed.buffer);
+        view.setUint32(0, chunkIndex, true);  // chunkIndex (little-endian)
+        view.setUint32(4, part, true);        // part number within chunk (little-endian)
+
+        framed.set(
+            new Uint8Array(payload.slice(offset, offset + size)),
+            8
+        );
+
+        dataChannel.send(framed.buffer);
+
+        // 🔴 MANDATORY: Yield after every send to prevent Chrome batching
+        await new Promise(r => requestAnimationFrame(r));
+
+        offset += size;
+        part++;
+    }
+
+    if (totalParts > 1) {
+        console.log(`📦 Fragmented chunk #${chunkIndex} into ${totalParts} wire parts (${payload.byteLength} bytes)`);
+    }
+}
+
 // DYNAMIC SLIDING WINDOW: Send chunks with high-water mark throttling
 // Fills buffer up to 4MB, then waits for bufferedAmountLow (1MB threshold) to trigger next burst
 async function sendNextQueuedChunk(chunkData, file, isConnected = false) {
@@ -1610,15 +1674,10 @@ async function sendNextQueuedChunk(chunkData, file, isConnected = false) {
         // ✅ FIX 2: Immutable chunk index - never reuse
         const chunkIndex = senderChunkIndex++;
 
-        // ✅ BINARY PROTOCOL: prepend 4-byte little-endian chunkIndex header to raw bytes
+        // 🔴 SCTP TRANSPORT: Fragment payload into 16KB wire chunks (prevents send credit exhaustion)
         const chunkArray = new Uint8Array(chunk);
-        const framed = new Uint8Array(4 + chunkArray.byteLength);
-        const headerView = new DataView(framed.buffer);
-        headerView.setUint32(0, chunkIndex, true); // little-endian index
-        framed.set(chunkArray, 4);
+        await frameAndSend(chunkIndex, chunkArray.buffer);
 
-        // Send pure binary ArrayBuffer (no base64 / JSON per chunk)
-        dataChannel.send(framed.buffer);
         transferStats.chunksSent++;
         totalChunksSent++;
         transferStats.bytesTransferred += chunk.byteLength;
@@ -2148,7 +2207,9 @@ async function streamFileLegacy(file, startOffset = 0) {
             }
 
             try {
-                dataChannel.send(chunk);
+                // 🔴 SCTP TRANSPORT: Fragment large chunks and yield after each send
+                const chunkIndex = senderChunkIndex++;
+                await frameAndSend(chunkIndex, chunk.buffer);
                 sendSuccess = true;
             } catch (error) {
                 if (error.message && (error.message.includes('queue is full') || error.message.includes('send queue'))) {
@@ -2580,16 +2641,51 @@ function handleDataChannelMessage(event) {
     // Handle binary file data - ONLY if we're actively receiving a file
     // This prevents chunks from being processed before file metadata arrives
     if (receivingFile && receivingFileSize > 0) {
-        // Binary chunk framing: first 4 bytes = little-endian chunkIndex, rest = payload
+        // 🔴 SCTP FRAGMENTATION: Binary chunk framing: 8-byte header (chunkIndex: 4 bytes LE, part: 4 bytes LE), then payload
         const processBinary = (buffer) => {
-            if (!buffer || buffer.byteLength <= 4) {
+            if (!buffer || buffer.byteLength <= 8) {
                 console.warn('⚠️ Received binary data too small to contain header, ignoring');
                 return;
             }
             const view = new DataView(buffer);
             const chunkIndex = view.getUint32(0, true);
-            const payload = buffer.slice(4);
-            handleFileChunk(payload, chunkIndex);
+            const part = view.getUint32(4, true);
+            const payload = buffer.slice(8);
+
+            // Reassemble fragmented chunks
+            if (!chunkFragments.has(chunkIndex)) {
+                chunkFragments.set(chunkIndex, new Map());
+            }
+            const parts = chunkFragments.get(chunkIndex);
+            parts.set(part, payload);
+
+            // Check if we have all parts: look for consecutive parts starting from 0
+            // Since sender sends parts sequentially, if we have part N and not part N+1, we're complete
+            let isComplete = false;
+            let consecutiveParts = 0;
+            while (parts.has(consecutiveParts)) {
+                consecutiveParts++;
+            }
+            // If we have consecutive parts from 0 and the next part doesn't exist, we're complete
+            // (This works because sender sends parts sequentially and we receive them in order)
+            if (consecutiveParts > 0 && !parts.has(consecutiveParts)) {
+                isComplete = true;
+            }
+
+            // If complete, reassemble and process
+            if (isComplete) {
+                const sortedParts = Array.from(parts.keys()).sort((a, b) => a - b);
+                const totalSize = sortedParts.reduce((sum, p) => sum + parts.get(p).byteLength, 0);
+                const reassembled = new Uint8Array(totalSize);
+                let offset = 0;
+                for (const p of sortedParts) {
+                    const partData = new Uint8Array(parts.get(p));
+                    reassembled.set(partData, offset);
+                    offset += partData.length;
+                }
+                chunkFragments.delete(chunkIndex);
+                handleFileChunk(reassembled.buffer, chunkIndex);
+            }
         };
 
         if (data instanceof ArrayBuffer) {
@@ -3013,6 +3109,8 @@ let expectedTotalChunks = 0; // ✅ FIX 5: Expected total chunks for completion 
 let highestContiguousChunkIndex = -1; // ✅ FIX 1: Track highest contiguous chunk on receiver
 let highestReceivedChunkIndex = -1; // Highest index ever received on receiver (may have gaps)
 let isChunkFlushInProgress = false;   // Background worker flag
+// 🔴 SCTP FRAGMENTATION: Reassemble fragmented chunks (chunkIndex -> Map<part -> payload>)
+let chunkFragments = new Map(); // chunkIndex -> Map<partNumber -> ArrayBuffer>
 
 async function handleFileChunk(chunk, chunkIndex) {
     // 🔹 Idempotent handler - safe to call multiple times
