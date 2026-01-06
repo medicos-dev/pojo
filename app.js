@@ -47,11 +47,11 @@ const WS_URL = getWebSocketURL();
 console.log('WebSocket URL:', WS_URL);
 // DYNAMIC SLIDING WINDOW: Optimized for 200GB+ files
 // 🔴 PROTOCOL INVARIANT: Fixed chunk size per index (single CHUNK_SIZE for entire transfer)
-const INITIAL_CHUNK_SIZE = 128 * 1024; // 128KB fixed chunk size
-const CONNECTED_CHUNK_SIZE = 128 * 1024; // Must match INITIAL_CHUNK_SIZE for deterministic offsets
-const HIGH_WATER_MARK = 4 * 1024 * 1024; // 4MB - fill buffer up to this before waiting
-const BACKPRESSURE_THRESHOLD = 1024 * 1024; // 1MB - bufferedAmountLowThreshold (triggers next burst)
-const MAX_BUFFERED_AMOUNT = HIGH_WATER_MARK; // 4MB max - don't send if buffer exceeds this
+const INITIAL_CHUNK_SIZE = 256 * 1024; // 256KB fixed chunk size (speed-optimized)
+const CONNECTED_CHUNK_SIZE = 256 * 1024; // Must match INITIAL_CHUNK_SIZE for deterministic offsets
+const HIGH_WATER_MARK = 16 * 1024 * 1024; // 16MB - fill buffer up to this before waiting (speed-optimized)
+const BACKPRESSURE_THRESHOLD = 4 * 1024 * 1024; // 4MB - bufferedAmountLowThreshold (triggers next burst)
+const MAX_BUFFERED_AMOUNT = HIGH_WATER_MARK; // 16MB max - don't send if buffer exceeds this
 // 🔴 SCTP TRANSPORT LIMIT: Never send >16KB wire payloads (prevents send credit exhaustion)
 const MAX_WIRE_CHUNK = 16 * 1024; // 16KB hard limit for stable SCTP over mobile
 
@@ -300,7 +300,7 @@ let isProcessingQueue = false; // Flag to prevent concurrent processing
 let currentFileResolve = null; // Resolve function for current file promise
 
 // ✅ FIX 1: Windowed ACK tracking (not per-chunk)
-const ACK_EVERY_N_CHUNKS = 64; // ACK every 64 chunks
+const ACK_EVERY_N_CHUNKS = 256; // ACK every 256 chunks (speed-optimized: ACK sparsity)
 let ackedChunks = new Set(); // Track which chunks receiver has ACKed (by index)
 let highestReceivedAckedChunkIndex = -1; // Highest index ever ACKed by receiver (may have gaps)
 let highestContiguousAckedChunkIndex = -1; // Highest contiguous index where all chunks [0..N] are ACKed
@@ -332,8 +332,8 @@ let transferStats = {
     totalChunksExpected: 0
 };
 
-// Adaptive sliding-window upper bound for in-flight chunks (tuned by sender)
-let maxInFlightChunks = 128;
+// Speed-optimized sliding-window: aggressive in-flight chunks for high throughput
+let maxInFlightChunks = 1024; // allow deep pipe (speed-first)
 let lastInFlightAdjustTs = 0;
 let ackWatchdogInterval = null;
 
@@ -1116,7 +1116,7 @@ function createDataChannel() {
     });
     
     console.log('📡 DataChannel created (reliable, ordered)');
-    console.log(`📏 Using fixed chunk size: ${(CONNECTED_CHUNK_SIZE/1024).toFixed(0)}KB for entire transfer`);
+    console.log(`📏 Speed-optimized: ${(CONNECTED_CHUNK_SIZE/1024).toFixed(0)}KB chunks, ${maxInFlightChunks} max in-flight, ${(HIGH_WATER_MARK/1024/1024).toFixed(0)}MB buffer`);
     
     setupDataChannel(dataChannel);
 }
@@ -1610,8 +1610,8 @@ async function frameAndSend(chunkIndex, payload) {
     }
 }
 
-// DYNAMIC SLIDING WINDOW: Send chunks with high-water mark throttling
-// Fills buffer up to 4MB, then waits for bufferedAmountLow (1MB threshold) to trigger next burst
+// SPEED-OPTIMIZED SLIDING WINDOW: Send chunks with high-water mark throttling
+// Fills buffer up to 16MB, then waits for bufferedAmountLow (4MB threshold) to trigger next burst
 async function sendNextQueuedChunk(chunkData, file, isConnected = false) {
     // 🔴 PROTOCOL: Fixed chunk size per index (use single CHUNK_SIZE for whole transfer)
     const chunkSize = CONNECTED_CHUNK_SIZE; // INITIAL_CHUNK_SIZE === CONNECTED_CHUNK_SIZE
@@ -1629,40 +1629,31 @@ async function sendNextQueuedChunk(chunkData, file, isConnected = false) {
         chunks.push(chunkData);
     }
     
-    // Send chunks in bursts until high-water mark (4MB) or in-flight limit is reached
+    // Send chunks in bursts until high-water mark (16MB) or in-flight limit is reached
     for (const chunk of chunks) {
-        // HIGH-WATER MARK THROTTLING: Fill buffer up to 4MB before waiting
-        while (dataChannel.bufferedAmount >= HIGH_WATER_MARK) {
-            // Buffer is full - wait for bufferedAmountLow event (1MB threshold)
-            await waitForDrain();
+        // FAST-PATH: Skip throttling if buffer is very low (speed optimization)
+        const bufferLow = dataChannel.bufferedAmount < (HIGH_WATER_MARK / 4);
+        
+        if (!bufferLow) {
+            // HIGH-WATER MARK THROTTLING: Fill buffer up to 16MB before waiting
+            while (dataChannel.bufferedAmount >= HIGH_WATER_MARK) {
+                // Buffer is full - wait for bufferedAmountLow event (4MB threshold)
+                await waitForDrain();
+            }
         }
 
-        // SLIDING WINDOW: Limit max in-flight chunks (TCP-like control)
-        // Adaptive sliding window: dynamically reduce max in-flight when we see prolonged backpressure
-        const windowStart = Date.now();
-        let localWaitCount = 0;
+        // SLIDING WINDOW: Limit max in-flight chunks (speed-optimized: fixed aggressive window)
+        // Allow temporary bursts up to 2048 if buffer is low and RTT is stable
+        const effectiveMaxInFlight = (bufferLow && dataChannel.bufferedAmount < (HIGH_WATER_MARK / 2)) 
+            ? Math.min(2048, maxInFlightChunks * 2) 
+            : maxInFlightChunks;
+        
         // Window is driven by ACKs (highest index ever ACKed), not contiguous correctness
-        while ((totalChunksSent - highestReceivedAckedChunkIndex) > maxInFlightChunks) {
+        while ((totalChunksSent - highestReceivedAckedChunkIndex) > effectiveMaxInFlight) {
             if (transferAborted) {
                 throw new Error('TRANSFER_ABORTED');
             }
             await waitForDrain();
-            localWaitCount++;
-
-            const now = Date.now();
-            const waitedMs = now - windowStart;
-            // If we've been waiting >3s or looped many times and it's been a while since last adjust,
-            // shrink the window down towards a safer lower bound for mobile radios.
-            if ((waitedMs > 3000 || localWaitCount > 30) && (now - lastInFlightAdjustTs > 5000)) {
-                if (maxInFlightChunks > 32) {
-                    const old = maxInFlightChunks;
-                    maxInFlightChunks = Math.max(32, Math.floor(maxInFlightChunks / 2));
-                    lastInFlightAdjustTs = now;
-                    console.warn(`⚠️ High RTT/backpressure detected. Reducing maxInFlightChunks from ${old} to ${maxInFlightChunks}`);
-                } else {
-                    lastInFlightAdjustTs = now;
-                }
-            }
         }
         
         // Check connection state before sending
@@ -2242,8 +2233,7 @@ async function streamFileLegacy(file, startOffset = 0) {
         const progress = (transferStats.bytesTransferred / file.size) * 100;
         updateProgress(Math.min(99.9, progress));
 
-        // Yield to the event loop to avoid call stack growth on mobile
-        await sleep(0);
+        // Speed optimization: removed artificial yield - let SCTP + browser scheduler handle fairness
     }
 
     console.log('📤 File reading complete (legacy).');
