@@ -112,35 +112,31 @@ const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
 let wakeLock = null;
 
 // ============================================================================
-// GUARDED SEND - CRITICAL FIX #1 (prevents null crashes)
+// GUARDED SEND - CRITICAL FIX #5 (prevents null crashes)
 // ============================================================================
 
-function sendControl(message) {
-    if (!controlChannel || controlChannel.readyState !== 'open') {
-        console.warn('⚠️ Control channel not ready, cannot send:', message.type);
+// ABSOLUTE RULE: Use this pattern for all sends
+function safeSend(channel, data, label) {
+    if (!channel || channel.readyState !== 'open') {
+        // Log warning but don't crash app
+        console.warn(`⚠️ ${label} channel not ready, message dropped`);
         return false;
     }
     try {
-        controlChannel.send(JSON.stringify(message));
+        channel.send(data);
         return true;
     } catch (e) {
-        console.error('Control send error:', e);
+        console.error(`${label} send error:`, e);
         return false;
     }
 }
 
+function sendControl(message) {
+    return safeSend(controlChannel, JSON.stringify(message), 'Control');
+}
+
 function sendData(data) {
-    if (!dataChannel || dataChannel.readyState !== 'open') {
-        console.warn('⚠️ Data channel not ready');
-        return false;
-    }
-    try {
-        dataChannel.send(data);
-        return true;
-    } catch (e) {
-        console.error('Data send error:', e);
-        return false;
-    }
+    return safeSend(dataChannel, data, 'Data');
 }
 
 // ============================================================================
@@ -605,10 +601,17 @@ function setupControlChannel(channel) {
         console.log('✅ Control channel opened');
         controlChannelClosed = false;
         updateConnectionStatus('connected', 'Ready');
-        startHeartbeat();
+        startHeartbeat(); // FIX #3: Keep alive
+
+        // FIX #2: Start transfer ONLY inside onopen
+        if (fileQueue.length > 0 && !isProcessingQueue) {
+            console.log('🔄 Processing queued files');
+            processFileQueue();
+        }
     };
 
-    // CRITICAL FIX #4: Don't nullify on close
+    // FIX #4: Do NOT close DataChannel on temporary state changes
+    // Only mark closed, let heartbeat/reconnect handle it
     channel.onclose = () => {
         console.warn('⚠️ Control channel closed - waiting for resume');
         controlChannelClosed = true;
@@ -860,6 +863,7 @@ function resetReceiverState() {
 // FILE SENDING
 // ============================================================================
 
+// FIX #1: Queue files instead of immediate send
 async function addFilesToQueue(files) {
     const socket = getSocket();
     if (socket.readyState !== WebSocket.OPEN) {
@@ -867,24 +871,38 @@ async function addFilesToQueue(files) {
         catch (e) { showUserMessage('Connection lost. Please wait.'); return; }
     }
 
-    // CRITICAL FIX #1: Guard before proceeding
-    if (!controlChannel || controlChannel.readyState !== 'open') {
-        showUserMessage('Waiting for peer connection...');
-        return;
-    }
-
+    // Add to queue regardless of channel state
     for (const file of files) fileQueue.push(file);
-    if (!isProcessingQueue) processFileQueue();
+
+    // If channel ready, start processing
+    if (controlChannel && controlChannel.readyState === 'open') {
+        if (!isProcessingQueue) processFileQueue();
+    } else {
+        console.warn("⏳ Channel not ready, queueing files");
+        showUserMessage('Waiting for peer connection to start transfer...');
+        // ensure connection creation
+        if (currentRoom && !peerConnection && isInitiator) {
+            createPeerConnection();
+            createChannels();
+            createOffer();
+        }
+    }
 }
 
 function processFileQueue() {
     if (fileQueue.length === 0) { isProcessingQueue = false; return; }
 
+    // CRITICAL FIX #5: Guard before processing
+    if (!controlChannel || controlChannel.readyState !== 'open') {
+        console.warn('⚠️ Control channel not ready in processQueue');
+        return;
+    }
+
     isProcessingQueue = true;
     currentFile = fileQueue.shift();
     console.log(`📤 Sending request: ${currentFile.name}`);
 
-    // Send via CONTROL channel
+    // Send via CONTROL channel using safeSend
     sendControl({
         type: 'file-request',
         name: currentFile.name,
