@@ -1,9 +1,13 @@
 // WebRTC Configuration
 const ICE_SERVERS = [
-    // { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
-    // { urls: "stun:stun.cloudflare.com:3478" },
-
+    {
+        urls: "stun:free.expressturn.com:3478"
+    },
+    {
+        urls: "turn:free.expressturn.com:3478?transport=tcp",
+        username: "000000002083986270",
+        credential: "yaZXTjsDpaLSnBGYVnDxMZ+acj8="
+    }
 ];
 
 // Constants
