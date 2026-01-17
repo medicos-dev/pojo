@@ -38,7 +38,39 @@ body::before {
     }
 }
 
-/* Typography Helpers */
+/* Custom Scrollbar - Global & Specific */
+html {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-strong) var(--bg-main);
+}
+
+body::-webkit-scrollbar,
+html::-webkit-scrollbar,
+::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+}
+
+body::-webkit-scrollbar-track,
+html::-webkit-scrollbar-track,
+::-webkit-scrollbar-track {
+    background: var(--bg-main);
+}
+
+body::-webkit-scrollbar-thumb,
+html::-webkit-scrollbar-thumb,
+::-webkit-scrollbar-thumb {
+    background: var(--border-strong);
+    border-radius: 5px;
+    border: 2px solid var(--bg-main);
+}
+
+body::-webkit-scrollbar-thumb:hover,
+html::-webkit-scrollbar-thumb:hover,
+::-webkit-scrollbar-thumb:hover {
+    background: var(--text-secondary);
+}
+
 .font-mono {
     font-family: 'IBM Plex Mono', monospace;
     letter-spacing: 0.02em;
