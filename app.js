@@ -23,8 +23,8 @@ const ICE_SERVERS = [
 // ============================================================================
 // TRANSFER CONFIGURATION
 // ============================================================================
-const CHUNK_SIZE = 64 * 1024;              // 64KB chunks (Reverted for stability)
-const HIGH_WATER_MARK = 16 * 1024 * 1024;  // 16MB backpressure threshold
+let CHUNK_SIZE = 64 * 1024;                // Initial safe size (Dynamic)
+const HIGH_WATER_MARK = 64 * 1024 * 1024;  // 64MB backpressure (Optimized)
 const MAX_RAM_MB = 256;
 const MAX_RAM_BYTES = MAX_RAM_MB * 1024 * 1024;
 const HEARTBEAT_INTERVAL_MS = 5000;        // 5 second heartbeat
@@ -629,7 +629,16 @@ function setupDataChannel(channel) {
     dataChannel = channel;
     dataChannelClosed = false;
     channel.binaryType = 'arraybuffer';
-    channel.bufferedAmountLowThreshold = HIGH_WATER_MARK / 2;
+
+    // SAFE DYNAMIC CHUNK SIZE (CRITICAL)
+    if (peerConnection?.sctp) {
+        const maxMsg = peerConnection.sctp.maxMessageSize || 65536;
+        CHUNK_SIZE = Math.min(128 * 1024, maxMsg - 1024);
+        console.log(`⚡ Dynamic Chunk Size: ${CHUNK_SIZE} bytes (SCTP Max: ${maxMsg})`);
+    }
+
+    // BUFFERED AMOUNT TUNING
+    channel.bufferedAmountLowThreshold = 32 * 1024 * 1024; // 32MB
 
     channel.onopen = () => {
         console.log('✅ Data channel opened');
@@ -800,8 +809,8 @@ function handleBinaryChunk(buffer) {
     // Start disk writer
     if (!diskWriterRunning) diskWriterLoop();
 
-    // ACK every 100 chunks
-    if (receivedChunkCount % 100 === 0) {
+    // REDUCE ACK FREQUENCY (Step 5)
+    if (receivedChunkCount % 400 === 0) {
         sendControl({ type: 'ack', chunkIndex, bytesReceived: totalBytesReceived });
     }
 
@@ -943,8 +952,8 @@ async function startSendingFile() {
             new DataView(framed).setUint32(0, i, true);
             new Uint8Array(framed, 4).set(new Uint8Array(buffer));
 
-            // Backpressure
-            while (dataChannel.bufferedAmount > HIGH_WATER_MARK) {
+            // Backpressure (RELAXED - Step 4)
+            while (dataChannel.bufferedAmount > HIGH_WATER_MARK * 1.2) {
                 await waitForDrain();
             }
 
