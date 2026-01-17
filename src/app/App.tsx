@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import Lenis from 'lenis';
 import { TransferPanel } from '../components/TransferPanel';
 import { WelcomeScreen } from '../components/WelcomeScreen';
 import { connectWebSocket, joinRoom, onSignal, sendSignal } from '../webrtc/signaling';
@@ -6,6 +7,25 @@ import { createPeerConnection, handleOffer, handleAnswer, handleIceCandidate } f
 
 function App() {
     const [roomId, setRoomId] = useState<string | null>(null);
+
+    useEffect(() => {
+        const lenis = new Lenis({
+            duration: 1.2,
+            easing: (t) => Math.min(1, 1.001 - Math.pow(2, -10 * t))
+        });
+
+        function raf(time: number) {
+            lenis.raf(time);
+            requestAnimationFrame(raf);
+        }
+
+        requestAnimationFrame(raf);
+        window.scrollTo(0, 0); // Fix scrolled-up issue
+
+        return () => {
+            lenis.destroy();
+        };
+    }, []);
 
     // 6-digit alphanumeric code generator
     const generateRoomCode = () => {
