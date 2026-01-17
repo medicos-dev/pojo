@@ -628,6 +628,7 @@ function setupDataChannel(channel) {
     dataChannel = channel;
     dataChannelClosed = false;
     channel.binaryType = 'arraybuffer';
+    channel.bufferedAmountLowThreshold = HIGH_WATER_MARK / 2;
 
     channel.onopen = () => {
         console.log('✅ Data channel opened');
@@ -965,12 +966,12 @@ async function startSendingFile() {
 }
 
 function waitForDrain() {
-    return new Promise(r => {
-        const check = () => {
-            if (!dataChannel || dataChannel.bufferedAmount <= HIGH_WATER_MARK / 2) r();
-            else setTimeout(check, 10);
+    if (dataChannel.bufferedAmount <= HIGH_WATER_MARK / 2) return Promise.resolve();
+    return new Promise(resolve => {
+        dataChannel.onbufferedamountlow = () => {
+            dataChannel.onbufferedamountlow = null;
+            resolve();
         };
-        check();
     });
 }
 
