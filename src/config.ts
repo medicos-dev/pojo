@@ -34,9 +34,4 @@ export const getWebSocketURL = (): string => {
 
 export const ICE_SERVERS = [
     { urls: "stun:free.expressturn.com:3478" },
-    {
-        urls: "turn:free.expressturn.com:3478?transport=tcp",
-        username: "000000002083986270",
-        credential: "yaZXTjsDpaLSnBGYVnDxMZ+acj8="
-    }
 ];
