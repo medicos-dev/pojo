@@ -15,6 +15,10 @@ export const registerPCStateCallback = (cb: PCStateCallback) => {
 
 export const createPeerConnection = (room: string, isInitiator: boolean) => {
 
+    if (peerConnection) {
+        peerConnection.close();
+    }
+
     currentRoom = room;
 
     peerConnection = new RTCPeerConnection({ iceServers: ICE_SERVERS });

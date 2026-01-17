@@ -117,12 +117,13 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
         setSenderProgress(null);
     };
 
-    const handleSenderStart = () => {
-        if (!senderFile) return;
+    const handleSenderStart = (fileOverride?: File) => {
+        const fileToSend = fileOverride || senderFile;
+        if (!fileToSend) return;
 
         // Setup Sender
         senderRef.current = new FileSender(
-            senderFile,
+            fileToSend,
             (progress) => setSenderProgress(progress),
             (status, err) => {
                 if (status === 'uploading') setSenderStatus('uploading');
@@ -138,9 +139,9 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
         setSenderStatus('waiting');
         sendControl({
             type: 'file-request',
-            name: senderFile.name,
-            size: senderFile.size,
-            mimeType: senderFile.type
+            name: fileToSend.name,
+            size: fileToSend.size,
+            mimeType: fileToSend.type
         });
     };
 
@@ -155,7 +156,7 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
             setSenderProgress(null);
             // Auto-start after brief delay to let UI update
             setTimeout(() => {
-                handleSenderStart();
+                handleSenderStart(fileQueue[nextIndex]);
             }, 500);
         }
     }, [senderStatus, currentFileIndex, fileQueue]);
@@ -214,7 +215,7 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
             }
         );
 
-        const sent = sendControl({ type: 'file-accept' });
+        sendControl({ type: 'file-accept' });
 
     };
 
@@ -304,7 +305,7 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
                             status={senderStatus}
                             error={senderError}
                             onFilesSelect={handleFilesSelect}
-                            onStart={handleSenderStart}
+                            onStart={() => handleSenderStart()}
                             onPause={() => {
                                 if (senderRef.current) senderRef.current.pause();
                                 setSenderStatus('paused' as any); // Force state update
