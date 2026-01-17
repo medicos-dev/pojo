@@ -23,7 +23,7 @@ const ICE_SERVERS = [
 // ============================================================================
 // TRANSFER CONFIGURATION
 // ============================================================================
-const CHUNK_SIZE = 256 * 1024;             // 256KB chunks (Optimized)
+const CHUNK_SIZE = 64 * 1024;              // 64KB chunks (Reverted for stability)
 const HIGH_WATER_MARK = 16 * 1024 * 1024;  // 16MB backpressure threshold
 const MAX_RAM_MB = 256;
 const MAX_RAM_BYTES = MAX_RAM_MB * 1024 * 1024;
