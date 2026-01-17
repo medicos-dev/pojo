@@ -60,6 +60,7 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
                     mimeType: msg.mimeType || 'application/octet-stream'
                 });
                 setReceiverStatus('offering');
+                setReceiverError(null);
                 break;
 
             case 'file-accept':
@@ -238,6 +239,7 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
         setMode('idle');
         setReceiverMeta(null);
         setReceiverStatus('idle');
+        setReceiverError(null);
         setReceiverRef(null);
     };
 

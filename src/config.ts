@@ -33,5 +33,5 @@ export const getWebSocketURL = (): string => {
 };
 
 export const ICE_SERVERS = [
-    { urls: "stun:free.expressturn.com:3478" },
+    { urls: "stun:stun.l.google.com:19302" },
 ];
