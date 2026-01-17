@@ -449,36 +449,33 @@ const server = http.createServer(async (req, res) => {
 
     // ========== STATIC FILES ==========
 
-    // Serve static files
-    let filePath = '.' + pathname;
-    if (filePath === './') {
-        filePath = './index.html';
-    }
+    // ========== STATIC FILES ==========
 
-    const extname = String(path.extname(filePath)).toLowerCase();
-    const contentType = mimeTypes[extname] || 'application/octet-stream';
+    // Serve from 'dist' (Production Build)
+    let filePath = path.join(__dirname, 'dist', pathname === '/' ? 'index.html' : pathname);
 
-    fs.readFile(filePath, (error, content) => {
-        if (error) {
-            if (error.code === 'ENOENT') {
-                fs.readFile('./index.html', (err, content) => {
-                    if (err) {
-                        res.writeHead(500);
-                        res.end('Server Error: ' + err.code);
-                    } else {
-                        res.writeHead(200, { 'Content-Type': 'text/html' });
-                        res.end(content, 'utf-8');
-                    }
-                });
+    const serveFile = (targetPath, isFallback = false) => {
+        const extname = String(path.extname(targetPath)).toLowerCase();
+        const contentType = mimeTypes[extname] || 'application/octet-stream';
+
+        fs.readFile(targetPath, (error, content) => {
+            if (error) {
+                if (error.code === 'ENOENT' && !isFallback) {
+                    // SPA Fallback: Serve index.html for unknown routes (e.g., refresh on deep link)
+                    const fallbackPath = path.join(__dirname, 'dist', 'index.html');
+                    serveFile(fallbackPath, true);
+                } else {
+                    res.writeHead(error.code === 'ENOENT' ? 404 : 500);
+                    res.end(error.code === 'ENOENT' ? 'Not Found' : 'Server Error: ' + error.code);
+                }
             } else {
-                res.writeHead(500);
-                res.end('Server Error: ' + error.code);
+                res.writeHead(200, { 'Content-Type': isFallback ? 'text/html' : contentType });
+                res.end(content, 'utf-8');
             }
-        } else {
-            res.writeHead(200, { 'Content-Type': contentType });
-            res.end(content, 'utf-8');
-        }
-    });
+        });
+    };
+
+    serveFile(filePath);
 });
 
 // ============================================================================

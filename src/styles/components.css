@@ -1,0 +1,91 @@
+/* Progress Bar */
+.progress-container {
+    background: var(--progress-track);
+    height: 24px;
+    border: 1px solid var(--border-soft);
+    margin: 1rem 0;
+    position: relative;
+    overflow: hidden;
+}
+
+.progress-fill {
+    background: var(--progress-fill);
+    height: 100%;
+    width: 0%;
+    transition: width 0.1s linear;
+    /* Smooth but fast */
+}
+
+/* Status Bar */
+.status-bar {
+    background: var(--terminal-bg);
+    border-top: 1px solid var(--border-strong);
+    color: var(--terminal-text);
+    padding: 0.5rem 1rem;
+    font-size: 0.85rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    display: inline-block;
+    margin-right: 8px;
+}
+
+.status-dot.connected {
+    background: var(--accent-green);
+    box-shadow: 0 0 8px var(--accent-green);
+}
+
+.status-dot.connecting {
+    background: var(--accent-amber);
+    animation: pulse 1s infinite;
+}
+
+.status-dot.error {
+    background: var(--accent-red);
+}
+
+@keyframes pulse {
+    0% {
+        opacity: 1;
+    }
+
+    50% {
+        opacity: 0.5;
+    }
+
+    100% {
+        opacity: 1;
+    }
+}
+
+/* Drop Zone */
+.drop-zone {
+    border: 2px dashed var(--border-strong);
+    background: var(--bg-inset);
+    padding: 3rem;
+    text-align: center;
+    color: var(--text-secondary);
+    transition: border-color 0.2s;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+}
+
+.drop-zone.active {
+    border-color: var(--accent-green);
+    background: rgba(127, 163, 124, 0.05);
+    /* Very subtle tint */
+}
+
+.drop-zone p {
+    margin: 0;
+}

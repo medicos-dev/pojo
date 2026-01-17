@@ -1,0 +1,88 @@
+🧱 Backgrounds
+--bg-main:        #1b1b1b;   /* deep charcoal (not pure black) */
+--bg-panel:       #242424;   /* panels / cards */
+--bg-inset:       #2d2a26;   /* subtle inner surfaces */
+
+
+Easier on eyes than pure black, prevents banding.
+
+📜 Primary Text
+--text-primary:   #e6dcc7;   /* warm parchment */
+--text-secondary: #b9b09c;   /* muted sand */
+--text-muted:     #8e8777;   /* faded ink */
+
+
+Looks printed, not digital. Perfect for long sessions.
+
+🟢 Accents (Status & Progress)
+--accent-green:   #7fa37c;   /* vintage green */
+--accent-amber:   #c9a24d;   /* warning / pending */
+--accent-red:     #b5655b;   /* errors (soft, not aggressive) */
+
+
+Avoids neon colors → looks mature & professional.
+
+🔵 Secondary Accent (Links / Highlights)
+--accent-blue:    #6c8aa6;   /* desaturated steel blue */
+
+📦 Borders & Lines
+--border-soft:    #3a3732;
+--border-strong:  #4a463f;
+
+🖥️ Progress Bar (IMPORTANT)
+--progress-track: #2a2926;
+--progress-fill:  #7fa37c;
+
+
+✔ No gradients
+✔ No glow
+✔ Just solid, honest progress
+
+🧾 Status Text / Terminal Look
+--terminal-bg:    #171717;
+--terminal-text:  #cfd2c7;
+
+
+Optional:
+
+letter-spacing: 0.02em;
+
+🧠 Recommended Fonts (FREE)
+Best combo:
+font-family: 'IBM Plex Mono', 'Courier New', monospace;
+
+
+Alternatives:
+
+JetBrains Mono
+
+Source Code Pro
+
+Inconsolata
+
+Monospace = retro + alignment + trust.
+
+🧩 Drop-in CSS Variables File
+:root {
+  --bg-main: #1b1b1b;
+  --bg-panel: #242424;
+  --bg-inset: #2d2a26;
+
+  --text-primary: #e6dcc7;
+  --text-secondary: #b9b09c;
+  --text-muted: #8e8777;
+
+  --accent-green: #7fa37c;
+  --accent-amber: #c9a24d;
+  --accent-red: #b5655b;
+  --accent-blue: #6c8aa6;
+
+  --border-soft: #3a3732;
+  --border-strong: #4a463f;
+
+  --progress-track: #2a2926;
+  --progress-fill: #7fa37c;
+
+  --terminal-bg: #171717;
+  --terminal-text: #cfd2c7;
+}
