@@ -12,7 +12,7 @@
 
 // WebRTC Configuration - TURN required for production reliability
 const ICE_SERVERS = [
-    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:free.expressturn.com:3478" },
     {
         urls: "turn:free.expressturn.com:3478?transport=tcp",
         username: "000000002083986270",
