@@ -21,15 +21,13 @@ const ICE_SERVERS = [
 ];
 
 // ============================================================================
-// TRANSFER CONFIGURATION - SPEED OPTIMIZED
+// TRANSFER CONFIGURATION
 // ============================================================================
-const CHUNK_SIZE = 512 * 1024;             // 512KB chunks (FIX #1 - bigger = faster)
-const HIGH_WATER_MARK = 16 * 1024 * 1024;  // 16MB buffer before backpressure
-const LOW_WATER_MARK = 8 * 1024 * 1024;    // 8MB - resume pumping
-const ACK_EVERY = 64;                       // ACK every 64 chunks (FIX #3)
-const MAX_RAM_MB = 512;                     // 512MB RAM buffer for speed
+const CHUNK_SIZE = 64 * 1024;              // 64KB chunks
+const HIGH_WATER_MARK = 16 * 1024 * 1024;  // 16MB backpressure threshold
+const MAX_RAM_MB = 256;
 const MAX_RAM_BYTES = MAX_RAM_MB * 1024 * 1024;
-const HEARTBEAT_INTERVAL_MS = 5000;
+const HEARTBEAT_INTERVAL_MS = 5000;        // 5 second heartbeat
 
 // ============================================================================
 // WEBSOCKET URL CONFIGURATION
@@ -112,31 +110,35 @@ const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
 let wakeLock = null;
 
 // ============================================================================
-// GUARDED SEND - CRITICAL FIX #5 (prevents null crashes)
+// GUARDED SEND - CRITICAL FIX #1 (prevents null crashes)
 // ============================================================================
 
-// ABSOLUTE RULE: Use this pattern for all sends
-function safeSend(channel, data, label) {
-    if (!channel || channel.readyState !== 'open') {
-        // Log warning but don't crash app
-        console.warn(`⚠️ ${label} channel not ready, message dropped`);
+function sendControl(message) {
+    if (!controlChannel || controlChannel.readyState !== 'open') {
+        console.warn('⚠️ Control channel not ready, cannot send:', message.type);
         return false;
     }
     try {
-        channel.send(data);
+        controlChannel.send(JSON.stringify(message));
         return true;
     } catch (e) {
-        console.error(`${label} send error:`, e);
+        console.error('Control send error:', e);
         return false;
     }
 }
 
-function sendControl(message) {
-    return safeSend(controlChannel, JSON.stringify(message), 'Control');
-}
-
 function sendData(data) {
-    return safeSend(dataChannel, data, 'Data');
+    if (!dataChannel || dataChannel.readyState !== 'open') {
+        console.warn('⚠️ Data channel not ready');
+        return false;
+    }
+    try {
+        dataChannel.send(data);
+        return true;
+    } catch (e) {
+        console.error('Data send error:', e);
+        return false;
+    }
 }
 
 // ============================================================================
@@ -531,9 +533,9 @@ function handleSignalingMessage(msg) {
             dataChannelClosed = true;
             break;
 
-        case 'offer': handleOffer(msg.offer).catch(e => console.error('Offer error:', e)); break;
-        case 'answer': handleAnswer(msg.answer).catch(e => console.error('Answer error:', e)); break;
-        case 'ice-candidate': handleIceCandidate(msg.candidate).catch(e => console.error('ICE error:', e)); break;
+        case 'offer': handleOffer(msg.offer); break;
+        case 'answer': handleAnswer(msg.answer); break;
+        case 'ice-candidate': handleIceCandidate(msg.candidate); break;
         case 'pong': break;
         case 'error': console.error('Server error:', msg.message); showUserMessage(msg.message); break;
     }
@@ -555,8 +557,9 @@ function createPeerConnection() {
 
     peerConnection.onconnectionstatechange = () => {
         console.log(`🔗 State: ${peerConnection.connectionState}`);
-        // RULE 5: UI state must NOT depend on ICE state (DataChannel is truth)
-        if (peerConnection.connectionState === 'failed') {
+        if (peerConnection.connectionState === 'connected') {
+            updateConnectionStatus('connected', 'P2P Connected');
+        } else if (peerConnection.connectionState === 'failed') {
             updateConnectionStatus('disconnected', 'Connection failed');
         }
     };
@@ -572,15 +575,11 @@ function createPeerConnection() {
 }
 
 // ============================================================================
-// DUAL CHANNEL CREATION - RULE 1: Only creator creates DataChannel
+// DUAL CHANNEL CREATION - CRITICAL FIX #2
 // ============================================================================
 
 function createChannels() {
-    if (!isInitiator) {
-        console.warn('⚠️ Non-initiator tried to create channels - ignored');
-        return;
-    }
-    console.log('📡 Creating dual channels (Initiator only)');
+    console.log('📡 Creating dual channels');
 
     // CONTROL channel: ordered, reliable - ALWAYS ALIVE
     controlChannel = peerConnection.createDataChannel('control', {
@@ -588,10 +587,10 @@ function createChannels() {
     });
     setupControlChannel(controlChannel);
 
-    // DATA channel: unordered for speed - DISPOSABLE (FIX #2)
+    // DATA channel: unordered for speed - DISPOSABLE
     dataChannel = peerConnection.createDataChannel('data', {
-        ordered: false,    // Fix #2: Unordered for max speed
-        maxRetransmits: 0  // Fix #2: No retransmits (SCTP congestion control only)
+        ordered: false,
+        maxPacketLifeTime: 300
     });
     setupDataChannel(dataChannel);
 }
@@ -603,18 +602,11 @@ function setupControlChannel(channel) {
     channel.onopen = () => {
         console.log('✅ Control channel opened');
         controlChannelClosed = false;
-        // RULE 5: UI state depends on DataChannel
         updateConnectionStatus('connected', 'Ready');
-        startHeartbeat(); // FIX #3: Keep alive
-
-        // FIX #2: Start transfer ONLY inside onopen
-        if (fileQueue.length > 0 && !isProcessingQueue) {
-            console.log('🔄 Processing queued files');
-            processFileQueue();
-        }
+        startHeartbeat();
     };
 
-    // FIX #4: Do NOT close DataChannel on temporary state changes
+    // CRITICAL FIX #4: Don't nullify on close
     channel.onclose = () => {
         console.warn('⚠️ Control channel closed - waiting for resume');
         controlChannelClosed = true;
@@ -629,7 +621,6 @@ function setupControlChannel(channel) {
     };
 }
 
-// RULE 2: setupDataChannel must be IDENTICAL on both sides
 function setupDataChannel(channel) {
     dataChannel = channel;
     dataChannelClosed = false;
@@ -640,6 +631,7 @@ function setupDataChannel(channel) {
         dataChannelClosed = false;
     };
 
+    // CRITICAL FIX #4: Don't nullify on close
     channel.onclose = () => {
         console.warn('⚠️ Data channel closed - waiting for resume');
         dataChannelClosed = true;
@@ -652,20 +644,6 @@ function setupDataChannel(channel) {
             handleBinaryChunk(e.data);
         }
     };
-}
-
-// ============================================================================
-// DIAGNOSTIC LOGGING
-// ============================================================================
-if (isInitiator) {
-    setTimeout(() => {
-        console.log("Creator state:", {
-            signaling: peerConnection?.signalingState,
-            ice: peerConnection?.iceConnectionState,
-            connection: peerConnection?.connectionState,
-            dc: dataChannel?.readyState
-        });
-    }, 5000);
 }
 
 // ============================================================================
@@ -813,8 +791,8 @@ function handleBinaryChunk(buffer) {
     // Start disk writer
     if (!diskWriterRunning) diskWriterLoop();
 
-    // ACK every N chunks (FIX #3: Reduced traffic)
-    if (receivedChunkCount % ACK_EVERY === 0) {
+    // ACK every 100 chunks
+    if (receivedChunkCount % 100 === 0) {
         sendControl({ type: 'ack', chunkIndex, bytesReceived: totalBytesReceived });
     }
 
@@ -880,7 +858,6 @@ function resetReceiverState() {
 // FILE SENDING
 // ============================================================================
 
-// FIX #1: Queue files instead of immediate send
 async function addFilesToQueue(files) {
     const socket = getSocket();
     if (socket.readyState !== WebSocket.OPEN) {
@@ -888,38 +865,24 @@ async function addFilesToQueue(files) {
         catch (e) { showUserMessage('Connection lost. Please wait.'); return; }
     }
 
-    // Add to queue regardless of channel state
-    for (const file of files) fileQueue.push(file);
-
-    // If channel ready, start processing
-    if (controlChannel && controlChannel.readyState === 'open') {
-        if (!isProcessingQueue) processFileQueue();
-    } else {
-        console.warn("⏳ Channel not ready, queueing files");
-        showUserMessage('Waiting for peer connection to start transfer...');
-        // ensure connection creation
-        if (currentRoom && !peerConnection && isInitiator) {
-            createPeerConnection();
-            createChannels();
-            createOffer();
-        }
+    // CRITICAL FIX #1: Guard before proceeding
+    if (!controlChannel || controlChannel.readyState !== 'open') {
+        showUserMessage('Waiting for peer connection...');
+        return;
     }
+
+    for (const file of files) fileQueue.push(file);
+    if (!isProcessingQueue) processFileQueue();
 }
 
 function processFileQueue() {
     if (fileQueue.length === 0) { isProcessingQueue = false; return; }
 
-    // CRITICAL FIX #5: Guard before processing
-    if (!controlChannel || controlChannel.readyState !== 'open') {
-        console.warn('⚠️ Control channel not ready in processQueue');
-        return;
-    }
-
     isProcessingQueue = true;
     currentFile = fileQueue.shift();
     console.log(`📤 Sending request: ${currentFile.name}`);
 
-    // Send via CONTROL channel using safeSend
+    // Send via CONTROL channel
     sendControl({
         type: 'file-request',
         name: currentFile.name,
@@ -940,7 +903,7 @@ async function startSendingFile() {
         return;
     }
 
-    console.log(`📤 Starting: ${currentFile.name} (Speed Optimized)`);
+    console.log(`📤 Starting: ${currentFile.name}`);
     transferActive = true;
     senderChunkIndex = 0;
     totalBytesSent = 0;
@@ -956,35 +919,9 @@ async function startSendingFile() {
     const file = currentFile;
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
 
-    // FIX #4: bufferedAmount pumping loop
-    // We want to keep filling the buffer until HIGH_WATER_MARK
-    // Then wait for LOW_WATER_MARK to resume
-
-    // Set low threshold callback
-    dataChannel.bufferedAmountLowThreshold = LOW_WATER_MARK;
-
     try {
-        let isDraining = false;
-
-        // Helper to wait for buffer drain
-        const waitForDrain = () => {
-            return new Promise(resolve => {
-                isDraining = true;
-                dataChannel.onbufferedamountlow = () => {
-                    isDraining = false;
-                    dataChannel.onbufferedamountlow = null; // Clear listener
-                    resolve();
-                };
-            });
-        };
-
         for (let i = 0; i < totalChunks; i++) {
             if (transferAborted) throw new Error('Aborted');
-
-            // FIX #4: Backpressure - wait if buffer is full
-            if (dataChannel.bufferedAmount > HIGH_WATER_MARK) {
-                await waitForDrain();
-            }
 
             const start = i * CHUNK_SIZE;
             const end = Math.min(start + CHUNK_SIZE, file.size);
@@ -996,8 +933,12 @@ async function startSendingFile() {
             new DataView(framed).setUint32(0, i, true);
             new Uint8Array(framed, 4).set(new Uint8Array(buffer));
 
+            // Backpressure
+            while (dataChannel.bufferedAmount > HIGH_WATER_MARK) {
+                await waitForDrain();
+            }
+
             // CRITICAL FIX #1: Guard before send
-            // FIX #5: Zero delays, push fast
             if (!sendData(framed)) {
                 throw new Error('Data channel closed during transfer');
             }
@@ -1005,11 +946,8 @@ async function startSendingFile() {
             totalBytesSent += buffer.byteLength;
             senderChunkIndex++;
 
-            // Only update UI occasionally to prevent thread blocking
-            if (i % 5 === 0) {
-                updateProgress((totalBytesSent / file.size) * 100);
-                updateSenderSpeed();
-            }
+            updateProgress((totalBytesSent / file.size) * 100);
+            updateSenderSpeed();
         }
 
         console.log('✅ All chunks sent');
@@ -1023,7 +961,15 @@ async function startSendingFile() {
     transferActive = false;
 }
 
-
+function waitForDrain() {
+    return new Promise(r => {
+        const check = () => {
+            if (!dataChannel || dataChannel.bufferedAmount <= HIGH_WATER_MARK / 2) r();
+            else setTimeout(check, 10);
+        };
+        check();
+    });
+}
 
 function updateSenderSpeed() {
     const now = Date.now();
