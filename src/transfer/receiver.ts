@@ -101,7 +101,7 @@ export class FileReceiver {
     }
 
     private async finalize() {
-        console.log('✅ Finalizing download...');
+
         this.onStatus('receiving', 'finalizing'); // Update UI status
 
         // Wait for buffer drain
@@ -109,7 +109,7 @@ export class FileReceiver {
             await new Promise(r => setTimeout(r, 50));
         }
 
-        console.log('💾 Assembling...');
+
         try {
             const chunks = await getAllChunks(this.metadata.name);
             const blob = new Blob(chunks, { type: this.metadata.mimeType });
@@ -126,7 +126,7 @@ export class FileReceiver {
             });
 
         } catch (e: any) {
-            console.error('Finalize error:', e);
+
             this.onStatus('error', e.message);
         }
     }

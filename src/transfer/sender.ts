@@ -44,7 +44,7 @@ export class FileSender {
     }
 
     async start() {
-        console.log(`📤 Starting sender: ${this.file.name}`);
+
         this.onStatus('uploading');
 
         this.totalBytesSent = 0;
@@ -114,11 +114,11 @@ export class FileSender {
                 this.updateStats();
             }
 
-            console.log('✅ All chunks sent');
+
             this.updateStats(true); // Force 100%
             this.onStatus('complete');
         } catch (err: any) {
-            console.error('Sender error:', err);
+
             this.onStatus('error', err.message);
         }
     }

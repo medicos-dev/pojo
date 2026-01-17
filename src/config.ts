@@ -6,7 +6,7 @@ export const MAX_RAM_BYTES = MAX_RAM_MB * 1024 * 1024;
 
 export const updateChunkSize = (size: number) => {
     CHUNK_SIZE = size;
-    console.log(`⚡ Chunk size updated to ${CHUNK_SIZE} bytes`);
+
 };
 
 export const getWebSocketURL = (): string => {

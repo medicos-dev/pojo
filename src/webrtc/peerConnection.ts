@@ -83,7 +83,7 @@ async function flushCandidateQueue() {
                 await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
 
             } catch (e) {
-                console.error('Error flushing buffered candidate', e);
+
             }
         }
     }
@@ -93,7 +93,7 @@ export const handleOffer = async (offer: RTCSessionDescriptionInit) => {
 
     if (!peerConnection) createPeerConnection(currentRoom!, false);
     if (!peerConnection) {
-        console.error('❌ Failed to create PC for offer');
+
         return;
     }
 
@@ -101,7 +101,7 @@ export const handleOffer = async (offer: RTCSessionDescriptionInit) => {
     // 'stable' is actually the CORRECT state to accept a new offer.
     // unexpected states might be 'have-local-offer' (glare).
     if (peerConnection.signalingState !== 'stable' && peerConnection.signalingState !== 'have-remote-offer') {
-        console.warn(`⚠️ Unexpected PC state for offer: ${peerConnection.signalingState}. Proceeding anyway to recover.`);
+
         // We usually proceed, or we might rollout 'rollback'.
         // For simplicity, let's just proceed. The previous check prohibited 'stable', which broke the flow.
     }
@@ -109,37 +109,37 @@ export const handleOffer = async (offer: RTCSessionDescriptionInit) => {
     try {
 
         await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
-        console.log('✅ Remote Description Set');
+
 
         await flushCandidateQueue();
 
-        console.log('🛠️ Creating Answer...');
+
         const answer = await peerConnection.createAnswer();
         await peerConnection.setLocalDescription(answer);
-        console.log('✅ Local Description Set (Answer)');
+
 
         sendSignal({ type: 'answer', answer, room: currentRoom! });
-        console.log('📤 Answer Sent');
+
     } catch (e) {
-        console.error('❌ Error handling offer:', e);
+
     }
 };
 
 export const handleAnswer = async (answer: RTCSessionDescriptionInit) => {
-    console.log('📩 Handling Answer...');
+
     if (!peerConnection) return;
     if (peerConnection.signalingState === 'stable') {
-        console.log('⚠️ PC stable, ignoring answer');
+
         return;
     }
 
     try {
-        console.log('🛠️ Setting Remote Description (Answer)...');
+
         await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
-        console.log('✅ Remote Description Set (Answer)');
+
         await flushCandidateQueue();
     } catch (e) {
-        console.error('❌ Error handling answer:', e);
+
     }
 };
 
@@ -148,25 +148,25 @@ export const handleIceCandidate = async (candidate: RTCIceCandidateInit) => {
 
     // Buffer if remote description is not ready
     if (!peerConnection.remoteDescription) {
-        console.log('🧊 Buffering ICE candidate (remote description not set)');
+
         candidateQueue.push(candidate);
         return;
     }
 
     try {
         await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
-        console.log('✅ ICE Candidate Added Direct');
+
     } catch (e) {
-        console.error('Error adding received ice candidate', e);
+
     }
 };
 
 export const createOffer = async () => {
     if (!peerConnection) return;
-    console.log('🛠️ Creating Offer...');
+
     const offer = await peerConnection.createOffer();
     await peerConnection.setLocalDescription(offer);
-    console.log('✅ Local Description Set (Offer)');
+
     sendSignal({ type: 'offer', offer, room: currentRoom! });
-    console.log('📤 Offer Sent');
+
 };

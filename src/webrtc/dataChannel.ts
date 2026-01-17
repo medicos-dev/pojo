@@ -32,11 +32,11 @@ export const getDataChannel = () => dataChannel;
 
 export const sendControl = (msg: ControlMessage): boolean => {
     if (controlChannel && controlChannel.readyState === 'open') {
-        console.log('📤 Sending Control:', msg.type);
+
         controlChannel.send(JSON.stringify(msg));
         return true;
     } else {
-        console.warn('❌ Control channel not open, cannot send:', msg.type);
+
         return false;
     }
 };
@@ -47,7 +47,7 @@ export const sendData = (data: ArrayBuffer): boolean => {
             dataChannel.send(data);
             return true;
         } catch (e) {
-            console.error('Send error:', e);
+
             return false;
         }
     }
@@ -58,18 +58,18 @@ export const setupControlChannel = (channel: RTCDataChannel) => {
     controlChannel = channel;
 
     channel.onopen = () => {
-        console.log('✅ Control channel opened');
+
         if (onChannelState) onChannelState('control', true);
         startHeartbeat();
     };
 
     channel.onclose = () => {
-        console.warn('⚠️ Control channel closed');
+
         stopHeartbeat();
         if (onChannelState) onChannelState('control', false);
     };
 
-    channel.onerror = (e) => console.error('Control error:', e);
+
 
     channel.onmessage = (e) => {
         try {
@@ -79,7 +79,7 @@ export const setupControlChannel = (channel: RTCDataChannel) => {
             // Auto-respond to ping
             if (msg.type === 'ping') sendControl({ type: 'pong' });
         } catch (err) {
-            console.error('Control parse error:', err);
+
         }
     };
 };
@@ -92,16 +92,16 @@ export const setupDataChannel = (channel: RTCDataChannel) => {
     channel.bufferedAmountLowThreshold = LOW_WATER_MARK;
 
     channel.onopen = () => {
-        console.log('✅ Data channel opened');
+
         if (onChannelState) onChannelState('data', true);
     };
 
     channel.onclose = () => {
-        console.warn('⚠️ Data channel closed');
+
         if (onChannelState) onChannelState('data', false);
     };
 
-    channel.onerror = (e) => console.error('Data error:', e);
+
 
     channel.onmessage = (e) => {
         if (e.data instanceof ArrayBuffer) {

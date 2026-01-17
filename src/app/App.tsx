@@ -34,7 +34,7 @@ function App() {
                         // If server says we ARE initiator, but we thought not -> we should become one?
                         // Current Architecture Limit: 'initializeConnection' is one-shot.
                         // For now, let's just log.
-                        console.log('Joined room. Initiator:', msg.isInitiator);
+
                     }
                 }
 
@@ -69,7 +69,7 @@ function App() {
                     // We don't trigger offer here for Initiator to avoid race with 'peer-joined'.
                     // 'peer-joined' event is the trigger.
                     if (msg.peerCount && msg.peerCount > 1) {
-                        console.log(`📡 Room members: ${msg.peerCount}`);
+
                     }
                 } else if (msg.type === 'offer') {
                     if (!isInitiator) {
@@ -89,7 +89,7 @@ function App() {
             });
 
         } catch (e) {
-            console.error('Connection failed', e);
+
         }
     };
 

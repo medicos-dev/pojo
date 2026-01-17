@@ -43,7 +43,7 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
 
     const handleChannelState = useCallback((type: 'control' | 'data', open: boolean) => {
         if (type === 'data' && !open) {
-            console.warn('Data Channel Closed');
+
         }
     }, []);
 
@@ -101,7 +101,7 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
     }, []);
 
     useEffect(() => {
-        initDB().catch(console.error);
+        initDB().catch(() => { });
         registerDataHandlers(handleControlMessage, handleBinaryData, handleChannelState);
     }, [handleControlMessage, handleBinaryData, handleChannelState]);
 
@@ -191,7 +191,7 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
     const handleAccept = () => {
         if (!receiverMeta) return;
 
-        console.log('📥 Accepting file transfer...');
+
         setReceiverStatus('receiving');
         receiverRef.current = new FileReceiver(
             receiverMeta,
@@ -215,7 +215,7 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
         );
 
         const sent = sendControl({ type: 'file-accept' });
-        console.log('📤 file-accept sent:', sent);
+
     };
 
     const handleReject = () => {

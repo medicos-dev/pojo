@@ -90,7 +90,7 @@ export const pushToRamQueue = (chunk: QueuedChunk) => {
 };
 
 async function diskWriterLoop() {
-    console.log('💾 Disk writer started');
+
     diskWriterRunning = true;
 
     while (RAM_QUEUE.length > 0) {
@@ -109,11 +109,11 @@ async function diskWriterLoop() {
             try {
                 await saveChunk(chunk.fileName, chunk.chunkIndex, chunk.data);
             } catch (e) {
-                console.error('Disk write error:', e);
+
             }
         }
     }
 
     diskWriterRunning = false;
-    console.log('💾 Disk writer idle');
+
 }
