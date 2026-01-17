@@ -80,6 +80,9 @@ export const ReceiverPanel = ({
                 <div className="text-green font-mono" style={{ marginTop: '1rem' }}>
                     <div>✓ RECEPTION COMPLETE</div>
                     <div style={{ fontSize: '0.8rem', opacity: 0.7 }}>File saved to Downloads</div>
+                    <button className="retro-btn" style={{ marginTop: '1rem', marginLeft: '0.5rem' }} onClick={onReset}>
+                        READY FOR NEXT
+                    </button>
                 </div>
             )}
 

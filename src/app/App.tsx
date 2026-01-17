@@ -98,23 +98,27 @@ function App() {
         const params = new URLSearchParams(window.location.search);
         const roomFromUrl = params.get('room');
         if (roomFromUrl) {
-            // If URL has room, we assume we are JOINING an existing room.
-            // Hence isInitiator = false.
-            initializeConnection(roomFromUrl, false);
+            // Check session storage for initiator status to persist across reloads
+            const storedInitiator = sessionStorage.getItem('isInitiator') === 'true';
+            // Only claim initiator if we have session proof, otherwise assume joiner (new link click)
+            initializeConnection(roomFromUrl, storedInitiator);
         }
     }, []);
 
     const handleCreate = () => {
         const code = generateRoomCode();
+        sessionStorage.setItem('isInitiator', 'true');
         initializeConnection(code, true);
     };
 
     const handleJoin = (code: string) => {
+        sessionStorage.setItem('isInitiator', 'false');
         initializeConnection(code, false);
     };
 
     const handleLeave = () => {
         setRoomId(null);
+        sessionStorage.removeItem('isInitiator');
         joinRoom(''); // Not strictly necessary if reloading, but clean
         // Reset URL
         const url = new URL(window.location.href);
