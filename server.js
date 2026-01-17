@@ -553,16 +553,38 @@ wss.on('connection', (ws, req) => {
         }
 
         const room = rooms.get(roomId);
+        const existingPeerCount = room.length;
         room.push(ws);
 
         console.log(`✅ Client joined room: ${roomId} (${room.length} client${room.length > 1 ? 's' : ''})`);
 
-        ws.send(JSON.stringify({ type: 'joined', room: roomId }));
+        // Send joined confirmation with room state (peer count)
+        ws.send(JSON.stringify({
+            type: 'joined',
+            room: roomId,
+            isInitiator: existingPeerCount === 0
+        }));
 
+        // CRITICAL: Send room-state with current peer count for state-replayable presence
+        ws.send(JSON.stringify({
+            type: 'room-state',
+            room: roomId,
+            peerCount: room.length,
+            hasPeer: room.length > 1
+        }));
+
+        // Notify existing peers about new client
         if (room.length > 1) {
             room.forEach(client => {
                 if (client !== ws && client.readyState === WebSocket.OPEN) {
                     client.send(JSON.stringify({ type: 'peer-joined', room: roomId }));
+                    // Also send updated room-state to existing peers
+                    client.send(JSON.stringify({
+                        type: 'room-state',
+                        room: roomId,
+                        peerCount: room.length,
+                        hasPeer: true
+                    }));
                 }
             });
             console.log(`📤 Notified ${room.length - 1} peer(s) about new client in room ${roomId}`);
@@ -588,6 +610,23 @@ wss.on('connection', (ws, req) => {
         if (index > -1) {
             room.splice(index, 1);
         }
+
+        // Notify remaining peers about the departure
+        room.forEach(client => {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(JSON.stringify({
+                    type: 'peer-left',
+                    room: roomId
+                }));
+                // Send updated room-state
+                client.send(JSON.stringify({
+                    type: 'room-state',
+                    room: roomId,
+                    peerCount: room.length,
+                    hasPeer: room.length > 1
+                }));
+            }
+        });
 
         if (room.length === 0) {
             console.log(`Room ${roomId} is now empty (kept active for future joins)`);

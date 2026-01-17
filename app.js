@@ -864,6 +864,19 @@ function handleFileSelect(e) {
 }
 
 async function addFilesToQueue(files) {
+    // CRITICAL GUARD: Ensure WebSocket is connected before file transfer
+    const socket = getSocket();
+    if (socket.readyState !== WebSocket.OPEN) {
+        console.log('⚠️ WebSocket not connected, attempting reconnect...');
+        updateConnectionStatus('connecting', 'Reconnecting...');
+        try {
+            await ensureSocketConnected();
+        } catch (error) {
+            showUserMessage('Connection lost. Please wait for reconnection or refresh the page.');
+            return;
+        }
+    }
+
     if (!dataChannel || dataChannel.readyState !== 'open') {
         showUserMessage('Please wait for peer connection to be established.');
         return;
@@ -1007,26 +1020,117 @@ function hideRoomDisplay() {
 }
 
 // ============================================================================
-// WEBSOCKET (Signaling)
+// WEBSOCKET SINGLETON (Signaling) - RULE 1: Singleton & Persistent
 // ============================================================================
 
-function connectWebSocket() {
-    console.log(`📡 Connecting to WebSocket: ${WS_URL}`);
+let wsReconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 10;
+const RECONNECT_DELAY_MS = 2000;
+
+// RULE 1: Singleton WebSocket - lives outside UI lifecycle
+function getSocket() {
+    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+        console.log('📡 Creating new WebSocket connection...');
+        ws = createWebSocket();
+    }
+    return ws;
+}
+
+// Check if socket is ready, reconnect if needed
+async function ensureSocketConnected() {
+    const socket = getSocket();
+
+    if (socket.readyState === WebSocket.OPEN) {
+        return socket;
+    }
+
+    if (socket.readyState === WebSocket.CONNECTING) {
+        // Wait for connection
+        return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                reject(new Error('WebSocket connection timeout'));
+            }, 10000);
+
+            socket.addEventListener('open', () => {
+                clearTimeout(timeout);
+                resolve(socket);
+            }, { once: true });
+
+            socket.addEventListener('error', () => {
+                clearTimeout(timeout);
+                reject(new Error('WebSocket connection failed'));
+            }, { once: true });
+        });
+    }
+
+    // Socket is closed, reconnect
+    return reconnectSocket();
+}
+
+// Reconnect WebSocket
+async function reconnectSocket() {
+    if (wsReconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+        console.error('❌ Max reconnection attempts reached');
+        updateConnectionStatus('disconnected', 'Connection failed - please refresh');
+        return null;
+    }
+
+    wsReconnectAttempts++;
+    console.log(`� Reconnecting WebSocket (attempt ${wsReconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
+
+    return new Promise((resolve, reject) => {
+        ws = createWebSocket();
+
+        const timeout = setTimeout(() => {
+            reject(new Error('WebSocket reconnection timeout'));
+        }, 10000);
+
+        ws.addEventListener('open', () => {
+            clearTimeout(timeout);
+            wsReconnectAttempts = 0; // Reset on successful connection
+
+            // Rejoin room if we were in one
+            if (currentRoom) {
+                ws.send(JSON.stringify({
+                    type: 'join',
+                    room: currentRoom
+                }));
+            }
+
+            resolve(ws);
+        }, { once: true });
+
+        ws.addEventListener('error', () => {
+            clearTimeout(timeout);
+            setTimeout(() => {
+                reconnectSocket().then(resolve).catch(reject);
+            }, RECONNECT_DELAY_MS);
+        }, { once: true });
+    });
+}
+
+// Create WebSocket with event handlers
+function createWebSocket() {
+    console.log(`�📡 Connecting to WebSocket: ${WS_URL}`);
     updateConnectionStatus('connecting', 'Connecting to server...');
 
-    ws = new WebSocket(WS_URL);
+    const socket = new WebSocket(WS_URL);
 
-    ws.onopen = () => {
+    socket.onopen = () => {
         console.log('✅ WebSocket connected');
-        updateConnectionStatus('connecting', 'Connected to server, joining room...');
+        wsReconnectAttempts = 0;
+        updateConnectionStatus('connecting', 'Connected to server');
 
-        ws.send(JSON.stringify({
-            type: 'join',
-            room: currentRoom
-        }));
+        // Join room if specified
+        if (currentRoom) {
+            socket.send(JSON.stringify({
+                type: 'join',
+                room: currentRoom
+            }));
+        }
     };
 
-    ws.onmessage = (event) => {
+    socket.onmessage = (event) => {
         try {
             const message = JSON.parse(event.data);
             handleSignalingMessage(message);
@@ -1035,26 +1139,87 @@ function connectWebSocket() {
         }
     };
 
-    ws.onerror = (error) => {
+    socket.onerror = (error) => {
         console.error('WebSocket error:', error);
         updateConnectionStatus('disconnected', 'Connection error');
     };
 
-    ws.onclose = () => {
-        console.log('WebSocket closed');
-        updateConnectionStatus('disconnected', 'Disconnected from server');
+    socket.onclose = (event) => {
+        console.log(`WebSocket closed (code: ${event.code}, reason: ${event.reason})`);
+
+        // Only show disconnected if we were connected and it wasn't intentional
+        if (currentRoom && event.code !== 1000) {
+            updateConnectionStatus('disconnected', 'Disconnected - reconnecting...');
+            // Auto-reconnect
+            setTimeout(() => {
+                reconnectSocket().catch(err => {
+                    console.error('Reconnection failed:', err);
+                });
+            }, RECONNECT_DELAY_MS);
+        } else {
+            updateConnectionStatus('disconnected', 'Disconnected');
+        }
     };
+
+    return socket;
+}
+
+// RULE 2: DO NOT close WebSocket on visibility change
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+        console.log('📱 Page hidden — keeping WebSocket connection alive');
+        // Send keepalive ping to prevent server timeout
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'ping' }));
+        }
+    } else {
+        console.log('📱 Page visible — checking connection status');
+        // Verify connection is still alive on return
+        if (ws && ws.readyState !== WebSocket.OPEN && currentRoom) {
+            console.log('🔄 Connection lost while hidden, reconnecting...');
+            reconnectSocket().catch(err => {
+                console.error('Reconnection failed:', err);
+            });
+        }
+    }
+});
+
+// Legacy function kept for compatibility
+function connectWebSocket() {
+    ws = getSocket();
 }
 
 function handleSignalingMessage(message) {
     switch (message.type) {
         case 'joined':
             console.log(`✅ Joined room: ${message.room}`);
+            // Use isInitiator from server if provided
+            if (message.isInitiator !== undefined) {
+                isInitiator = message.isInitiator;
+            }
             showRoomDisplay();
             updateConnectionStatus('connecting', 'Waiting for peer...');
 
             if (isInitiator) {
                 createPeerConnection();
+            }
+            break;
+
+        // RULE 3: State-replayable peer presence
+        case 'room-state':
+            console.log(`📊 Room state: ${message.peerCount} peer(s), hasPeer: ${message.hasPeer}`);
+            if (message.hasPeer) {
+                updateConnectionStatus('connecting', 'Peer found, connecting...');
+                // Trigger connection if we have a peer and aren't connected yet
+                if (!peerConnection) {
+                    createPeerConnection();
+                }
+                if (isInitiator && !dataChannel) {
+                    createDataChannel();
+                    createOffer();
+                }
+            } else {
+                updateConnectionStatus('connecting', 'Waiting for peer...');
             }
             break;
 
@@ -1068,6 +1233,21 @@ function handleSignalingMessage(message) {
             if (isInitiator) {
                 createDataChannel();
                 createOffer();
+            }
+            break;
+
+        case 'peer-left':
+            console.log('👋 Peer left the room');
+            updateConnectionStatus('connecting', 'Peer disconnected, waiting...');
+
+            // Close DataChannel and PeerConnection, but stay in room
+            if (dataChannel) {
+                dataChannel.close();
+                dataChannel = null;
+            }
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
             }
             break;
 
