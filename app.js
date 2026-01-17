@@ -1,912 +1,962 @@
-// WebRTC Configuration
+// ============================================================================
+// POJO FILES - HYBRID TRANSFER MODEL
+// ============================================================================
+// WebRTC: Signaling, peer discovery, metadata, control messages
+// HTTP: All file data transfer (resumable, high-speed)
+// ============================================================================
+
+// WebRTC Configuration (for signaling only, not file data)
 const ICE_SERVERS = [
-    {
-        urls: "stun:free.expressturn.com:3478"
-    },
-    {
-        urls: "turn:free.expressturn.com:3478?transport=udp",
-        username: "000000002083986270",
-        credential: "yaZXTjsDpaLSnBGYVnDxMZ+acj8="
-    }
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" }
 ];
 
-// Constants
-// Get WebSocket URL from URL parameters or use same host as page
+// ============================================================================
+// HTTP TRANSFER CONFIGURATION
+// ============================================================================
+const HTTP_CHUNK_SIZE = 4 * 1024 * 1024;  // 4MB chunks (balance of speed and memory)
+const MAX_PARALLEL_UPLOADS = 2;            // Parallel upload streams
+const PROGRESS_UPDATE_INTERVAL = 500;      // Progress updates every 500ms
+
+// ============================================================================
+// WEBSOCKET URL CONFIGURATION
+// ============================================================================
 function getWebSocketURL() {
     const params = new URLSearchParams(window.location.search);
     const wsParam = params.get('ws');
 
-    // If WebSocket URL is provided as parameter, use it directly
     if (wsParam) {
-        // If it starts with ws:// or wss://, use as-is
         if (wsParam.startsWith('ws://') || wsParam.startsWith('wss://')) {
             return wsParam;
         }
-        // For dev tunnels, use wss:// without port (dev tunnel handles routing)
         if (wsParam.includes('devtunnels.ms')) {
             return `wss://${wsParam}`;
         }
-        // For other hosts, determine protocol and port
         const protocol = 'ws:';
         const port = params.get('port') || '8080';
         return `${protocol}//${wsParam}:${port}`;
     }
 
-    // Default: use same host and protocol as current page
     const hostname = window.location.hostname;
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 
-    // For Render deployments (.onrender.com), use same hostname and protocol
-    // Render handles WebSocket upgrades automatically on the same port
     if (hostname.includes('onrender.com')) {
-        // Render uses same port for HTTP and WebSocket, no port needed in URL
         return `${protocol}//${hostname}`;
     }
 
-    // For local development, use the port from URL or default to 8080
     const port = window.location.port || '8080';
     return `${protocol}//${hostname}:${port}`;
 }
+
+function getHttpBaseURL() {
+    const hostname = window.location.hostname;
+    const protocol = window.location.protocol;
+    const port = window.location.port || '';
+    return port ? `${protocol}//${hostname}:${port}` : `${protocol}//${hostname}`;
+}
+
 const WS_URL = getWebSocketURL();
+const HTTP_BASE_URL = getHttpBaseURL();
 console.log('WebSocket URL:', WS_URL);
-// DYNAMIC SLIDING WINDOW: Optimized for 200GB+ files
-// 🔴 PROTOCOL INVARIANT: Fixed chunk size per index (single CHUNK_SIZE for entire transfer)
-// 🛠️ FIX #2: Lock chunk size to 64KB (not 128KB) - 128KB is too aggressive for mobile SCTP
-const INITIAL_CHUNK_SIZE = 64 * 1024; // 64KB fixed chunk size (safe for mobile)
-const CONNECTED_CHUNK_SIZE = 64 * 1024; // Must match INITIAL_CHUNK_SIZE for deterministic offsets
-
-// 🧯 FIX #1: Hard sender rate limit (do NOT send "as fast as possible")
-// Recommended safe values: Desktop↔Desktop: 6-10 MBps, Mobile involved: 2-4 MBps, Long transfers: ≤3 MBps
-const TARGET_MBPS = 5; // SAFE - conservative for long transfers and mobile
-const BYTES_PER_SEC = TARGET_MBPS * 1024 * 1024;
-const TICK_MS = 20;
-const BYTES_PER_TICK = Math.floor(BYTES_PER_SEC * (TICK_MS / 1000)); // ~62KB per tick
-
-// 🛠️ FIX #3: Lower in-flight permanently (reduces retransmission pressure)
-const HIGH_WATER_MARK = 1.5 * 1024 * 1024; // 1.5MB - conservative for mobile Chrome
-const BACKPRESSURE_THRESHOLD = 0.75 * 1024 * 1024; // 0.75MB - bufferedAmountLowThreshold
-const MAX_BUFFERED_AMOUNT = HIGH_WATER_MARK; // 1.5MB max - don't send if buffer exceeds this
-// 🔴 SCTP TRANSPORT LIMIT: Never send >16KB wire payloads (prevents send credit exhaustion)
-const MAX_WIRE_CHUNK = 16 * 1024; // 16KB hard limit for stable SCTP over mobile
-
-// Mobile device detection
-const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+console.log('HTTP Base URL:', HTTP_BASE_URL);
 
 // ============================================================================
-// INDEXEDDB STORAGE FOR RECEIVER (Free Tier Safe - No Server-Side Database)
+// STATE MANAGEMENT
 // ============================================================================
-// Store file chunks in IndexedDB instead of RAM to support 200GB+ files
-// This prevents mobile RAM crashes when receiving large files
-
-let db = null;
-const DB_NAME = 'P2PFileTransferDB';
-const DB_VERSION = 1;
-const STORE_NAME = 'fileChunks';
-
-// Initialize IndexedDB
-async function initIndexedDB() {
-    return new Promise((resolve, reject) => {
-        const request = indexedDB.open(DB_NAME, DB_VERSION);
-
-        request.onerror = () => {
-            console.error('❌ IndexedDB open failed:', request.error);
-            reject(request.error);
-        };
-
-        request.onsuccess = () => {
-            db = request.result;
-            console.log('✅ IndexedDB initialized');
-            resolve(db);
-        };
-
-        request.onupgradeneeded = (event) => {
-            const database = event.target.result;
-            if (!database.objectStoreNames.contains(STORE_NAME)) {
-                // Create object store with fileName as keyPath
-                const objectStore = database.createObjectStore(STORE_NAME, { keyPath: 'chunkIndex' });
-                // Create index for fileName to query all chunks for a file
-                objectStore.createIndex('fileName', 'fileName', { unique: false });
-                console.log('✅ IndexedDB object store created');
-            }
-        };
-    });
-}
-
-// Store chunk in IndexedDB (receiver side)
-async function storeChunkInIndexedDB(fileName, chunkIndex, chunkData) {
-    if (!db) {
-        await initIndexedDB();
-    }
-
-    return new Promise((resolve, reject) => {
-        const transaction = db.transaction([STORE_NAME], 'readwrite');
-        const store = transaction.objectStore(STORE_NAME);
-
-        // Convert chunk to ArrayBuffer for storage
-        const chunkBuffer = chunkData instanceof ArrayBuffer
-            ? chunkData
-            : chunkData.buffer instanceof ArrayBuffer
-                ? chunkData.buffer
-                : new Uint8Array(chunkData).buffer;
-
-        const record = {
-            chunkIndex: `${fileName}_${chunkIndex}`, // Composite key
-            fileName: fileName,
-            chunkIndexNum: chunkIndex,
-            chunkData: chunkBuffer,
-            timestamp: Date.now()
-        };
-
-        const request = store.put(record);
-
-        request.onsuccess = () => {
-            resolve();
-        };
-
-        request.onerror = () => {
-            console.error(`❌ CRITICAL: Error storing chunk ${chunkIndex} in IndexedDB:`, request.error);
-            reject(request.error);
-        };
-
-        // Handle transaction errors
-        transaction.onerror = () => {
-            console.error(`❌ CRITICAL: Transaction error while storing chunk ${chunkIndex}:`, transaction.error);
-            reject(transaction.error);
-        };
-    });
-}
-
-// Get total bytes received from IndexedDB for a file
-async function getTotalBytesFromIndexedDB(fileName) {
-    if (!db) {
-        await initIndexedDB();
-    }
-
-    return new Promise((resolve, reject) => {
-        const transaction = db.transaction([STORE_NAME], 'readonly');
-        const store = transaction.objectStore(STORE_NAME);
-        const index = store.index('fileName');
-        const request = index.getAll(fileName);
-
-        request.onsuccess = () => {
-            const chunks = request.result;
-            let totalBytes = 0;
-            const chunkIndices = [];
-            chunks.forEach(chunk => {
-                if (chunk.chunkData && chunk.chunkData.byteLength) {
-                    totalBytes += chunk.chunkData.byteLength;
-                    if (chunk.chunkIndexNum !== undefined) {
-                        chunkIndices.push(chunk.chunkIndexNum);
-                    }
-                }
-            });
-
-            // Sort indices to check for gaps
-            chunkIndices.sort((a, b) => a - b);
-            const minIndex = chunkIndices[0] || 0;
-            const maxIndex = chunkIndices[chunkIndices.length - 1] || 0;
-
-            // Log if there are significant gaps (missing chunks)
-            if (chunkIndices.length > 0 && (maxIndex - minIndex + 1) > chunkIndices.length) {
-                const missing = (maxIndex - minIndex + 1) - chunkIndices.length;
-                if (missing > 10) { // Only log if significant number missing
-                    console.warn(`⚠️ IndexedDB has ${chunkIndices.length} chunks but range is ${minIndex}-${maxIndex} (missing ~${missing} chunks)`);
-                }
-            }
-
-            resolve({ totalBytes, chunkCount: chunks.length, minIndex, maxIndex });
-        };
-
-        request.onerror = () => {
-            console.error('❌ Error reading from IndexedDB:', request.error);
-            reject(request.error);
-        };
-    });
-}
-
-// Get all chunks from IndexedDB for a file (for final assembly)
-async function getAllChunksFromIndexedDB(fileName) {
-    if (!db) {
-        await initIndexedDB();
-    }
-
-    return new Promise((resolve, reject) => {
-        const transaction = db.transaction([STORE_NAME], 'readonly');
-        const store = transaction.objectStore(STORE_NAME);
-        const index = store.index('fileName');
-        const request = index.getAll(fileName);
-
-        request.onsuccess = () => {
-            const chunks = request.result;
-            // Sort by chunkIndexNum to ensure correct order
-            chunks.sort((a, b) => a.chunkIndexNum - b.chunkIndexNum);
-            resolve(chunks.map(chunk => chunk.chunkData));
-        };
-
-        request.onerror = () => {
-            console.error('❌ Error reading chunks from IndexedDB:', request.error);
-            reject(request.error);
-        };
-    });
-}
-
-// Delete all chunks for a file from IndexedDB (cleanup after download)
-async function deleteFileFromIndexedDB(fileName) {
-    if (!db) {
-        return; // No DB, nothing to delete
-    }
-
-    return new Promise((resolve, reject) => {
-        const transaction = db.transaction([STORE_NAME], 'readwrite');
-        const store = transaction.objectStore(STORE_NAME);
-        const index = store.index('fileName');
-        const request = index.openKeyCursor(IDBKeyRange.only(fileName));
-
-        request.onsuccess = (event) => {
-            const cursor = event.target.result;
-            if (cursor) {
-                store.delete(cursor.primaryKey);
-                cursor.continue();
-            } else {
-                console.log(`✅ Deleted all chunks for ${fileName} from IndexedDB`);
-                resolve();
-            }
-        };
-
-        request.onerror = () => {
-            console.error('❌ Error deleting from IndexedDB:', request.error);
-            reject(request.error);
-        };
-    });
-}
-
-// ============================================================================
-// LOCALSTORAGE PERSISTENCE (Free Tier Safe)
-// ============================================================================
-// Store file metadata and byte offset for resume capability
-
-function saveFileMetadataToLocalStorage(fileName, fileSize, mimeType, receivedBytes) {
-    try {
-        const metadata = {
-            fileName,
-            fileSize,
-            mimeType,
-            receivedBytes,
-            timestamp: Date.now()
-        };
-        localStorage.setItem(`fileMetadata_${fileName}`, JSON.stringify(metadata));
-        console.log(`💾 Saved file metadata to localStorage: ${fileName} (${receivedBytes}/${fileSize} bytes)`);
-    } catch (error) {
-        console.error('❌ Error saving to localStorage:', error);
-    }
-}
-
-function getFileMetadataFromLocalStorage(fileName) {
-    try {
-        const data = localStorage.getItem(`fileMetadata_${fileName}`);
-        if (data) {
-            return JSON.parse(data);
-        }
-    } catch (error) {
-        console.error('❌ Error reading from localStorage:', error);
-    }
-    return null;
-}
-
-function deleteFileMetadataFromLocalStorage(fileName) {
-    try {
-        localStorage.removeItem(`fileMetadata_${fileName}`);
-        console.log(`🗑️ Deleted file metadata from localStorage: ${fileName}`);
-    } catch (error) {
-        console.error('❌ Error deleting from localStorage:', error);
-    }
-}
-
-// State
 let ws = null;
 let peerConnection = null;
 let dataChannel = null;
 let currentRoom = null;
 let isInitiator = false;
+
+// File handling
 let currentFile = null;
-let fileQueue = []; // Queue for multiple files
-let isProcessingQueue = false; // Flag to prevent concurrent processing
-let currentFileResolve = null; // Resolve function for current file promise
+let fileQueue = [];
+let isProcessingQueue = false;
 
-// ✅ FIX 1: Windowed ACK tracking (not per-chunk)
-const ACK_EVERY_N_CHUNKS = 64; // ACK every 64 chunks (stabilizes RTT and keeps credits flowing)
-let ackedChunks = new Set(); // Track which chunks receiver has ACKed (by index)
-let highestReceivedAckedChunkIndex = -1; // Highest index ever ACKed by receiver (may have gaps)
-let highestContiguousAckedChunkIndex = -1; // Highest contiguous index where all chunks [0..N] are ACKed
-let totalChunksSent = 0; // Total chunks sent for current file
-let ackedChunkCount = 0; // Total chunks ACKed (derived from windowed ACKs)
-let fileCompleteSent = false; // ✅ FIX 4: Guard against duplicate file-complete
-let senderChunkIndex = 0; // ✅ FIX 2: Immutable chunk index counter
-let fileReader = null;
-let fileStream = null;
-// Promise resolver for file transfer confirmation
-let fileTransferConfirmationResolver = null;
-// Connection loss handling
-let transferAborted = false; // Flag to abort transfer on connection loss
-let transferPaused = false; // Flag to pause transfer (waiting for reconnection)
-let keepaliveInterval = null; // Keepalive ping interval
-let bytesSentThisTick = 0; // Track bytes sent in current tick
-let lastTick = performance.now(); // For rate limiting
-let currentTargetMbps = TARGET_MBPS; // Dynamic rate (can be reduced on throttling detection)
+// Upload session state
+let currentUploadSession = null;  // { uploadId, fileName, fileSize, offset }
+let uploadAbortController = null;
 
-// Pause transfer function (hard guard - stops sending immediately)
-function pauseTransfer(reason) {
-    transferPaused = true;
-    console.warn(`⏸️ Transfer paused: ${reason}`);
-}
-
-// 🧯 FIX #1: Hard sender rate limit - canSend() function (drop-in)
-// Ensure function is defined in global scope for accessibility
-window.canSend = function canSend(bytes) {
-    const now = performance.now();
-    if (now - lastTick >= TICK_MS) {
-        lastTick = now;
-        bytesSentThisTick = 0;
-    }
-    const bytesPerTick = Math.floor((currentTargetMbps * 1024 * 1024) * (TICK_MS / 1000));
-    if (bytesSentThisTick + bytes > bytesPerTick) return false;
-    bytesSentThisTick += bytes;
-    return true;
+// Transfer state
+const TransferState = {
+    IDLE: 'IDLE',
+    CONNECTING: 'CONNECTING',
+    SENDING: 'SENDING',
+    RECEIVING: 'RECEIVING',
+    PAUSED: 'PAUSED',
+    COMPLETED: 'COMPLETED',
+    FAILED: 'FAILED'
 };
+let transferState = TransferState.IDLE;
 
-// 🛠️ FIX #4: Reduce send rate on SCTP throttling detection
-function reduceSendRate() {
-    const oldRate = currentTargetMbps;
-    currentTargetMbps = Math.max(1, currentTargetMbps * 0.7); // Reduce by 30%
-    console.warn(`⚠️ SCTP throttling detected - reducing send rate from ${oldRate.toFixed(1)} MBps to ${currentTargetMbps.toFixed(1)} MBps`);
-}
-let connectionLostHandled = false; // Guard against double-calls
-let reader = null; // File stream reader (for ReadableStream)
-let streamReader = null; // Alternative reader reference
-let disconnectedTimer = null; // Timer for ICE disconnected state
-let wakeLock = null; // Screen Wake Lock for mobile transfers
+// Receiver state
+let pendingFileOffer = null;      // { fileId, fileName, fileSize, mimeType, uploadId }
+let pendingFileOfferQueue = [];    // Queue for multiple file offers
 
+// Transfer statistics
 let transferStats = {
     bytesTransferred: 0,
     startTime: null,
     lastUpdateTime: null,
-    lastBytesTransferred: 0,
-    chunksSent: 0,
-    chunksQueued: 0,
-    totalChunksExpected: 0
+    lastBytesTransferred: 0
 };
 
-// RTT-aware adaptive sliding-window: dynamically adjust based on network conditions
-// 🛟 Treat DataChannel as fragile - lower limits for stability
-// 🛠️ FIX #3: Lower in-flight permanently (reduces retransmission pressure)
-let maxInFlightChunks = 24; // Conservative limit - Chrome mobile needs this
-let lastInFlightAdjustTs = 0;
-let ackWatchdogInterval = null;
-// RTT tracking for adaptive window
-let sentAt = new Map(); // chunkIndex -> send timestamp
-let smoothedRTT = 0; // Exponential moving average of RTT
-const RTT_ALPHA = 0.125; // Smoothing factor for RTT
+// Mobile detection
+const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
 
-// Sender-side helper: wait until all chunks have been ACKed (MNC-grade completion gating)
-async function waitForAllAcks(expectedTotalChunks, timeoutMs = 60000) {
-    // If we don't know how many chunks to expect, skip ACK gating
-    if (!expectedTotalChunks || expectedTotalChunks <= 0) {
-        return;
-    }
+// Wake Lock for mobile
+let wakeLock = null;
 
-    const start = Date.now();
-    let lastAckedSize = ackedChunks.size;
-    let stallCount = 0;
+// ============================================================================
+// LOCALSTORAGE PERSISTENCE
+// ============================================================================
 
-    while (ackedChunks.size < expectedTotalChunks) {
-        // Abort if transfer was cancelled
-        if (transferAborted) {
-            throw new Error('TRANSFER_ABORTED');
-        }
-
-        const now = Date.now();
-        if (now - start > timeoutMs) {
-            throw new Error(`ACK_TIMEOUT: received ACKs for ${ackedChunks.size}/${expectedTotalChunks} chunks`);
-        }
-
-        // Monotonic progress guard to avoid livelock
-        if (ackedChunks.size <= lastAckedSize) {
-            stallCount++;
-            if (stallCount > 100) { // ~10s at 100ms interval
-                throw new Error('SEND_STALLED');
-            }
-        } else {
-            stallCount = 0;
-            lastAckedSize = ackedChunks.size;
-        }
-
-        await new Promise(resolve => setTimeout(resolve, 100));
-    }
-
-    // Explicit end-of-file validation: ensure contiguous ACKs up to final chunk
-    if (highestContiguousAckedChunkIndex + 1 !== expectedTotalChunks) {
-        throw new Error(`ACK_RANGE_MISMATCH: highestContiguousAckedChunkIndex=${highestContiguousAckedChunkIndex}, expectedTotalChunks=${expectedTotalChunks}`);
+function saveUploadSession(session) {
+    try {
+        localStorage.setItem(`uploadSession_${session.uploadId}`, JSON.stringify({
+            ...session,
+            timestamp: Date.now()
+        }));
+        console.log(`💾 Saved upload session: ${session.uploadId}`);
+    } catch (error) {
+        console.error('Error saving upload session:', error);
     }
 }
 
-// Helper function to stop keepalive pings
-function stopKeepalive() {
-    if (keepaliveInterval) {
-        clearInterval(keepaliveInterval);
-        keepaliveInterval = null;
-        console.log('🛑 Keepalive stopped');
+function getUploadSession(uploadId) {
+    try {
+        const data = localStorage.getItem(`uploadSession_${uploadId}`);
+        return data ? JSON.parse(data) : null;
+    } catch (error) {
+        console.error('Error reading upload session:', error);
+        return null;
     }
 }
 
-// Screen Wake Lock API - prevents Android Doze mode from pausing transfers
+function deleteUploadSession(uploadId) {
+    try {
+        localStorage.removeItem(`uploadSession_${uploadId}`);
+        console.log(`🗑️ Deleted upload session: ${uploadId}`);
+    } catch (error) {
+        console.error('Error deleting upload session:', error);
+    }
+}
+
+// ============================================================================
+// SCREEN WAKE LOCK (Mobile)
+// ============================================================================
+
 async function requestWakeLock() {
     try {
         if ('wakeLock' in navigator) {
             wakeLock = await navigator.wakeLock.request('screen');
-            console.log('📱 Screen Wake Lock active (prevents sleep during transfer)');
+            console.log('📱 Screen Wake Lock active');
         }
     } catch (err) {
-        // Wake lock may fail if user denies permission or browser doesn't support it
-        console.warn(`Wake Lock not available: ${err.name}, ${err.message}`);
+        console.warn(`Wake Lock not available: ${err.message}`);
     }
-
 }
 
-// Release wake lock when transfer completes or fails
 function releaseWakeLock() {
-    if (wakeLock !== null) {
+    if (wakeLock) {
         try {
             wakeLock.release();
             wakeLock = null;
             console.log('📱 Screen Wake Lock released');
         } catch (err) {
             console.warn(`Error releasing wake lock: ${err.message}`);
-            wakeLock = null;
         }
     }
 }
 
-// Initialize IndexedDB on page load
-initIndexedDB().catch(error => {
-    console.error('❌ Failed to initialize IndexedDB:', error);
-});
+// ============================================================================
+// UI HELPERS
+// ============================================================================
 
-// Helper function to show user-friendly messages
+function formatFileSize(bytes) {
+    if (bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+function formatTime(seconds) {
+    if (!isFinite(seconds) || seconds < 0) return '--';
+    if (seconds < 60) return `${Math.round(seconds)}s`;
+    if (seconds < 3600) {
+        const mins = Math.floor(seconds / 60);
+        const secs = Math.round(seconds % 60);
+        return `${mins}m ${secs}s`;
+    }
+    const hours = Math.floor(seconds / 3600);
+    const mins = Math.floor((seconds % 3600) / 60);
+    return `${hours}h ${mins}m`;
+}
+
+function updateProgress(percent) {
+    const progressFill = document.getElementById('progressFill');
+    const progressPercent = document.getElementById('progressPercent');
+
+    if (progressFill) {
+        progressFill.style.width = `${percent}%`;
+    }
+    if (progressPercent) {
+        progressPercent.textContent = `${percent.toFixed(1)}%`;
+    }
+}
+
+function updateTransferSpeed() {
+    const now = Date.now();
+    const elapsedSinceLastUpdate = (now - transferStats.lastUpdateTime) / 1000;
+    const bytesSinceLastUpdate = transferStats.bytesTransferred - transferStats.lastBytesTransferred;
+
+    if (elapsedSinceLastUpdate > 0) {
+        const speedBps = bytesSinceLastUpdate / elapsedSinceLastUpdate;
+        const speedText = document.getElementById('transferSpeed');
+        const timeRemaining = document.getElementById('timeRemaining');
+
+        if (speedText) {
+            if (speedBps > 1024 * 1024) {
+                speedText.textContent = `${(speedBps / (1024 * 1024)).toFixed(1)} MB/s`;
+            } else if (speedBps > 1024) {
+                speedText.textContent = `${(speedBps / 1024).toFixed(1)} KB/s`;
+            } else {
+                speedText.textContent = `${speedBps.toFixed(0)} B/s`;
+            }
+        }
+
+        if (timeRemaining && currentFile) {
+            const remainingBytes = currentFile.size - transferStats.bytesTransferred;
+            if (speedBps > 0) {
+                const remainingSeconds = remainingBytes / speedBps;
+                timeRemaining.textContent = formatTime(remainingSeconds);
+            }
+        }
+    }
+
+    transferStats.lastUpdateTime = now;
+    transferStats.lastBytesTransferred = transferStats.bytesTransferred;
+}
+
+function resetTransferStats() {
+    transferStats = {
+        bytesTransferred: 0,
+        startTime: null,
+        lastUpdateTime: null,
+        lastBytesTransferred: 0
+    };
+}
+
+function updateConnectionStatus(status, text) {
+    const statusIndicator = document.getElementById('statusIndicator');
+    const statusText = document.getElementById('statusText');
+
+    if (statusIndicator) {
+        statusIndicator.className = 'status-indicator';
+        if (status === 'connected') {
+            statusIndicator.classList.add('connected');
+        } else if (status === 'connecting') {
+            statusIndicator.classList.add('connecting');
+        }
+    }
+
+    if (statusText) {
+        statusText.textContent = text;
+    }
+}
+
+function showTransferInfo(fileName, fileSize) {
+    const transferInfo = document.getElementById('transferInfo');
+    const fileNameEl = document.getElementById('fileName');
+    const fileSizeEl = document.getElementById('fileSize');
+    const dropZone = document.getElementById('dropZone');
+    const transferSection = document.getElementById('transferSection');
+
+    if (transferSection) transferSection.style.display = 'block';
+    if (dropZone) dropZone.style.display = 'none';
+    if (transferInfo) transferInfo.style.display = 'block';
+    if (fileNameEl) fileNameEl.textContent = fileName;
+    if (fileSizeEl) fileSizeEl.textContent = formatFileSize(fileSize);
+
+    updateProgress(0);
+}
+
+function hideTransferInfo() {
+    const transferInfo = document.getElementById('transferInfo');
+    const dropZone = document.getElementById('dropZone');
+
+    if (transferInfo) transferInfo.style.display = 'none';
+    if (dropZone) dropZone.style.display = 'flex';
+}
+
+function showSuccessMessage(fileName) {
+    const successMessage = document.getElementById('successMessage');
+    const successText = document.getElementById('successText');
+
+    if (successMessage) {
+        successMessage.style.display = 'flex';
+        if (successText) {
+            successText.textContent = `${fileName} transferred successfully!`;
+        }
+        setTimeout(() => {
+            successMessage.style.display = 'none';
+        }, 5000);
+    }
+}
+
 function showUserMessage(message) {
     alert(message);
 }
 
-// CRITICAL: Handle connection loss - treat as connection failure, not file failure
-// Define this BEFORE it's used (near top of file)
-// Track connection loss attempts to avoid false positives
-let connectionLossCheckCount = 0;
-let lastConnectionLossCheck = 0;
-const CONNECTION_LOSS_GRACE_PERIOD = 3000; // 3 seconds grace period on mobile
-const CONNECTION_LOSS_CHECK_INTERVAL = 1000; // Check every 1 second
+// ============================================================================
+// HTTP UPLOAD API (Sender)
+// ============================================================================
 
-async function handleConnectionLoss(reason = "unknown") {
-    // 🔹 Update state machine on connection loss
-    if (transferState === TransferState.TRANSFERRING || transferState === TransferState.RESUMING) {
-        transferState = TransferState.PAUSED;
-        console.log(`⏸️ Transfer paused due to connection loss: ${reason}`);
+async function createUploadSession(file) {
+    console.log(`📤 Creating upload session for: ${file.name}`);
+
+    const response = await fetch(`${HTTP_BASE_URL}/upload/session`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            fileName: file.name,
+            fileSize: file.size,
+            mimeType: file.type || 'application/octet-stream',
+            chunkSize: HTTP_CHUNK_SIZE
+        })
+    });
+
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to create upload session');
     }
 
-    const now = Date.now();
+    const session = await response.json();
+    console.log(`✅ Upload session created: ${session.uploadId}`);
 
-    // CRITICAL: Verify connection is actually dead before showing alert
-    // Check multiple conditions to avoid false positives
-    const wsConnected = ws && ws.readyState === WebSocket.OPEN;
-    const dcState = dataChannel?.readyState || 'unknown';
-    const pcState = peerConnection?.connectionState || 'unknown';
-    const iceState = peerConnection?.iceConnectionState || 'unknown';
+    currentUploadSession = {
+        uploadId: session.uploadId,
+        uploadUrl: session.uploadUrl,
+        fileName: file.name,
+        fileSize: file.size,
+        offset: 0,
+        maxChunkSize: session.maxChunkSize
+    };
 
-    // If WebSocket is still connected, this is likely a transient issue
-    // Only treat as connection loss if WebSocket is also closed/failed
-    if (wsConnected && reason !== "ice-failed") {
-        // WebSocket is still connected - this is likely a transient DataChannel state change
-        // Wait and verify before treating as connection loss
-        console.log(`⏳ Transient state change detected (${reason}). WebSocket still connected. Verifying...`);
-        console.log(`   DataChannel: ${dcState}, PeerConnection: ${pcState}, ICE: ${iceState}`);
+    saveUploadSession(currentUploadSession);
+    return session;
+}
 
-        // Only proceed if DataChannel is actually closed AND PeerConnection is failed
-        if (dcState !== 'closed' || pcState !== 'failed') {
-            console.log(`✅ Connection appears active - ignoring transient state change`);
-            return; // Don't treat as connection loss if connection is still active
+async function uploadFileHTTP(file, session, startOffset = 0) {
+    console.log(`📤 Starting HTTP upload: ${file.name} from offset ${startOffset}`);
+
+    await requestWakeLock();
+
+    transferState = TransferState.SENDING;
+    transferStats.startTime = Date.now();
+    transferStats.lastUpdateTime = Date.now();
+    transferStats.bytesTransferred = startOffset;
+
+    showTransferInfo(file.name, file.size);
+    updateProgress((startOffset / file.size) * 100);
+
+    uploadAbortController = new AbortController();
+    const { signal } = uploadAbortController;
+
+    let offset = startOffset;
+    const chunkSize = session.maxChunkSize || HTTP_CHUNK_SIZE;
+
+    // Progress update interval
+    const progressInterval = setInterval(() => {
+        updateTransferSpeed();
+        sendProgressUpdate(transferStats.bytesTransferred, file.size);
+    }, PROGRESS_UPDATE_INTERVAL);
+
+    try {
+        while (offset < file.size) {
+            // Check for abort
+            if (signal.aborted) {
+                throw new Error('Upload aborted');
+            }
+
+            const end = Math.min(offset + chunkSize, file.size);
+            const chunk = file.slice(offset, end);
+
+            const response = await fetch(`${HTTP_BASE_URL}/upload/${session.uploadId}`, {
+                method: 'PUT',
+                headers: {
+                    'Content-Type': 'application/octet-stream',
+                    'Content-Range': `bytes ${offset}-${end - 1}/${file.size}`
+                },
+                body: chunk,
+                signal
+            });
+
+            if (!response.ok) {
+                const error = await response.json().catch(() => ({ error: 'Upload failed' }));
+                throw new Error(error.error || `HTTP ${response.status}`);
+            }
+
+            const result = await response.json();
+            offset = result.bytesReceived;
+
+            // Update state
+            transferStats.bytesTransferred = offset;
+            currentUploadSession.offset = offset;
+            saveUploadSession(currentUploadSession);
+
+            // Update UI
+            const percent = (offset / file.size) * 100;
+            updateProgress(percent);
         }
-    }
 
-    // On mobile/broadband, add grace period before showing alert
-    // Brief disconnections are common even on stable connections
-    if ((now - lastConnectionLossCheck) < CONNECTION_LOSS_GRACE_PERIOD) {
-        console.log(`⏳ Grace period: ignoring brief connection loss (${reason})`);
-        connectionLossCheckCount++;
+        clearInterval(progressInterval);
 
-        // Only proceed if we've seen multiple connection loss events
-        if (connectionLossCheckCount < 5) { // Increased from 3 to 5 for more stability
-            lastConnectionLossCheck = now;
-            return; // Ignore transient disconnections
+        // Upload complete
+        console.log(`✅ Upload complete: ${file.name}`);
+        transferState = TransferState.COMPLETED;
+        updateProgress(100);
+
+        // Send completion via WebRTC
+        sendUploadComplete(session.uploadId, file.name, file.size);
+
+        // Cleanup
+        deleteUploadSession(session.uploadId);
+        showSuccessMessage(file.name);
+
+        setTimeout(() => {
+            hideTransferInfo();
+            currentFile = null;
+            currentUploadSession = null;
+            processFileQueue();
+        }, 2000);
+
+    } catch (error) {
+        clearInterval(progressInterval);
+
+        if (error.name === 'AbortError' || error.message === 'Upload aborted') {
+            console.log('📤 Upload aborted by user');
+            transferState = TransferState.PAUSED;
+        } else {
+            console.error('❌ Upload error:', error);
+            transferState = TransferState.FAILED;
+            showUserMessage(`Upload failed: ${error.message}`);
         }
+    } finally {
+        releaseWakeLock();
+        uploadAbortController = null;
+    }
+}
+
+async function resumeUpload(file) {
+    if (!currentUploadSession) {
+        console.log('No upload session to resume');
+        return false;
     }
 
-    lastConnectionLossCheck = now;
+    // Check session on server
+    try {
+        const response = await fetch(`${HTTP_BASE_URL}/upload/${currentUploadSession.uploadId}`);
+        if (!response.ok) {
+            console.log('Upload session expired, starting new upload');
+            currentUploadSession = null;
+            return false;
+        }
 
-    // Guard against double-calls (important)
-    if (connectionLostHandled) {
-        console.log("⚠️ Connection loss already handled, ignoring duplicate call");
+        const serverSession = await response.json();
+        const resumeOffset = serverSession.receivedBytes || 0;
+
+        console.log(`🔄 Resuming upload from byte ${resumeOffset}`);
+        await uploadFileHTTP(file, currentUploadSession, resumeOffset);
+        return true;
+
+    } catch (error) {
+        console.error('Failed to check upload session:', error);
+        return false;
+    }
+}
+
+// ============================================================================
+// WEBRTC CONTROL MESSAGES
+// ============================================================================
+
+function sendFileOffer(uploadId, file) {
+    if (!dataChannel || dataChannel.readyState !== 'open') {
+        console.error('Cannot send file offer: DataChannel not open');
+        return false;
+    }
+
+    const offer = {
+        type: 'file-offer',
+        fileId: uploadId,
+        uploadId: uploadId,
+        fileName: file.name,
+        fileSize: file.size,
+        mimeType: file.type || 'application/octet-stream'
+    };
+
+    dataChannel.send(JSON.stringify(offer));
+    console.log(`📤 Sent file offer: ${file.name} (${uploadId})`);
+    return true;
+}
+
+function sendFileAccept(fileId) {
+    if (!dataChannel || dataChannel.readyState !== 'open') {
+        console.error('Cannot send file accept: DataChannel not open');
         return;
     }
 
-    // For large files, be more lenient with transient disconnections
-    const fileSize = currentFile?.size || receivingFileSize || 0;
-    const fileSizeGB = fileSize / (1024 * 1024 * 1024);
-    const isLargeFile = fileSizeGB > 1; // Files over 1GB
+    dataChannel.send(JSON.stringify({
+        type: 'file-accept',
+        fileId: fileId
+    }));
+    console.log(`✅ Sent file accept: ${fileId}`);
+}
 
-    // Final verification: Only treat as connection loss if connection is actually dead
-    // Check if WebSocket is closed AND (DataChannel is closed OR PeerConnection is failed)
-    const isActuallyDead = !wsConnected && (dcState === 'closed' || pcState === 'failed' || iceState === 'failed');
-
-    if (!isActuallyDead && reason !== "ice-failed") {
-        console.log(`✅ Connection verification: Not actually dead. WebSocket: ${wsConnected ? 'connected' : 'disconnected'}, DataChannel: ${dcState}, PeerConnection: ${pcState}, ICE: ${iceState}`);
-        console.log(`   Ignoring false positive connection loss (${reason})`);
-        return; // Don't treat as connection loss if connection is still active
+function sendFileReject(fileId) {
+    if (!dataChannel || dataChannel.readyState !== 'open') {
+        console.error('Cannot send file reject: DataChannel not open');
+        return;
     }
 
-    console.warn("🚨 Connection lost:", reason, isLargeFile ? `(Large file: ${fileSizeGB.toFixed(2)}GB - being lenient)` : "", isMobile ? "(Mobile - being extra lenient)" : "");
+    dataChannel.send(JSON.stringify({
+        type: 'file-reject',
+        fileId: fileId
+    }));
+    console.log(`❌ Sent file reject: ${fileId}`);
+}
 
-    // Correct logic: Check dataChannel state directly, not PC/ICE state
-    if (dataChannel && dataChannel.readyState === 'closed') {
-        console.warn('🔁 DataChannel closed — attempting recovery...');
-        try {
-            await recoverDataChannelAndResume();
-            transferPaused = false; // Resume transfer after recovery
-            return; // Recovery successful, don't abort
-        } catch (recoverErr) {
-            console.error('❌ DataChannel recovery failed:', recoverErr);
-            // Fall through to normal connection loss handling
-        }
+function sendProgressUpdate(bytesUploaded, totalBytes) {
+    if (!dataChannel || dataChannel.readyState !== 'open') return;
+
+    try {
+        dataChannel.send(JSON.stringify({
+            type: 'progress',
+            bytesUploaded,
+            totalBytes,
+            percent: Math.round((bytesUploaded / totalBytes) * 100)
+        }));
+    } catch (error) {
+        // Non-critical, ignore
+    }
+}
+
+function sendUploadComplete(uploadId, fileName, fileSize) {
+    if (!dataChannel || dataChannel.readyState !== 'open') return;
+
+    dataChannel.send(JSON.stringify({
+        type: 'upload-complete',
+        uploadId,
+        fileName,
+        fileSize
+    }));
+    console.log(`✅ Sent upload complete: ${fileName}`);
+}
+
+// ============================================================================
+// WEBRTC MESSAGE HANDLERS
+// ============================================================================
+
+function handleDataChannelMessage(event) {
+    const data = event.data;
+
+    // All messages should be JSON (no binary on DataChannel anymore)
+    if (typeof data !== 'string') {
+        console.warn('⚠️ Received unexpected binary data on DataChannel');
+        return;
     }
 
-    // Legacy handling for other connection loss reasons
-    if (reason === "datachannel-closed" && (isLargeFile || isMobile)) {
-        // Check if WebSocket is still connected - if so, this might be recoverable
-        if (ws && ws.readyState === WebSocket.OPEN) {
-            console.log("🔄 WebSocket still connected, attempting recovery...");
-            transferPaused = true;
-            // Try to recreate DataChannel if we're the initiator
-            if (isInitiator && peerConnection && peerConnection.connectionState === 'connected') {
-                console.log("🔄 Attempting to recreate DataChannel...");
-                try {
-                    createDataChannel();
-                    // Reset the flag after a delay to allow recovery
-                    setTimeout(() => {
-                        if (dataChannel && dataChannel.readyState === 'open') {
-                            console.log("✅ DataChannel recovered!");
-                            connectionLostHandled = false;
-                            transferPaused = false;
-                            connectionLossCheckCount = 0; // Reset counter
-                            return; // Don't proceed with error handling
-                        }
-                    }, 2000);
-                } catch (error) {
-                    console.error("❌ Failed to recreate DataChannel:", error);
-                }
-            }
+    try {
+        const message = JSON.parse(data);
+
+        switch (message.type) {
+            case 'ping':
+                dataChannel.send(JSON.stringify({ type: 'pong' }));
+                break;
+
+            case 'pong':
+                // Keepalive acknowledged
+                break;
+
+            case 'file-offer':
+                handleFileOffer(message);
+                break;
+
+            case 'file-accept':
+                handleFileAccepted(message.fileId);
+                break;
+
+            case 'file-reject':
+                handleFileRejected(message.fileId);
+                break;
+
+            case 'progress':
+                handleProgressUpdate(message);
+                break;
+
+            case 'upload-complete':
+                handleUploadComplete(message);
+                break;
+
+            default:
+                console.warn('Unknown message type:', message.type);
         }
+    } catch (error) {
+        console.error('Error parsing DataChannel message:', error);
     }
+}
 
-    // Mark as handled now (unless recovery attempt above succeeds)
-    connectionLostHandled = true;
-    connectionLossCheckCount = 0; // Reset counter
+function handleFileOffer(offer) {
+    console.log(`📥 Received file offer: ${offer.fileName} (${formatFileSize(offer.fileSize)})`);
 
-    // Set pause flag - do NOT abort transfer immediately
-    // Transfer must pause, not abort, to allow resume
-    transferPaused = true;
+    pendingFileOfferQueue.push(offer);
 
-    // Only abort if it's a definitive failure (not just disconnected)
-    // For large files and mobile, be even more conservative
-    const shouldAbort = reason === "ice-failed" || (reason === "ice-disconnected-timeout" && !isLargeFile && !isMobile);
-    if (shouldAbort) {
-        transferAborted = true;
-
-        // Only cancel readers if we're actually aborting (not just pausing)
-        // Stop file readers immediately on abort
-        try {
-            if (reader) {
-                reader.cancel();
-                reader = null;
-            }
-        } catch (e) {
-            // Ignore if already cancelled
-        }
-
-        try {
-            if (streamReader) {
-                streamReader.cancel();
-                streamReader = null;
-            }
-        } catch (e) {
-            // Ignore if already cancelled
-        }
-
-        // Also try fileReader (legacy)
-        try {
-            if (fileReader) {
-                fileReader.abort();
-                fileReader = null;
-            }
-        } catch (e) {
-            // Ignore if already aborted
-        }
-
-        // Also try fileStream reader
-        if (fileStream) {
-            try {
-                const streamReader = fileStream.getReader();
-                streamReader.cancel();
-            } catch (e) {
-                // Ignore if already cancelled
-            }
-            fileStream = null;
-        }
+    // Show first offer in queue
+    if (pendingFileOfferQueue.length === 1) {
+        showFileOfferUI();
     }
-    // If just paused (not aborted), don't cancel readers - they'll wait for reconnection
+}
 
-    // Stop keepalive
-    stopKeepalive();
+function handleFileAccepted(fileId) {
+    console.log(`✅ File accepted by peer: ${fileId}`);
 
-    // CRITICAL: Resume support - file state is already saved in IndexedDB and localStorage
-    // No need to save separately - it's already persisted
-    if (receivingFile && receivedBytes > 0 && receivedBytes < receivingFileSize) {
-        console.log(`💾 Partial file state already saved in IndexedDB: ${receivingFile.name} (${receivedBytes}/${receivingFileSize} bytes)`);
+    // Start upload now that peer accepted
+    if (currentFile && currentUploadSession && currentUploadSession.uploadId === fileId) {
+        uploadFileHTTP(currentFile, currentUploadSession, 0);
     }
+}
 
-    // Update UI with user-friendly message
-    updateConnectionStatus('disconnected', 'Connection interrupted');
+function handleFileRejected(fileId) {
+    console.log(`❌ File rejected by peer: ${fileId}`);
 
-    // Show user-friendly message - different for pause vs abort
-    // For large files and mobile, show more encouraging message
-    if (transferPaused && !transferAborted) {
-        const fileSizeGB = (currentFile?.size || receivingFileSize || 0) / (1024 * 1024 * 1024);
-        if (fileSizeGB > 1 || isMobile) {
-            const message = isMobile
-                ? "Connection interrupted. Waiting for reconnection… Mobile networks may experience brief interruptions."
-                : `Connection interrupted (${fileSizeGB.toFixed(2)}GB file). Waiting for reconnection… Large files may experience brief interruptions.`;
-            showUserMessage(message);
+    // Cleanup
+    if (currentUploadSession && currentUploadSession.uploadId === fileId) {
+        deleteUploadSession(fileId);
+        currentUploadSession = null;
+        currentFile = null;
+        hideTransferInfo();
+        showUserMessage('File transfer was rejected by the receiver.');
+        processFileQueue();
+    }
+}
+
+function handleProgressUpdate(progress) {
+    // Update UI with sender's progress
+    if (transferState === TransferState.RECEIVING) {
+        updateProgress(progress.percent);
+        transferStats.bytesTransferred = progress.bytesUploaded;
+    }
+}
+
+function handleUploadComplete(message) {
+    console.log(`✅ Upload complete notification: ${message.fileName}`);
+
+    if (pendingFileOffer && pendingFileOffer.uploadId === message.uploadId) {
+        // Download the file
+        downloadFile(message.uploadId, message.fileName);
+    }
+}
+
+// ============================================================================
+// HTTP DOWNLOAD API (Receiver)
+// ============================================================================
+
+async function downloadFile(uploadId, fileName) {
+    console.log(`📥 Starting download: ${fileName}`);
+
+    await requestWakeLock();
+    transferState = TransferState.RECEIVING;
+
+    try {
+        const response = await fetch(`${HTTP_BASE_URL}/download/${uploadId}`);
+
+        if (!response.ok) {
+            throw new Error(`Download failed: HTTP ${response.status}`);
+        }
+
+        const contentLength = response.headers.get('content-length');
+        const total = parseInt(contentLength, 10) || 0;
+
+        // Read the response as a stream
+        const reader = response.body.getReader();
+        const chunks = [];
+        let received = 0;
+
+        transferStats.startTime = Date.now();
+        transferStats.lastUpdateTime = Date.now();
+
+        showTransferInfo(fileName, total);
+
+        while (true) {
+            const { done, value } = await reader.read();
+
+            if (done) break;
+
+            chunks.push(value);
+            received += value.length;
+
+            // Update progress
+            if (total > 0) {
+                const percent = (received / total) * 100;
+                updateProgress(percent);
+                transferStats.bytesTransferred = received;
+                updateTransferSpeed();
+            }
+        }
+
+        // Create blob and trigger download
+        const blob = new Blob(chunks);
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fileName;
+        a.click();
+        URL.revokeObjectURL(url);
+
+        console.log(`✅ Download complete: ${fileName}`);
+        transferState = TransferState.COMPLETED;
+        showSuccessMessage(fileName);
+
+        // Cleanup
+        pendingFileOffer = null;
+        hideTransferInfo();
+        processNextFileOffer();
+
+    } catch (error) {
+        console.error('❌ Download error:', error);
+        transferState = TransferState.FAILED;
+        showUserMessage(`Download failed: ${error.message}`);
+    } finally {
+        releaseWakeLock();
+    }
+}
+
+// ============================================================================
+// FILE OFFER UI
+// ============================================================================
+
+function showFileOfferUI() {
+    if (pendingFileOfferQueue.length === 0) return;
+
+    const offer = pendingFileOfferQueue[0];
+    pendingFileOffer = offer;
+
+    const transferSection = document.getElementById('transferSection');
+    const dropZone = document.getElementById('dropZone');
+    const fileRequest = document.getElementById('fileRequest');
+    const requestFileName = document.getElementById('requestFileName');
+    const requestFileSize = document.getElementById('requestFileSize');
+
+    if (transferSection) transferSection.style.display = 'block';
+    if (dropZone) dropZone.style.display = 'none';
+    if (fileRequest) fileRequest.style.display = 'block';
+
+    if (requestFileName) {
+        if (pendingFileOfferQueue.length > 1) {
+            requestFileName.textContent = `${offer.fileName} (+${pendingFileOfferQueue.length - 1} more files)`;
         } else {
-            showUserMessage("Connection interrupted. Waiting for reconnection…");
+            requestFileName.textContent = offer.fileName;
         }
-    } else if (currentFile || (receivingFile && receivedBytes > 0)) {
-        showUserMessage("Connection lost. Transfer paused. You can retry or resume when peer reconnects.");
     }
 
-    // Don't clear currentFile or receivingFile - allow user to retry/resume
-    // Just reset transfer stats
-    resetTransferStats();
+    if (requestFileSize) {
+        const totalSize = pendingFileOfferQueue.reduce((sum, o) => sum + o.fileSize, 0);
+        requestFileSize.textContent = formatFileSize(totalSize);
+    }
 }
 
-// DOM Elements
-const roomIdInput = document.getElementById('roomId');
-const createRoomBtn = document.getElementById('createRoomBtn');
-const joinRoomBtn = document.getElementById('joinRoomBtn');
-const leaveRoomBtn = document.getElementById('leaveRoomBtn');
-const roomDisplay = document.getElementById('roomDisplay');
-const currentRoomSpan = document.getElementById('currentRoom');
-const transferSection = document.getElementById('transferSection');
-const dropZone = document.getElementById('dropZone');
-const fileInput = document.getElementById('fileInput');
-const transferInfo = document.getElementById('transferInfo');
-const fileNameEl = document.getElementById('fileName');
-const fileSizeEl = document.getElementById('fileSize');
-const progressFill = document.getElementById('progressFill');
-const progressPercent = document.getElementById('progressPercent');
-const transferSpeed = document.getElementById('transferSpeed');
-const timeRemaining = document.getElementById('timeRemaining');
-const connectionStatus = document.getElementById('connectionStatus');
-const statusIndicator = document.getElementById('statusIndicator');
-const statusText = document.getElementById('statusText');
-const connectionInfo = document.getElementById('connectionInfo');
-const serverUrl = document.getElementById('serverUrl');
-const warningMessage = document.getElementById('warningMessage');
-const receivedFiles = document.getElementById('receivedFiles');
-const fileRequest = document.getElementById('fileRequest');
-const requestFileName = document.getElementById('requestFileName');
-const requestFileSize = document.getElementById('requestFileSize');
-const acceptFileBtn = document.getElementById('acceptFileBtn');
-const rejectFileBtn = document.getElementById('rejectFileBtn');
-const successMessage = document.getElementById('successMessage');
-const successText = document.getElementById('successText');
-const progressLabel = document.getElementById('progressLabel');
-const donateBtn = document.getElementById('donateBtn');
-const donateModal = document.getElementById('donateModal');
-const closeModal = document.getElementById('closeModal');
-const developerAvatar = document.querySelector('.developer-avatar');
-const donationImage = document.querySelector('.donation-image');
+function hideFileOfferUI() {
+    const fileRequest = document.getElementById('fileRequest');
+    const dropZone = document.getElementById('dropZone');
 
-// Initialize
-init();
-
-function init() {
-    setupEventListeners();
-    setupPageUnloadHandler();
-    updateConnectionStatus('disconnected', 'Disconnected');
+    if (fileRequest) fileRequest.style.display = 'none';
+    if (dropZone) dropZone.style.display = 'flex';
 }
 
-function setupEventListeners() {
-    createRoomBtn.addEventListener('click', createRoom);
-    joinRoomBtn.addEventListener('click', () => joinRoom());
-    leaveRoomBtn.addEventListener('click', leaveRoom);
-
-    // Allow Enter key to join room
-    roomIdInput.addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') {
-            e.preventDefault();
-            joinRoom();
-        }
-    });
-
-    dropZone.addEventListener('click', () => fileInput.click());
-    dropZone.addEventListener('dragover', handleDragOver);
-    dropZone.addEventListener('dragleave', handleDragLeave);
-    dropZone.addEventListener('drop', handleDrop);
-    fileInput.addEventListener('change', handleFileSelect);
-
-    // File request buttons
-    if (acceptFileBtn) {
-        acceptFileBtn.addEventListener('click', handleAcceptFile);
-    }
-    if (rejectFileBtn) {
-        rejectFileBtn.addEventListener('click', handleRejectFile);
-    }
-
-    // Donation modal
-    if (donateBtn) {
-        donateBtn.addEventListener('click', () => {
-            if (donateModal && donationImage) {
-                donationImage.src = 'image.png';
-                donationImage.alt = 'Donation';
-                donateModal.style.display = 'flex';
-            }
-        });
-    }
-
-    // Developer avatar modal - clicking avatar opens it in modal
-    if (developerAvatar) {
-        developerAvatar.addEventListener('click', () => {
-            if (donateModal && donationImage) {
-                donationImage.src = 'aiks.jpg';
-                donationImage.alt = 'Developer';
-                donateModal.style.display = 'flex';
-            }
-        });
-        // Add cursor pointer style to indicate it's clickable
-        developerAvatar.style.cursor = 'pointer';
-    }
-
-    if (closeModal) {
-        closeModal.addEventListener('click', () => {
-            if (donateModal) {
-                donateModal.style.display = 'none';
-            }
-        });
-    }
-    // Close modal when clicking outside
-    if (donateModal) {
-        donateModal.addEventListener('click', (e) => {
-            if (e.target === donateModal) {
-                donateModal.style.display = 'none';
-            }
-        });
-    }
-    // Close modal with Escape key
-    document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && donateModal && donateModal.style.display === 'flex') {
-            donateModal.style.display = 'none';
-        }
-    });
-}
-
-// Track if user is intentionally leaving
-let isIntentionallyLeaving = false;
-
-// Page unload handler - show confirmation dialog
-function setupPageUnloadHandler() {
-    // Handle browser back/forward/close
-    window.addEventListener('beforeunload', (e) => {
-        // Only show confirmation if user is already in a room (room exists and WebSocket is connected) and not intentionally leaving
-        if (currentRoom && ws && ws.readyState === WebSocket.OPEN && !isIntentionallyLeaving) {
-            // Standard way to show browser confirmation
-            e.preventDefault();
-            e.returnValue = 'Are you sure you want to leave? This will disconnect you from the room.'; // Chrome requires returnValue to be set
-            return e.returnValue; // Some browsers require return value
-        }
-    });
-
-    // Also handle visibility change (tab switching) - but don't show confirmation
-    document.addEventListener('visibilitychange', () => {
-        // Keep connection alive when tab is hidden
-        if (document.hidden && ws && ws.readyState === WebSocket.OPEN && currentRoom) {
-            // Send a keepalive ping
-            try {
-                ws.send(JSON.stringify({ type: 'ping', room: currentRoom }));
-            } catch (e) {
-                // Ignore errors
-            }
-        }
-
-        // Page visibility handling: reduce window when tab is hidden (prevents Chrome throttling SCTP)
-        if (document.hidden) {
-            const oldWindow = maxInFlightChunks;
-            maxInFlightChunks = Math.min(64, maxInFlightChunks);
-            if (oldWindow !== maxInFlightChunks) {
-                console.log(`📱 Tab hidden - reduced window from ${oldWindow} to ${maxInFlightChunks} to prevent Chrome throttling`);
-            }
+function processNextFileOffer() {
+    if (pendingFileOfferQueue.length > 0) {
+        pendingFileOfferQueue.shift();
+        if (pendingFileOfferQueue.length > 0) {
+            showFileOfferUI();
         } else {
-            // Restore adaptive window when tab becomes visible
-            if (smoothedRTT < 150) {
-                maxInFlightChunks = 384;
-            } else if (smoothedRTT < 300) {
-                maxInFlightChunks = 256;
-            } else {
-                maxInFlightChunks = 128;
-            }
-            if (smoothedRTT > 0) {
-                console.log(`📱 Tab visible - restored window to ${maxInFlightChunks} (RTT: ${smoothedRTT.toFixed(0)}ms)`);
-            }
+            pendingFileOffer = null;
+            hideFileOfferUI();
         }
-    });
+    }
 }
 
-// Room Management
+function handleAcceptFile() {
+    if (!pendingFileOffer) return;
+
+    console.log(`✅ Accepting file: ${pendingFileOffer.fileName}`);
+
+    // Accept all pending files
+    for (const offer of pendingFileOfferQueue) {
+        sendFileAccept(offer.fileId);
+    }
+
+    hideFileOfferUI();
+
+    // Show progress UI for first file
+    transferState = TransferState.RECEIVING;
+    showTransferInfo(pendingFileOffer.fileName, pendingFileOffer.fileSize);
+
+    // Update progress label
+    const progressLabel = document.getElementById('progressLabel');
+    if (progressLabel) {
+        progressLabel.textContent = 'Downloading...';
+    }
+}
+
+function handleRejectFile() {
+    if (!pendingFileOffer) return;
+
+    console.log(`❌ Rejecting files`);
+
+    // Reject all pending files
+    for (const offer of pendingFileOfferQueue) {
+        sendFileReject(offer.fileId);
+    }
+
+    pendingFileOfferQueue = [];
+    pendingFileOffer = null;
+    hideFileOfferUI();
+}
+
+// ============================================================================
+// FILE HANDLING (Sender)
+// ============================================================================
+
+function handleDragOver(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    const dropZone = document.getElementById('dropZone');
+    if (dropZone) dropZone.classList.add('drag-over');
+}
+
+function handleDragLeave(e) {
+    e.preventDefault();
+    const dropZone = document.getElementById('dropZone');
+    if (dropZone) dropZone.classList.remove('drag-over');
+}
+
+function handleDrop(e) {
+    e.preventDefault();
+    e.stopPropagation();
+
+    const dropZone = document.getElementById('dropZone');
+    if (dropZone) dropZone.classList.remove('drag-over');
+
+    const files = e.dataTransfer.files;
+    if (files.length > 0) {
+        addFilesToQueue(Array.from(files));
+    }
+}
+
+function handleFileSelect(e) {
+    const files = e.target.files;
+    if (files.length > 0) {
+        addFilesToQueue(Array.from(files));
+    }
+    e.target.value = '';  // Reset input
+}
+
+async function addFilesToQueue(files) {
+    if (!dataChannel || dataChannel.readyState !== 'open') {
+        showUserMessage('Please wait for peer connection to be established.');
+        return;
+    }
+
+    console.log(`📁 Adding ${files.length} file(s) to queue`);
+
+    for (const file of files) {
+        fileQueue.push(file);
+    }
+
+    if (!isProcessingQueue) {
+        processFileQueue();
+    }
+}
+
+async function processFileQueue() {
+    if (fileQueue.length === 0) {
+        isProcessingQueue = false;
+        return;
+    }
+
+    isProcessingQueue = true;
+    currentFile = fileQueue.shift();
+
+    console.log(`📤 Processing file: ${currentFile.name}`);
+
+    try {
+        // Create upload session
+        const session = await createUploadSession(currentFile);
+
+        // Update progress label
+        const progressLabel = document.getElementById('progressLabel');
+        if (progressLabel) {
+            progressLabel.textContent = 'Uploading...';
+        }
+
+        // Send file offer to peer via WebRTC
+        if (!sendFileOffer(session.uploadId, currentFile)) {
+            throw new Error('Failed to send file offer');
+        }
+
+        // Show waiting UI
+        showTransferInfo(currentFile.name, currentFile.size);
+        updateConnectionStatus('connected', 'Waiting for peer to accept...');
+
+        // Upload will start when peer accepts (handleFileAccepted)
+
+    } catch (error) {
+        console.error('Error processing file:', error);
+        showUserMessage(`Failed to start transfer: ${error.message}`);
+        currentFile = null;
+        processFileQueue();
+    }
+}
+
+// ============================================================================
+// ROOM MANAGEMENT
+// ============================================================================
+
 function createRoom(e) {
-    // Prevent any event from interfering
-    if (e) {
-        e.preventDefault();
-    }
+    if (e) e.preventDefault();
     const roomId = generateRoomId();
-    roomIdInput.value = roomId;
     joinRoom(roomId, true);
 }
 
 function joinRoom(roomId = null, isCreator = false) {
-    // If roomId is provided (from createRoom), use it
-    // Otherwise, use the value from the input field
-    let room;
-    if (roomId && typeof roomId === 'string') {
-        // Only use provided roomId if it's actually a string (not an event object)
-        room = roomId;
-    } else {
-        // Get the value from the input field
-        room = roomIdInput.value.trim();
+    if (!roomId) {
+        const roomIdInput = document.getElementById('roomId');
+        roomId = roomIdInput ? roomIdInput.value.trim() : '';
     }
 
-    if (!room) {
-        alert('Please enter a room ID');
+    if (!roomId) {
+        showUserMessage('Please enter a room ID');
         return;
     }
 
-    // Update the input field to show the actual room being used
-    roomIdInput.value = room;
-    currentRoom = room;
+    console.log(`🚪 Joining room: ${roomId}`);
+    currentRoom = roomId;
     isInitiator = isCreator;
 
     connectWebSocket();
-    showRoomDisplay();
-    updateConnectionStatus('connecting', 'Connecting...');
 }
 
 function leaveRoom() {
-    // Confirm with user
-    if (!confirm('Are you sure you want to leave the room? This will disconnect you from the peer.')) {
-        return;
+    console.log('🚪 Leaving room');
+
+    // Abort any ongoing upload
+    if (uploadAbortController) {
+        uploadAbortController.abort();
     }
 
-    // Mark as intentionally leaving to prevent beforeunload confirmation
-    isIntentionallyLeaving = true;
-
-    // Release wake lock if active
-    releaseWakeLock();
-
-    // Clean up connections
+    // Close WebRTC
     if (dataChannel) {
         dataChannel.close();
         dataChannel = null;
@@ -915,26 +965,23 @@ function leaveRoom() {
         peerConnection.close();
         peerConnection = null;
     }
-    if (ws) {
-        // Send leave message to server
-        try {
-            ws.send(JSON.stringify({ type: 'leave', room: currentRoom }));
-        } catch (e) {
-            // Ignore if already closed
-        }
-        ws.close();
-        ws = null;
+
+    // Notify server
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'leave', room: currentRoom }));
     }
 
+    // Reset state
     currentRoom = null;
-    hideRoomDisplay();
-    updateConnectionStatus('disconnected', 'Disconnected');
-    resetTransferUI();
+    isInitiator = false;
+    fileQueue = [];
+    currentFile = null;
+    transferState = TransferState.IDLE;
 
-    // Reset flag after cleanup
-    setTimeout(() => {
-        isIntentionallyLeaving = false;
-    }, 1000);
+    // Update UI
+    hideRoomDisplay();
+    hideTransferInfo();
+    updateConnectionStatus('disconnected', 'Disconnected');
 }
 
 function generateRoomId() {
@@ -942,31 +989,41 @@ function generateRoomId() {
 }
 
 function showRoomDisplay() {
-    roomDisplay.style.display = 'flex';
-    currentRoomSpan.textContent = currentRoom;
-    transferSection.style.display = 'block';
+    const roomDisplay = document.getElementById('roomDisplay');
+    const currentRoomSpan = document.getElementById('currentRoom');
+    const transferSection = document.getElementById('transferSection');
+
+    if (roomDisplay) roomDisplay.style.display = 'flex';
+    if (currentRoomSpan) currentRoomSpan.textContent = currentRoom;
+    if (transferSection) transferSection.style.display = 'block';
 }
 
 function hideRoomDisplay() {
-    roomDisplay.style.display = 'none';
-    transferSection.style.display = 'none';
+    const roomDisplay = document.getElementById('roomDisplay');
+    const transferSection = document.getElementById('transferSection');
+
+    if (roomDisplay) roomDisplay.style.display = 'none';
+    if (transferSection) transferSection.style.display = 'none';
 }
 
-// WebSocket Signaling
-function connectWebSocket() {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        return; // Already connected
-    }
+// ============================================================================
+// WEBSOCKET (Signaling)
+// ============================================================================
 
-    console.log('Connecting to WebSocket:', WS_URL);
+function connectWebSocket() {
+    console.log(`📡 Connecting to WebSocket: ${WS_URL}`);
     updateConnectionStatus('connecting', 'Connecting to server...');
 
     ws = new WebSocket(WS_URL);
 
     ws.onopen = () => {
-        console.log('WebSocket connected');
-        ws.send(JSON.stringify({ type: 'join', room: currentRoom }));
-        updateConnectionStatus('connecting', 'Connected to server, waiting for peer...');
+        console.log('✅ WebSocket connected');
+        updateConnectionStatus('connecting', 'Connected to server, joining room...');
+
+        ws.send(JSON.stringify({
+            type: 'join',
+            room: currentRoom
+        }));
     };
 
     ws.onmessage = (event) => {
@@ -980,86 +1037,74 @@ function connectWebSocket() {
 
     ws.onerror = (error) => {
         console.error('WebSocket error:', error);
-        updateConnectionStatus('disconnected', 'Server connection failed. Check if server is running.');
+        updateConnectionStatus('disconnected', 'Connection error');
     };
 
-    ws.onclose = (event) => {
-        console.log('WebSocket closed', event.code, event.reason);
-        if (event.code !== 1000) {
-            updateConnectionStatus('disconnected', 'Server disconnected. Check connection.');
-        } else {
-            updateConnectionStatus('disconnected', 'Disconnected');
-        }
+    ws.onclose = () => {
+        console.log('WebSocket closed');
+        updateConnectionStatus('disconnected', 'Disconnected from server');
     };
 }
 
-// Store pending offer/answer if peer connection isn't ready yet
-let pendingOffer = null;
-let pendingAnswer = null;
-
 function handleSignalingMessage(message) {
-    console.log('Received signaling message:', message.type, 'isInitiator:', isInitiator);
     switch (message.type) {
         case 'joined':
-            // When we join, create peer connection (both initiator and non-initiator need it)
-            createPeerConnection();
+            console.log(`✅ Joined room: ${message.room}`);
+            showRoomDisplay();
+            updateConnectionStatus('connecting', 'Waiting for peer...');
+
+            if (isInitiator) {
+                createPeerConnection();
+            }
             break;
+
         case 'peer-joined':
-            // When a peer joins our room
-            console.log('Peer joined! Initiator:', isInitiator, 'Has peerConnection:', !!peerConnection);
+            console.log('👤 Peer joined the room');
+
             if (!peerConnection) {
-                console.log('Peer joined but no peer connection, creating now...');
                 createPeerConnection();
-            } else if (isInitiator) {
-                // If we're initiator and already have connection, create offer if not already sent
-                console.log('Peer joined, ensuring offer is sent...');
-                // Check if we already have a local description (offer was created)
-                if (peerConnection.localDescription) {
-                    console.log('Offer already exists, re-sending...');
-                    ws.send(JSON.stringify({
-                        type: 'offer',
-                        offer: peerConnection.localDescription,
-                        room: currentRoom
-                    }));
-                } else {
-                    console.log('No offer yet, creating now...');
-                    createOffer();
-                }
+            }
+
+            if (isInitiator) {
+                createDataChannel();
+                createOffer();
             }
             break;
+
         case 'offer':
-            // Store offer if peer connection isn't ready yet
-            if (!peerConnection) {
-                console.log('Offer received before peer connection ready, storing...');
-                pendingOffer = message.offer;
-                createPeerConnection();
-            } else {
-                handleOffer(message.offer);
-            }
+            handleOffer(message.offer);
             break;
+
         case 'answer':
-            // Store answer if peer connection isn't ready yet
-            if (!peerConnection) {
-                console.log('Answer received before peer connection ready, storing...');
-                pendingAnswer = message.answer;
-                createPeerConnection();
-            } else {
-                handleAnswer(message.answer);
-            }
+            handleAnswer(message.answer);
             break;
+
         case 'ice-candidate':
             handleIceCandidate(message.candidate);
+            break;
+
+        case 'pong':
+            // Server keepalive response
+            break;
+
+        case 'error':
+            console.error('Server error:', message.message);
+            showUserMessage(message.message);
             break;
     }
 }
 
-// WebRTC Peer Connection
+// ============================================================================
+// WEBRTC (Signaling Only - No File Data)
+// ============================================================================
+
 function createPeerConnection() {
+    console.log('🔗 Creating peer connection');
+
     peerConnection = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
-    // Handle ICE candidates
     peerConnection.onicecandidate = (event) => {
-        if (event.candidate) {
+        if (event.candidate && ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
                 type: 'ice-candidate',
                 candidate: event.candidate,
@@ -1068,138 +1113,32 @@ function createPeerConnection() {
         }
     };
 
-    // Detect connection state changes
     peerConnection.onconnectionstatechange = () => {
-        const state = peerConnection.connectionState;
-        console.log('PeerConnection state changed:', state);
-        if (state === 'connected') {
+        console.log(`🔗 Connection state: ${peerConnection.connectionState}`);
+
+        if (peerConnection.connectionState === 'connected') {
             updateConnectionStatus('connected', 'P2P Connected');
-            checkRelayStatus();
-        } else if (state === 'connecting') {
-            updateConnectionStatus('connecting', 'Connecting to peer...');
-        } else if (state === 'disconnected' || state === 'failed') {
-            updateConnectionStatus('disconnected', 'Connection Lost: ' + state);
+        } else if (peerConnection.connectionState === 'failed') {
+            updateConnectionStatus('disconnected', 'Connection failed');
         }
     };
 
-    // CRITICAL: Listen to ICE & DataChannel lifecycle explicitly
     peerConnection.oniceconnectionstatechange = () => {
-        const state = peerConnection.iceConnectionState;
-        console.warn("ICE connection state:", state);
-        checkRelayStatus();
-
-        if (state === "disconnected") {
-            // Wait before declaring failure - transient disconnections are common, especially for large files
-            // Use longer timeout for large file transfers (200GB+ files need more patience)
-            if (!disconnectedTimer) {
-                // Calculate timeout based on file size - larger files get more time
-                const fileSize = currentFile?.size || receivingFileSize || 0;
-                const fileSizeGB = fileSize / (1024 * 1024 * 1024);
-
-                // Base timeout: 30 seconds for small files, up to 60 seconds for 200GB+ files
-                const baseTimeout = 30000; // 30 seconds base
-                const largeFileTimeout = Math.min(60000, baseTimeout + (fileSizeGB * 150)); // +150ms per GB, max 60s
-                const timeout = fileSizeGB > 1 ? largeFileTimeout : baseTimeout;
-
-                console.log(`⏳ ICE disconnected - waiting ${(timeout / 1000).toFixed(0)}s before action (file: ${(fileSizeGB).toFixed(2)}GB)`);
-
-                disconnectedTimer = setTimeout(async () => {
-                    console.warn("ICE still disconnected after timeout");
-
-                    // OPTIONAL: Try ICE restart before giving up (often saves mobile connections and Render deployments)
-                    try {
-                        console.log("🔄 Attempting ICE restart...");
-                        await peerConnection.restartIce();
-                        console.log("✅ ICE restart initiated");
-                        // Give it more time after restart for large files
-                        const restartTimeout = fileSizeGB > 1 ? 20000 : 15000; // 20s for large files, 15s for small
-                        disconnectedTimer = setTimeout(() => {
-                            console.warn("ICE still disconnected after restart");
-                            handleConnectionLoss("ice-disconnected-timeout");
-                        }, restartTimeout);
-                    } catch (error) {
-                        console.error("❌ ICE restart failed:", error);
-                        handleConnectionLoss("ice-disconnected-timeout");
-                    }
-                }, timeout);
-            }
-        }
-
-        if (state === "connected" || state === "completed") {
-            // Connection recovered - clear timer and reset flags
-            if (disconnectedTimer) {
-                clearTimeout(disconnectedTimer);
-                disconnectedTimer = null;
-                console.log("✅ ICE recovered");
-            }
-
-            // Reset connection lost flag on successful connection
-            connectionLostHandled = false;
-            transferPaused = false; // Resume transfer
-
-            updateConnectionStatus('connecting', 'ICE connected, establishing DataChannel...');
-        }
-
-        if (state === "failed") {
-            // Clear disconnected timer if it exists
-            if (disconnectedTimer) {
-                clearTimeout(disconnectedTimer);
-                disconnectedTimer = null;
-            }
-            // Failed state is definitive - abort transfer
-            handleConnectionLoss("ice-failed");
-        }
+        console.log(`🧊 ICE state: ${peerConnection.iceConnectionState}`);
     };
 
-    // Handle data channel (for receiver)
-    if (!isInitiator) {
-        peerConnection.ondatachannel = (event) => {
-            setupDataChannel(event.channel);
-        };
-    } else {
-        // Create data channel (for sender)
-        createDataChannel();
-    }
-
-    // Create offer if initiator
-    if (isInitiator) {
-        // Small delay to ensure data channel is set up before creating offer
-        setTimeout(() => {
-            createOffer();
-        }, 100);
-    } else {
-        // If we're not the initiator and have a pending offer, handle it now
-        if (pendingOffer) {
-            console.log('Handling pending offer...');
-            const offer = pendingOffer;
-            pendingOffer = null;
-            setTimeout(() => {
-                handleOffer(offer);
-            }, 200); // Delay to ensure connection is ready
-        }
-    }
-
-    // Handle pending answer if we have one
-    if (pendingAnswer) {
-        console.log('Handling pending answer...');
-        const answer = pendingAnswer;
-        pendingAnswer = null;
-        setTimeout(() => {
-            handleAnswer(answer);
-        }, 200);
-    }
+    peerConnection.ondatachannel = (event) => {
+        console.log('📡 Received DataChannel');
+        setupDataChannel(event.channel);
+    };
 }
 
 function createDataChannel() {
-    // 🔴 Fully reliable, ordered delivery - let SCTP handle retransmits
-    // Do NOT set maxRetransmits or maxPacketLifeTime (even as null) - Chrome treats null as "present"
-    // The real fix for send credit exhaustion is: small wire chunks (≤16KB) + yielding + sliding window
-    dataChannel = peerConnection.createDataChannel('fileTransfer', {
+    console.log('📡 Creating DataChannel');
+
+    dataChannel = peerConnection.createDataChannel('control', {
         ordered: true
     });
-
-    console.log('📡 DataChannel created (reliable, ordered)');
-    console.log(`📏 Speed-optimized: ${(CONNECTED_CHUNK_SIZE / 1024).toFixed(0)}KB chunks, ${maxInFlightChunks} max in-flight, ${(HIGH_WATER_MARK / 1024 / 1024).toFixed(0)}MB buffer`);
 
     setupDataChannel(dataChannel);
 }
@@ -1207,178 +1146,29 @@ function createDataChannel() {
 function setupDataChannel(channel) {
     dataChannel = channel;
 
-    // DYNAMIC SLIDING WINDOW: Set bufferedAmountLowThreshold to 1MB for burst-based sending
-    // This enables high-water mark throttling (fill to 4MB, wait for 1MB threshold)
-    channel.bufferedAmountLowThreshold = BACKPRESSURE_THRESHOLD;
-    console.log(`📊 Set bufferedAmountLowThreshold to ${(BACKPRESSURE_THRESHOLD / 1024 / 1024).toFixed(1)}MB (sliding window optimized)`);
-
-    console.log('DataChannel setup. Current state:', channel.readyState);
-
-    // Check if already open
-    if (channel.readyState === 'open') {
-        console.log('DataChannel already open!');
-        updateConnectionStatus('connected', 'P2P Connected');
-    }
-
-    dataChannel.onopen = () => {
-        console.log('✅ DataChannel opened! Ready to transfer files.');
+    channel.onopen = () => {
+        console.log('✅ DataChannel opened (control channel only)');
         updateConnectionStatus('connected', 'P2P Connected - Ready');
-
-        // Start ACK watchdog to detect "looks alive but frozen" states
-        if (!ackWatchdogInterval) {
-            lastAckTime = Date.now();
-            ackWatchdogInterval = setInterval(() => {
-                try {
-                    if (!dataChannel || dataChannel.readyState !== 'open') {
-                        return;
-                    }
-                    // Only watch when we have outstanding in-flight data
-                    const outstanding = totalChunksSent - ackedChunks.size;
-                    if (outstanding <= 0) {
-                        return;
-                    }
-
-                    const now = Date.now();
-                    const sinceLastAck = now - lastAckTime;
-
-                    // If channel is open, buffer is low, but no ACKs for >15s → STALL_DETECTED
-                    if (sinceLastAck > 15000 && dataChannel.bufferedAmount < BACKPRESSURE_THRESHOLD) {
-                        console.warn(`❗ STALL_DETECTED: no ACKs for ${sinceLastAck}ms, outstanding chunks=${outstanding}, bufferedAmount=${dataChannel.bufferedAmount}`);
-                    }
-
-                    // Emergency unstick: if still no ACKs for >20s with low buffer, relax window
-                    if (sinceLastAck > 20000 && dataChannel.bufferedAmount < BACKPRESSURE_THRESHOLD && outstanding > 0) {
-                        console.warn('FORCING WINDOW RELAXATION');
-                        maxInFlightChunks = Math.min(maxInFlightChunks * 2, 512);
-                    }
-
-                    // 🔴 SCTP STALL RECOVERY: If no ACK AND no bufferedAmount growth for 20s, restart DataChannel
-                    const lastBufferedAmount = dataChannel.bufferedAmount || 0;
-                    if (sinceLastAck > 20000 && dataChannel.readyState === 'open' && outstanding > 0) {
-                        // Check if bufferedAmount hasn't changed (SCTP credit exhaustion)
-                        setTimeout(() => {
-                            if (dataChannel && dataChannel.readyState === 'open') {
-                                const currentBufferedAmount = dataChannel.bufferedAmount || 0;
-                                if (Math.abs(currentBufferedAmount - lastBufferedAmount) < 1000) {
-                                    console.warn('🚨 SCTP STALL — no ACKs and no bufferedAmount growth. Restarting DataChannel...');
-                                    try {
-                                        dataChannel.close();
-                                        // Trigger ICE restart and DataChannel recreation
-                                        if (peerConnection) {
-                                            peerConnection.restartIce();
-                                            setTimeout(() => {
-                                                createDataChannel();
-                                            }, 500);
-                                        }
-                                    } catch (err) {
-                                        console.error('Error restarting DataChannel:', err);
-                                    }
-                                }
-                            }
-                        }, 100);
-                    }
-                } catch (err) {
-                    console.warn('ACK watchdog error:', err);
-                }
-            }, 2000);
-        }
-
-        // Reset connection lost flag on successful connection
-        connectionLostHandled = false;
-        transferPaused = false; // Resume transfer
-
-        // 🔴 Pillar 4: Deterministic Resume - On reconnect, request resume from receivedBytes
-        if (receivingFile && receivedBytes > 0 && receivedBytes < receivingFileSize) {
-            console.log(`🔄 Connection restored. Requesting resume from byte ${receivedBytes}/${receivingFileSize}`);
-            transferState = TransferState.RESUMING;
-            try {
-                dataChannel.send(JSON.stringify({
-                    type: 'resume-request',
-                    fileName: receivingFile.name,
-                    offset: receivedBytes
-                }));
-                console.log(`📤 Sent resume request: ${receivingFile.name} from byte ${receivedBytes}`);
-            } catch (error) {
-                console.warn('⚠️ Resume request send failed (non-critical):', error);
-                // Recovery will happen automatically on next send attempt
-            }
-        } else if (transferState === TransferState.PAUSED) {
-            // Was paused, resume transfer
-            transferState = TransferState.TRANSFERRING;
-        } else if (transferState === TransferState.IDLE) {
-            // New connection, ready for new transfer
-            transferState = TransferState.CONNECTING;
-        }
-
-        // CRITICAL: Start keepalive pings to prevent NAT timeouts
-        // This improves long transfers by 30-40% reliability on mobile networks
-        if (keepaliveInterval) {
-            clearInterval(keepaliveInterval);
-        }
-        keepaliveInterval = setInterval(() => {
-            if (dataChannel && dataChannel.readyState === 'open') {
-                try {
-                    dataChannel.send(JSON.stringify({ type: 'ping' }));
-                } catch (error) {
-                    // Ignore ping errors - connection might be closing
-                }
-            } else {
-                // Stop keepalive if channel is not open
-                if (keepaliveInterval) {
-                    clearInterval(keepaliveInterval);
-                    keepaliveInterval = null;
-                }
-            }
-        }, 5000); // Send ping every 5 seconds
-        console.log('🔄 Keepalive pings started (every 5s)');
     };
 
-    // CRITICAL: Listen to DataChannel lifecycle explicitly
-    dataChannel.onclose = () => {
-        console.warn('🔁 DataChannel closed — will recreate on next send');
-        // 🛟 Treat DataChannel as fragile - pause transfer, will recreate on resume
-        pauseTransfer('datachannel-closed');
+    channel.onclose = () => {
+        console.log('📡 DataChannel closed');
+        updateConnectionStatus('disconnected', 'DataChannel closed');
     };
 
-    dataChannel.onerror = (error) => {
+    channel.onerror = (error) => {
         console.error('DataChannel error:', error);
-        updateConnectionStatus('disconnected', 'DataChannel error');
     };
 
-    dataChannel.onmessage = (event) => {
-        handleDataChannelMessage(event);
-    };
-
-    // Log state changes
-    const checkState = () => {
-        if (channel.readyState === 'connecting') {
-            console.log('DataChannel state: connecting...');
-            updateConnectionStatus('connecting', 'Establishing DataChannel...');
-        } else if (channel.readyState === 'open') {
-            console.log('DataChannel state: open');
-        } else if (channel.readyState === 'closing') {
-            console.log('DataChannel state: closing');
-        } else if (channel.readyState === 'closed') {
-            console.log('DataChannel state: closed');
-        }
-    };
-
-    // Check state periodically
-    const stateInterval = setInterval(() => {
-        if (channel.readyState === 'open') {
-            clearInterval(stateInterval);
-        } else {
-            checkState();
-        }
-    }, 500);
+    channel.onmessage = handleDataChannelMessage;
 }
 
 async function createOffer() {
     try {
-        console.log('Creating offer...');
+        console.log('📤 Creating offer');
         const offer = await peerConnection.createOffer();
         await peerConnection.setLocalDescription(offer);
-        console.log('Offer created, sending to peer');
+
         ws.send(JSON.stringify({
             type: 'offer',
             offer: offer,
@@ -1391,15 +1181,17 @@ async function createOffer() {
 
 async function handleOffer(offer) {
     try {
-        console.log('Received offer, creating answer...');
+        console.log('📥 Received offer');
+
         if (!peerConnection) {
-            console.error('No peer connection when receiving offer');
-            return;
+            createPeerConnection();
         }
+
         await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+
         const answer = await peerConnection.createAnswer();
         await peerConnection.setLocalDescription(answer);
-        console.log('Answer created, sending to peer');
+
         ws.send(JSON.stringify({
             type: 'answer',
             answer: answer,
@@ -1412,9 +1204,8 @@ async function handleOffer(offer) {
 
 async function handleAnswer(answer) {
     try {
-        console.log('Received answer, setting remote description...');
+        console.log('📥 Received answer');
         await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
-        console.log('Answer processed successfully');
     } catch (error) {
         console.error('Error handling answer:', error);
     }
@@ -1422,2802 +1213,108 @@ async function handleAnswer(answer) {
 
 async function handleIceCandidate(candidate) {
     try {
-        await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+        if (peerConnection && candidate) {
+            await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+        }
     } catch (error) {
         console.error('Error adding ICE candidate:', error);
     }
 }
 
-function checkRelayStatus() {
-    if (!peerConnection) return;
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
 
-    peerConnection.getStats().then(stats => {
-        let selectedPair = null;
-        let localCandidate = null;
-        let remoteCandidate = null;
+function init() {
+    console.log('🚀 POJO Files - Hybrid Transfer Model');
+    console.log('📡 WebRTC: Signaling & Control');
+    console.log('📤 HTTP: File Data Transfer');
 
-        stats.forEach(report => {
-            if (report.type === 'candidate-pair' && report.selected) {
-                selectedPair = report;
-                if (report.localCandidateId) localCandidate = stats.get(report.localCandidateId);
-                if (report.remoteCandidateId) remoteCandidate = stats.get(report.remoteCandidateId);
+    setupEventListeners();
+    updateConnectionStatus('disconnected', 'Disconnected');
+}
+
+function setupEventListeners() {
+    const createRoomBtn = document.getElementById('createRoomBtn');
+    const joinRoomBtn = document.getElementById('joinRoomBtn');
+    const leaveRoomBtn = document.getElementById('leaveRoomBtn');
+    const roomIdInput = document.getElementById('roomId');
+    const dropZone = document.getElementById('dropZone');
+    const fileInput = document.getElementById('fileInput');
+    const acceptFileBtn = document.getElementById('acceptFileBtn');
+    const rejectFileBtn = document.getElementById('rejectFileBtn');
+    const donateBtn = document.getElementById('donateBtn');
+    const donateModal = document.getElementById('donateModal');
+    const closeModal = document.getElementById('closeModal');
+    const developerAvatar = document.querySelector('.developer-avatar');
+    const donationImage = document.querySelector('.donation-image');
+
+    if (createRoomBtn) createRoomBtn.addEventListener('click', createRoom);
+    if (joinRoomBtn) joinRoomBtn.addEventListener('click', () => joinRoom());
+    if (leaveRoomBtn) leaveRoomBtn.addEventListener('click', leaveRoom);
+
+    if (roomIdInput) {
+        roomIdInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                joinRoom();
             }
         });
-
-        if (selectedPair && localCandidate && remoteCandidate) {
-            const localType = localCandidate.candidateType;
-            const remoteType = remoteCandidate.candidateType;
-            const protocol = localCandidate.protocol || 'unknown';
-
-            console.log(`📡 Connection Mode: ${localType} <-> ${remoteType} (${protocol.toUpperCase()})`);
-
-            const isRelayed = localType === 'relay' || remoteType === 'relay';
-
-            if (isRelayed) {
-                console.warn('⚠️ TURN Relay detected. Throttling transfer to 2.5 MBps to prevent congestion.');
-                currentTargetMbps = 2.5; // Cap to 2.5 MBps for relay
-                updateConnectionStatus('relayed', `Relayed (${protocol.toUpperCase()}) - Speed Capped`);
-                if (warningMessage) warningMessage.style.display = 'flex';
-            } else {
-                console.log('✅ Direct P2P connection detected. Full speed enabled.');
-                currentTargetMbps = TARGET_MBPS; // Restore full speed (5 MBps)
-                const typeInfo = (localType === 'host' && remoteType === 'host') ? 'Local Network' : 'P2P Direct';
-                updateConnectionStatus('connected', `${typeInfo} (${protocol.toUpperCase()})`);
-                if (warningMessage) warningMessage.style.display = 'none';
-            }
-        }
-    }).catch(error => {
-        console.error('❌ Error checking connection stats:', error);
-    });
-}
-
-// File Handling
-function handleDragOver(e) {
-    e.preventDefault();
-    dropZone.classList.add('dragover');
-}
-
-function handleDragLeave(e) {
-    e.preventDefault();
-    dropZone.classList.remove('dragover');
-}
-
-function handleDrop(e) {
-    e.preventDefault();
-    dropZone.classList.remove('dragover');
-
-    const files = e.dataTransfer.files;
-    if (files.length > 0) {
-        if (!dataChannel) {
-            alert('Please wait for peer connection to be established. Status: ' + statusText.textContent);
-            return;
-        }
-        if (dataChannel.readyState !== 'open') {
-            alert('DataChannel is not ready. Current state: ' + dataChannel.readyState + '. Please wait for connection.');
-            return;
-        }
-        // Add all files to queue
-        addFilesToQueue(Array.from(files));
-    }
-}
-
-function handleFileSelect(e) {
-    const files = e.target.files;
-    if (files.length > 0) {
-        if (!dataChannel) {
-            alert('Please wait for peer connection to be established. Status: ' + statusText.textContent);
-            return;
-        }
-        if (dataChannel.readyState !== 'open') {
-            alert('DataChannel is not ready. Current state: ' + dataChannel.readyState + '. Please wait for connection.');
-            return;
-        }
-        // Add all files to queue
-        addFilesToQueue(Array.from(files));
-    }
-    // Reset input to allow selecting same files again
-    e.target.value = '';
-}
-
-// Add files to queue and send all requests at once (bulk)
-function addFilesToQueue(files) {
-    if (!dataChannel) {
-        alert('DataChannel not created yet. Please wait for peer to join.\n\nStatus: ' + statusText.textContent + '\n\nCheck browser console (F12) for details.');
-        return;
     }
 
-    const state = dataChannel.readyState;
-    if (state !== 'open') {
-        const stateNames = {
-            'connecting': 'Connecting',
-            'open': 'Open',
-            'closing': 'Closing',
-            'closed': 'Closed'
-        };
-        alert(`DataChannel is not ready yet.\n\nCurrent state: ${stateNames[state] || state}\nStatus: ${statusText.textContent}\nPeerConnection: ${peerConnection?.connectionState || 'N/A'}\n\nPlease wait for the connection to establish. Check browser console (F12) for details.`);
-        return;
-    }
-
-    // Add all files to queue
-    fileQueue.push(...files);
-    console.log(`Added ${files.length} file(s) to queue. Total in queue: ${fileQueue.length}`);
-
-    // Send all file requests at once (bulk)
-    // CRITICAL: Verify DataChannel is open before sending
-    if (dataChannel.readyState !== 'open') {
-        console.error(`❌ Cannot send file requests: DataChannel state is ${dataChannel.readyState}, not 'open'`);
-        alert(`Cannot send files. DataChannel is not ready (state: ${dataChannel.readyState}). Please wait for connection.`);
-        return;
-    }
-
-    files.forEach((file, index) => {
-        const request = {
-            type: 'file-request',
-            name: file.name,
-            size: file.size,
-            mimeType: file.type,
-            index: index, // Add index for tracking
-            total: files.length // Total files in this batch
-        };
-
-        try {
-            dataChannel.send(JSON.stringify(request));
-            console.log(`📤 File transfer request ${index + 1}/${files.length} sent:`, file.name, `(${formatFileSize(file.size)})`);
-        } catch (error) {
-            console.error(`❌ Error sending file request for ${file.name}:`, error);
-            alert(`Error sending file request: ${error.message}`);
-        }
-    });
-
-    console.log(`✅ All ${files.length} file request(s) sent successfully`);
-
-    // Start processing the first file
-    if (!isProcessingQueue && fileQueue.length > 0) {
-        processFileQueue();
-    }
-}
-
-// Track if all files have been accepted (bulk acceptance)
-let allFilesAccepted = false;
-
-// Process files from queue one by one (after acceptance)
-async function processFileQueue() {
-    if (isProcessingQueue || fileQueue.length === 0) {
-        return;
-    }
-
-    // If we're already waiting for acceptance, don't start another
-    if (currentFile && !allFilesAccepted) {
-        return;
-    }
-
-    isProcessingQueue = true;
-
-    // Get the first file from queue
-    const file = fileQueue[0];
-    currentFile = file;
-
-    // If all files were already accepted, start sending immediately
-    if (allFilesAccepted) {
-        const queueInfo = fileQueue.length > 1 ? ` (${fileQueue.length - 1} more in queue)` : '';
-        showTransferUI(file, `Uploading...${queueInfo}`);
-
-        // Send file metadata FIRST, then start streaming
-        const metadata = {
-            type: 'file-metadata',
-            name: file.name,
-            size: file.size,
-            mimeType: file.type
-        };
-        dataChannel.send(JSON.stringify(metadata));
-        console.log(`📤 Sent file-metadata for: ${file.name}`);
-
-        // Request wake lock to prevent screen sleep during transfer
-        requestWakeLock();
-
-        // Small delay to ensure metadata arrives before chunks
-        setTimeout(() => {
-            streamFile(file);
-        }, 100);
-        return;
-    }
-
-    // Update UI to show queue status (waiting for acceptance)
-    const queueInfo = fileQueue.length > 1 ? ` (${fileQueue.length} files in queue)` : '';
-    const label = `Waiting for acceptance...${queueInfo}`;
-
-    // Hide drop zone, show transfer info (waiting for acceptance)
-    dropZone.style.display = 'none';
-    transferInfo.style.display = 'block';
-    showTransferUI(file, label);
-    resetTransferStats();
-
-    console.log(`Waiting for acceptance of file: ${file.name} (${fileQueue.length} files in queue)`);
-    // Don't resolve here - wait for acceptance and completion
-}
-
-// Legacy function for backward compatibility
-async function handleFile(file) {
-    addFilesToQueue([file]);
-}
-
-// Event-based drain function - prevents CPU spinning
-// Uses bufferedAmountLow event instead of polling
-async function waitForDrain() {
-    if (!dataChannel || dataChannel.readyState !== 'open') {
-        return;
-    }
-
-    if (dataChannel.bufferedAmount < BACKPRESSURE_THRESHOLD) {
-        return; // Already drained
-    }
-
-    // Wait for bufferedAmountLow event
-    return new Promise((resolve) => {
-        const handler = () => {
-            dataChannel.removeEventListener('bufferedamountlow', handler);
-            resolve();
-        };
-        dataChannel.addEventListener('bufferedamountlow', handler);
-
-        // Safety timeout - if event doesn't fire, resolve anyway after 5 seconds
-        setTimeout(() => {
-            dataChannel.removeEventListener('bufferedamountlow', handler);
-            console.warn('⚠️ bufferedAmountLow event timeout, proceeding anyway');
-            resolve();
-        }, 5000);
-    });
-}
-
-// Wait for DataChannel to be open (Rule A: Never read file unless channel is OPEN)
-async function waitForChannelOpen() {
-    if (dataChannel && dataChannel.readyState === 'open') {
-        return;
-    }
-
-    return new Promise((resolve, reject) => {
-        if (!dataChannel) {
-            reject(new Error('DataChannel not created'));
-            return;
-        }
-
-        if (dataChannel.readyState === 'open') {
-            resolve();
-            return;
-        }
-
-        const timeout = setTimeout(() => {
-            dataChannel.removeEventListener('open', handler);
-            reject(new Error('DataChannel open timeout'));
-        }, 15000);
-
-        const handler = () => {
-            clearTimeout(timeout);
-            dataChannel.removeEventListener('open', handler);
-            resolve();
-        };
-
-        dataChannel.addEventListener('open', handler);
-    });
-}
-
-// DataChannel recovery: recreate channel and resume from last ACK (Rule C: Channel failure ≠ transfer failure)
-// Mandatory recovery path (sender side) - resumes from ACK state
-async function recoverDataChannelAndResume() {
-    console.warn('🔁 DataChannel closed — recovering...');
-
-    // Hard rule: old channel is dead
-    try {
-        if (dataChannel) {
-            dataChannel.close();
-        }
-    } catch (err) {
-        // Ignore close errors
-    }
-
-    dataChannel = null;
-
-    // Create new channel
-    if (!peerConnection) {
-        throw new Error('PeerConnection not available for recovery');
-    }
-
-    dataChannel = peerConnection.createDataChannel('fileTransfer', {
-        ordered: true
-    });
-
-    setupDataChannel(dataChannel);
-
-    // Wait until OPEN
-    await new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error('DC_RECOVERY_TIMEOUT')), 15000);
-        dataChannel.onopen = () => {
-            clearTimeout(timeout);
-            console.log('✅ DataChannel recovered');
-            resolve();
-        };
-        dataChannel.onerror = (err) => {
-            clearTimeout(timeout);
-            reject(new Error('DC_RECOVERY_ERROR'));
-        };
-    });
-
-    // Resume from ACK state (ACK state is source of truth - Rule B)
-    senderChunkIndex = highestReceivedAckedChunkIndex + 1;
-    console.log(`▶️ Resuming from chunk ${senderChunkIndex} (last ACKed: ${highestReceivedAckedChunkIndex})`);
-}
-
-// 🔴 SCTP TRANSPORT: Fragment large payloads into 16KB wire chunks to prevent send credit exhaustion
-// This is mandatory for stable transfers on mobile Chrome
-async function frameAndSend(chunkIndex, payload) {
-    let offset = 0;
-    let part = 0;
-    const totalParts = Math.ceil(payload.byteLength / MAX_WIRE_CHUNK);
-
-    while (offset < payload.byteLength) {
-        const size = Math.min(MAX_WIRE_CHUNK, payload.byteLength - offset);
-        const framed = new Uint8Array(8 + size);
-
-        const view = new DataView(framed.buffer);
-        view.setUint32(0, chunkIndex, true);  // chunkIndex (little-endian)
-        view.setUint32(4, part, true);        // part number within chunk (little-endian)
-
-        framed.set(
-            new Uint8Array(payload.slice(offset, offset + size)),
-            8
-        );
-
-        // 🧯 HARD GUARD: Never send when state ≠ open (stop immediately, not catch error)
-        if (!dataChannel || dataChannel.readyState !== 'open') {
-            pauseTransfer('datachannel-not-open');
-            return; // Stop sending immediately
-        }
-
-        if (dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-            await waitForDrain();
-        }
-
-        // 🧯 FIX #1: Hard sender rate limit - wait until canSend() allows it
-        const bytesToSend = framed.buffer.byteLength;
-        while (!canSend(bytesToSend)) {
-            await new Promise(r => setTimeout(r, 1));
-        }
-
-        dataChannel.send(framed.buffer);
-
-        offset += size;
-        part++;
-    }
-
-    if (totalParts > 1) {
-        console.log(`📦 Fragmented chunk #${chunkIndex} into ${totalParts} wire parts (${payload.byteLength} bytes)`);
-    }
-}
-
-// CONSERVATIVE SLIDING WINDOW: Send chunks with high-water mark throttling
-// Fills buffer up to 2MB, then waits for bufferedAmountLow (1MB threshold) to trigger next burst
-async function sendNextQueuedChunk(chunkData, file, isConnected = false) {
-    // 🔴 PROTOCOL: Fixed chunk size per index (use single CHUNK_SIZE for whole transfer)
-    const chunkSize = CONNECTED_CHUNK_SIZE; // INITIAL_CHUNK_SIZE === CONNECTED_CHUNK_SIZE
-
-    // Split chunkData if it's larger than chunkSize
-    const chunks = [];
-    if (chunkData.byteLength > chunkSize) {
-        let offset = 0;
-        while (offset < chunkData.byteLength) {
-            const slice = chunkData.slice(offset, Math.min(offset + chunkSize, chunkData.byteLength));
-            chunks.push(slice);
-            offset += slice.byteLength;
-        }
-    } else {
-        chunks.push(chunkData);
-    }
-
-    // Send chunks in bursts until high-water mark (2MB) or in-flight limit is reached
-    for (const chunk of chunks) {
-        // FAST-PATH: Skip throttling if buffer is very low (speed optimization)
-        const bufferLow = dataChannel.bufferedAmount < (HIGH_WATER_MARK / 4);
-
-        if (!bufferLow) {
-            // HIGH-WATER MARK THROTTLING: Fill buffer up to 16MB before waiting
-            while (dataChannel.bufferedAmount >= HIGH_WATER_MARK) {
-                // Buffer is full - wait for bufferedAmountLow event (4MB threshold)
-                await waitForDrain();
-            }
-        }
-
-        // SLIDING WINDOW: Limit max in-flight chunks (conservative window to prevent SCTP collapse)
-        // Window is driven by ACKs (highest index ever ACKed), not contiguous correctness
-        while ((totalChunksSent - highestReceivedAckedChunkIndex) > maxInFlightChunks) {
-            if (transferAborted) {
-                throw new Error('TRANSFER_ABORTED');
-            }
-            await waitForDrain();
-        }
-
-        // 🧯 HARD GUARD: Never send when state ≠ open (stop immediately, not catch error)
-        if (!dataChannel || dataChannel.readyState !== 'open') {
-            pauseTransfer('datachannel-not-open');
-            return; // Stop sending immediately
-        }
-
-        // ✅ FIX 2: Immutable chunk index - never reuse
-        const chunkIndex = senderChunkIndex++;
-
-        // Track send timestamp for RTT measurement
-        sentAt.set(chunkIndex, performance.now());
-
-        // 🔴 SCTP TRANSPORT: Fragment payload into 16KB wire chunks (prevents send credit exhaustion)
-        const chunkArray = new Uint8Array(chunk);
-        await frameAndSend(chunkIndex, chunkArray.buffer);
-
-        transferStats.chunksSent++;
-        totalChunksSent++;
-        transferStats.bytesTransferred += chunk.byteLength;
-
-        // Update progress
-        const progress = (transferStats.bytesTransferred / file.size) * 100;
-        updateProgress(Math.min(99.9, progress));
-    }
-}
-
-// Wait for receiver ACK with timeout watchdog
-// Prevents infinite hangs if receiver tab closes or browser crashes
-async function waitForAckWithTimeout(fileName, timeout = 30000) {
-    const waitForAck = () => {
-        return new Promise((resolve) => {
-            // Store the previous resolver
-            const previousResolver = fileTransferConfirmationResolver;
-
-            // Set up our resolver
-            fileTransferConfirmationResolver = () => {
-                // Restore previous resolver if it existed
-                if (previousResolver) {
-                    fileTransferConfirmationResolver = previousResolver;
-                } else {
-                    fileTransferConfirmationResolver = null;
-                }
-                resolve();
-            };
-        });
-    };
-
-    return Promise.race([
-        waitForAck(),
-        new Promise((_, reject) =>
-            setTimeout(() => reject(new Error(`ACK timeout for file "${fileName}" after ${timeout}ms. Receiver may have disconnected.`)), timeout)
-        )
-    ]);
-}
-
-async function streamFile(file, startOffset = 0) {
-    // Resume support: startOffset allows resuming from a specific byte position
-    if (startOffset > 0) {
-        console.log(`🔄 Resuming file transfer from offset: ${startOffset} bytes`);
-    }
-
-    if (!file.stream) {
-        // Fallback for browsers without ReadableStream support
-        await streamFileLegacy(file, startOffset);
-        return;
-    }
-
-    fileStream = file.stream();
-    reader = fileStream.getReader(); // Store globally for handleConnectionLoss
-    streamReader = reader; // Also store as streamReader
-
-    // If resuming, skip to the offset
-    // Note: For ReadableStream, we can't easily skip, so we'll read and discard
-    // This is less efficient but works correctly
-    let skippedBytes = 0;
-    if (startOffset > 0) {
-        while (skippedBytes < startOffset) {
-            const { done, value } = await reader.read();
-            if (done) {
-                console.warn(`⚠️ File ended before reaching offset ${startOffset}`);
-                break;
-            }
-            skippedBytes += value.byteLength;
-            if (skippedBytes > startOffset) {
-                // We overshot - we need to keep the remainder for the first chunk
-                // This will be handled in the main loop by adjusting the first read
-                break;
-            }
-        }
-        console.log(`✅ Skipped to offset ${startOffset} (actually skipped ${skippedBytes} bytes)`);
-        // Update transfer stats to reflect the skipped bytes
-        transferStats.bytesTransferred = startOffset;
-    }
-    transferStats.startTime = Date.now();
-    transferStats.lastUpdateTime = Date.now();
-    lastAckTime = Date.now();
-
-    // Track connection state for dynamic chunk sizing
-    let isConnected = dataChannel && dataChannel.readyState === 'open';
-    let connectionEstablishedTime = isConnected ? Date.now() : null;
-
-    // Main sending loop with sliding window
-    while (true) {
-        // CRITICAL: Check if transfer was paused or aborted due to connection loss
-        if (transferPaused || transferAborted) {
-            if (transferAborted) {
-                console.warn('⚠️ Transfer aborted due to connection loss');
-                reader.cancel();
-                throw new Error('TRANSFER_ABORTED');
-            } else {
-                // Transfer paused - wait for reconnection
-                const fileSizeGB = (file.size || 0) / (1024 * 1024 * 1024);
-                const waitTime = fileSizeGB > 10 ? 2000 : 1000;
-
-                console.warn(`⏸️ Transfer paused - waiting for reconnection... (checking every ${waitTime}ms)`);
-
-                // Check if connection is actually restored
-                if (dataChannel && dataChannel.readyState === 'open' && !connectionLostHandled) {
-                    console.log('✅ Connection appears restored, resuming transfer...');
-                    transferPaused = false;
-                    connectionLostHandled = false;
-                    isConnected = true;
-                    connectionEstablishedTime = Date.now();
-                } else {
-                    await new Promise(resolve => setTimeout(resolve, waitTime));
-                    continue;
-                }
-            }
-        }
-
-        // 🧯 HARD GUARD: Never send when state ≠ open (stop immediately, not catch error)
-        if (!dataChannel || dataChannel.readyState !== 'open') {
-            pauseTransfer('datachannel-not-open');
-            return; // Stop sending immediately
-        }
-
-        // Update connection state for dynamic chunk sizing
-        if (!isConnected && dataChannel.readyState === 'open') {
-            isConnected = true;
-            connectionEstablishedTime = Date.now();
-            console.log('✅ Connection established - switching to 128KB chunks');
-        }
-
-        try {
-            let { done, value } = await reader.read();
-
-            // If we overshot during offset skip, adjust the first chunk
-            if (startOffset > 0 && skippedBytes > startOffset && value && !done) {
-                const overshoot = skippedBytes - startOffset;
-                value = value.slice(overshoot);
-                skippedBytes = startOffset;
-            }
-
-            if (done) {
-                console.log('📤 File reading complete.');
-                console.log(`📊 Transfer stats: Bytes: ${transferStats.bytesTransferred}/${file.size}, Chunks sent: ${transferStats.chunksSent}, Chunks queued: ${transferStats.chunksQueued}`);
-
-                // Note: We don't check byte count here because chunks might still be in transit
-                // We'll wait for receiver confirmation instead, which is the authoritative source
-
-                // Verify chunks were sent (warning only, not fatal)
-                if (transferStats.chunksSent !== transferStats.chunksQueued) {
-                    console.warn(`⚠️ Warning: Chunks sent (${transferStats.chunksSent}) != chunks queued (${transferStats.chunksQueued}). Some chunks may have failed.`);
-                }
-
-                // Wait for all buffered data to be sent before marking as complete
-                let bufferWaitAttempts = 0;
-                const MAX_BUFFER_WAIT = 300; // Wait up to 30 seconds
-                while (dataChannel.bufferedAmount > 0 && bufferWaitAttempts < MAX_BUFFER_WAIT) {
-                    if (bufferWaitAttempts % 20 === 0) {
-                        console.log(`⏳ Waiting for buffer to clear. Buffered: ${(dataChannel.bufferedAmount / 1024 / 1024).toFixed(2)} MB (attempt ${bufferWaitAttempts + 1}/${MAX_BUFFER_WAIT})`);
-                    }
-                    await new Promise(resolve => setTimeout(resolve, 100));
-                    bufferWaitAttempts++;
-                }
-
-                if (dataChannel.bufferedAmount > 0) {
-                    console.warn(`⚠️ Buffer still has ${(dataChannel.bufferedAmount / 1024 / 1024).toFixed(2)} MB after waiting, but proceeding`);
-                } else {
-                    console.log('✅ Buffer cleared successfully');
-                }
-
-                // CRITICAL: Wait additional time for data to reach receiver (network latency)
-                // bufferedAmount=0 means data left browser, but it may still be in transit
-                // Calculate wait time based on file size and estimated network speed
-                // For large files, we need more time for data to traverse the network
-                const fileSizeMB = file.size / (1024 * 1024);
-                // Estimate: assume ~5MB/s transfer rate (conservative), add 10 seconds buffer
-                // For very large files, cap at 30 seconds max wait
-                // Much more conservative wait time - ensure all data has time to traverse network
-                // Formula: (fileSizeMB / 2) + 20, minimum 20s, maximum 60s
-                const estimatedWaitSeconds = Math.min(60, Math.max(20, (fileSizeMB / 2) + 20));
-                console.log(`⏳ Waiting ${estimatedWaitSeconds}s for data to reach receiver (network latency, file: ${fileSizeMB.toFixed(2)}MB)...`);
-
-                // Also check DataChannel state periodically during wait
-                let waitAttempts = 0;
-                const maxWaitAttempts = estimatedWaitSeconds * 10; // Check every 100ms
-                while (waitAttempts < maxWaitAttempts) {
-                    if (dataChannel.readyState !== 'open') {
-                        console.error('❌ DataChannel closed during wait! State:', dataChannel.readyState);
-                        alert('Connection lost during file transfer. Please try again.');
-                        return;
-                    }
-                    // Check if buffer filled up again (shouldn't happen, but check anyway)
-                    if (dataChannel.bufferedAmount > 0 && waitAttempts % 50 === 0) {
-                        console.log(`⚠️ Buffer refilled during wait: ${(dataChannel.bufferedAmount / 1024 / 1024).toFixed(2)} MB`);
-                    }
-                    await new Promise(resolve => setTimeout(resolve, 100));
-                    waitAttempts++;
-                }
-
-                // Note: We don't check byte count here - we'll wait for receiver confirmation
-                // The receiver's confirmation is the authoritative source of truth
-                // Byte count mismatches can occur due to chunking overhead or timing, but if receiver confirms, we're good
-
-                // CRITICAL: Wait until buffer is completely empty AND stays empty for a period
-                // This ensures all data has actually been transmitted, not just queued
-                let finalBufferCheckAttempts = 0;
-                let consecutiveEmptyChecks = 0;
-                const FINAL_BUFFER_CHECK = 500; // Check up to 500 times (50 seconds)
-                const REQUIRED_EMPTY_CHECKS = 100; // Buffer must be empty for 10 seconds straight
-
-                console.log('🔍 Starting final buffer verification...');
-                while (finalBufferCheckAttempts < FINAL_BUFFER_CHECK) {
-                    const currentBuffer = dataChannel.bufferedAmount;
-
-                    if (currentBuffer === 0) {
-                        consecutiveEmptyChecks++;
-                        if (consecutiveEmptyChecks >= REQUIRED_EMPTY_CHECKS) {
-                            console.log(`✅ Buffer verified empty for ${(consecutiveEmptyChecks * 0.1).toFixed(1)}s - all data transmitted`);
-                            break;
-                        }
-                    } else {
-                        consecutiveEmptyChecks = 0; // Reset counter if buffer has data
-                        if (finalBufferCheckAttempts % 10 === 0) {
-                            console.log(`🔍 Buffer check: ${(currentBuffer / 1024 / 1024).toFixed(2)} MB still buffered (attempt ${finalBufferCheckAttempts + 1}/${FINAL_BUFFER_CHECK})`);
-                        }
-                    }
-
-                    await new Promise(resolve => setTimeout(resolve, 100));
-                    finalBufferCheckAttempts++;
-                }
-
-                if (dataChannel.bufferedAmount > 0) {
-                    console.error(`❌ CRITICAL: Buffer still has ${(dataChannel.bufferedAmount / 1024 / 1024).toFixed(2)} MB after ${FINAL_BUFFER_CHECK} checks! This data may be lost.`);
-                    console.error(`⚠️ Warning: Some data may not have been transmitted. Receiver may be missing ${(dataChannel.bufferedAmount / 1024 / 1024).toFixed(2)} MB`);
-                } else if (consecutiveEmptyChecks < REQUIRED_EMPTY_CHECKS) {
-                    console.warn(`⚠️ Buffer cleared but didn't stay empty for required duration. Proceeding anyway.`);
-                }
-
-                const actualPercent = (transferStats.bytesTransferred / file.size) * 100;
-                console.log(`📊 Final verification: ${transferStats.bytesTransferred}/${file.size} bytes (${actualPercent.toFixed(2)}%), Buffer: ${dataChannel.bufferedAmount} bytes, Empty checks: ${consecutiveEmptyChecks}/${REQUIRED_EMPTY_CHECKS}`);
-                updateProgress(Math.min(99.9, actualPercent)); // Don't show 100% yet
-
-                // CRITICAL: Flush buffer before sending completion signal
-                // This ensures all chunks are transmitted before signaling completion
-                console.log('🔄 Flushing buffer before sending completion signal...');
-                await waitForDrain();
-                console.log('✅ Buffer flushed - waiting for ACKs before completion signal...');
-
-                // Wait until all chunks have been ACKed by receiver (MNC-grade gating)
-                try {
-                    await waitForAllAcks(totalChunksSent);
-                    console.log(`✅ All chunks ACKed by receiver (${totalChunksSent}/${totalChunksSent})`);
-                } catch (error) {
-                    console.error('❌ Error while waiting for ACKs before completion:', error);
-                    if (error.message === 'TRANSFER_ABORTED') {
-                        console.warn('⚠️ Transfer aborted while waiting for ACKs');
-                        return;
-                    }
-                    alert(`Error waiting for receiver ACKs: ${error.message}`);
-                    return;
-                }
-
-                // CRITICAL: File-end must be delayed until buffer drains
-                // Wait for buffer to drain before sending file-complete
-                console.log('🔄 Final buffer drain before file-complete signal...');
-                await waitForDrain();
-
-                // ✅ FIX 4: SINGLE authoritative file-complete (guard against duplicates)
-                if (fileCompleteSent) {
-                    console.warn('⚠️ file-complete already sent, skipping duplicate');
-                    return;
-                }
-
-                // ✅ FIX 3: Tail chunk MUST be its own index (already handled by senderChunkIndex++)
-                // The last chunk sent already has its own unique index
-
-                // 🔴 Pillar 5: Compute file hash for integrity verification
-                let fileHash = null;
-                try {
-                    const fileBuffer = await file.arrayBuffer();
-                    const hashBuffer = await crypto.subtle.digest('SHA-256', fileBuffer);
-                    const hashArray = Array.from(new Uint8Array(hashBuffer));
-                    fileHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-                    console.log(`🔐 Computed file hash: ${fileHash.substring(0, 16)}...`);
-                } catch (error) {
-                    console.warn('⚠️ Could not compute file hash (non-critical):', error);
-                }
-
-                // ✅ FIX 4: Mark as sent BEFORE sending (prevents race conditions)
-                fileCompleteSent = true;
-
-                // Send completion message with file size, name, and hash
-                console.log('📨 Sending file-complete signal...');
-                try {
-                    dataChannel.send(JSON.stringify({
-                        type: 'file-complete',
-                        size: file.size,
-                        fileName: file.name, // Include file name for proper matching in bulk transfers
-                        hash: fileHash, // 🔴 Pillar 5: Integrity hash
-                        totalChunks: totalChunksSent // ✅ FIX 5: Send total chunks for chunk-based completion
-                    }));
-                    console.log('✅ File-complete signal sent (file:', file.name, ', size:', file.size, 'bytes, chunks:', totalChunksSent, ', hash:', fileHash ? fileHash.substring(0, 16) + '...' : 'none', '). Waiting for receiver confirmation...');
-                } catch (error) {
-                    console.error('❌ Error sending completion signal:', error);
-                    fileCompleteSent = false; // Reset on error
-                    alert('Error sending completion signal: ' + error.message);
-                    return;
-                }
-
-                // Reset ACK tracking for next file
-                ackedChunks.clear();
-                highestReceivedAckedChunkIndex = -1;
-                highestContiguousAckedChunkIndex = -1;
-                totalChunksSent = 0;
-                senderChunkIndex = 0;
-
-                // Wait for receiver confirmation that all bytes were received
-                // Use timeout watchdog to prevent infinite hangs
-                console.log('⏳ Waiting for receiver confirmation that all bytes were received...');
-                try {
-                    await waitForAckWithTimeout(file.name, 30000); // 30 second timeout
-                    console.log('✅ Receiver confirmed file receipt');
-                } catch (error) {
-                    console.error(`❌ ${error.message}`);
-                    // Continue anyway - receiver may have received the file even if ACK was lost
-                    console.warn('⚠️ Proceeding despite ACK timeout - file may have been received');
-                }
-
-                if (dataChannel.readyState !== 'open') {
-                    console.error('❌ DataChannel closed while waiting for confirmation!');
-                    alert('Connection lost while waiting for transfer confirmation.');
-                    return;
-                }
-
-                // Now mark as 100% complete
-                updateProgress(100);
-                setTimeout(() => completeSendingFile(), 500);
-                return;
-            }
-
-            // DYNAMIC SLIDING WINDOW: Send chunk using high-water mark throttling
-            // Uses 16KB initially, then 128KB once connected
-            try {
-                await sendNextQueuedChunk(value, file, isConnected);
-
-                // Log every 100th chunk or when close to completion
-                if (transferStats.chunksSent % 100 === 0 || transferStats.bytesTransferred > file.size * 0.95) {
-                    const chunkSize = isConnected ? CONNECTED_CHUNK_SIZE : INITIAL_CHUNK_SIZE;
-                    console.log(`📤 Sent chunk #${transferStats.chunksSent}: ${chunkSize / 1024}KB chunks. Total: ${transferStats.bytesTransferred}/${file.size} (${((transferStats.bytesTransferred / file.size) * 100).toFixed(1)}%), Buffer: ${(dataChannel.bufferedAmount / 1024 / 1024).toFixed(2)}MB`);
-                }
-            } catch (error) {
-                // Handle connection loss or other errors
-                if (error.message === 'DataChannel closed' || transferAborted) {
-                    if (transferAborted) {
-                        throw new Error('TRANSFER_ABORTED');
-                    } else {
-                        // Connection lost - wait and retry
-                        await new Promise(resolve => setTimeout(resolve, 1000));
-                        continue;
-                    }
-                } else {
-                    throw error;
-                }
-            }
-        } catch (error) {
-            // CRITICAL: Treat connection loss differently from file errors
-            if (error.message === 'TRANSFER_ABORTED' || transferAborted) {
-                console.warn('⚠️ Transfer aborted due to connection loss');
-                // Release wake lock on abort
-                releaseWakeLock();
-                // Don't show error - handleConnectionLoss already showed user-friendly message
-                return;
-            }
-
-            // Release wake lock on error
-            releaseWakeLock();
-            console.error('❌ Error reading file stream:', error);
-            alert('Error reading file: ' + error.message);
-            return;
-        }
-    }
-}
-
-async function streamFileLegacy(file, startOffset = 0) {
-    // Fallback for browsers without ReadableStream support
-    // Resume support: startOffset allows resuming from a specific byte position
-    if (startOffset > 0) {
-        console.log(`🔄 Resuming legacy file transfer from offset: ${startOffset} bytes`);
-    }
-
-    // DYNAMIC SLIDING WINDOW: Use 16KB initially, 128KB once connected
-    let chunkSize = INITIAL_CHUNK_SIZE;
-    let isConnected = dataChannel && dataChannel.readyState === 'open';
-
-    // Reset and initialize transfer stats
-    transferStats.startTime = Date.now();
-    transferStats.lastUpdateTime = Date.now();
-    transferStats.bytesTransferred = startOffset; // Start from offset if resuming
-    transferStats.chunksSent = 0;
-    transferStats.chunksQueued = 0;
-    transferStats.totalChunksExpected = Math.ceil((file.size - startOffset) / chunkSize);
-
-    console.log(`📤 Starting file transfer (legacy): ${file.name} (${(file.size / 1024 / 1024).toFixed(2)}MB), Expected chunks: ~${transferStats.totalChunksExpected}`);
-    let offset = startOffset; // Resume from startOffset if provided
-
-    transferStats.startTime = Date.now();
-    transferStats.lastUpdateTime = Date.now();
-    lastAckTime = Date.now();
-    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-    while (offset < file.size) {
-        // Paused or aborted?
-        if (transferPaused || transferAborted) {
-            if (transferAborted) {
-                console.warn('⚠️ Transfer aborted - stopping legacy transfer');
-                return;
-            }
-
-            const fileSizeGB = (file.size || 0) / (1024 * 1024 * 1024);
-            const waitTime = fileSizeGB > 10 ? 2000 : 1000;
-
-            if (dataChannel && dataChannel.readyState === 'open' && !connectionLostHandled) {
-                console.log('✅ Connection appears restored, resuming legacy transfer...');
-                transferPaused = false;
-                connectionLostHandled = false;
-                isConnected = true;
-                chunkSize = CONNECTED_CHUNK_SIZE;
-            } else {
-                console.warn(`⏸️ Transfer paused - waiting for reconnection... (checking in ${waitTime}ms)`);
-                await sleep(waitTime);
-                continue;
-            }
-        }
-
-        // 🧯 HARD GUARD: Never send when state ≠ open (stop immediately, not catch error)
-        if (!dataChannel || dataChannel.readyState !== 'open') {
-            pauseTransfer('datachannel-not-open');
-            return; // Stop sending immediately
-        }
-
-        // Update connection state for dynamic chunk sizing
-        if (!isConnected && dataChannel.readyState === 'open') {
-            isConnected = true;
-            chunkSize = CONNECTED_CHUNK_SIZE;
-            console.log('✅ Connection established - switching to 128KB chunks (legacy)');
-        }
-
-        // High-water mark throttling
-        if (dataChannel.bufferedAmount >= HIGH_WATER_MARK) {
-            await waitForDrain();
-            continue;
-        }
-
-        const blob = file.slice(offset, offset + chunkSize);
-        let chunk;
-        try {
-            const arrayBuffer = await blob.arrayBuffer();
-            chunk = new Uint8Array(arrayBuffer);
-        } catch (error) {
-            console.error('Error reading blob:', error);
-            alert('Error reading file');
-            return;
-        }
-
-        const chunkLength = chunk.length;
-        transferStats.chunksQueued++;
-
-        // Backpressure-aware send loop (no recursion)
-        let sendSuccess = false;
-        let retryCount = 0;
-        const MAX_RETRIES = 20;
-
-        while (!sendSuccess && retryCount < MAX_RETRIES) {
-            if (transferPaused || transferAborted) {
-                if (transferAborted) {
-                    return;
-                }
-                const fileSizeGB = (file.size || 0) / (1024 * 1024 * 1024);
-                const waitTime = fileSizeGB > 10 ? 2000 : 1000;
-                await sleep(waitTime);
-                continue;
-            }
-
-            if (dataChannel.readyState !== 'open') {
-                const dcState = dataChannel.readyState;
-                const wsConnected = ws && ws.readyState === WebSocket.OPEN;
-                const pcState = peerConnection?.connectionState;
-
-                if (dcState === 'closed' && (!wsConnected || pcState === 'failed')) {
-                    handleConnectionLoss("datachannel-closed");
-                    if (transferAborted) {
-                        return;
-                    }
-                } else {
-                    console.log(`⏳ DataChannel state: ${dcState}. Waiting for recovery...`);
-                }
-                await sleep(1000);
-                continue;
-            }
-
-            // Event-based backpressure handling
-            if (dataChannel.bufferedAmount > BACKPRESSURE_THRESHOLD || dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-                await waitForDrain();
-                continue;
-            }
-
-            try {
-                // 🔴 SCTP TRANSPORT: Fragment large chunks and yield after each send
-                const chunkIndex = senderChunkIndex++;
-                await frameAndSend(chunkIndex, chunk.buffer);
-                sendSuccess = true;
-            } catch (error) {
-                if (error.message && (error.message.includes('queue is full') || error.message.includes('send queue'))) {
-                    retryCount++;
-                    console.warn(`Send queue full (attempt ${retryCount}/${MAX_RETRIES}), buffered: ${(dataChannel.bufferedAmount / 1024 / 1024).toFixed(2)}MB`);
-                    if (retryCount < MAX_RETRIES) {
-                        await sleep(200);
-                        continue;
-                    }
-                } else {
-                    console.error('Error sending chunk:', error);
-                }
-            }
-        }
-
-        if (!sendSuccess) {
-            console.error(`Failed to send chunk after ${MAX_RETRIES} retries. Buffer: ${(dataChannel.bufferedAmount / 1024 / 1024).toFixed(2)}MB`);
-            releaseWakeLock();
-            alert(`Failed to send chunk after ${MAX_RETRIES} retries. Transfer may be incomplete.`);
-            return;
-        }
-
-        transferStats.chunksSent++;
-        transferStats.bytesTransferred += chunkLength;
-        offset += chunkLength;
-
-        if (transferStats.chunksSent % 100 === 0 || transferStats.bytesTransferred > file.size * 0.95) {
-            console.log(`📤 Sent chunk #${transferStats.chunksSent}: ${chunkLength} bytes. Total: ${transferStats.bytesTransferred}/${file.size} (${((transferStats.bytesTransferred / file.size) * 100).toFixed(1)}%)`);
-        }
-
-        const progress = (transferStats.bytesTransferred / file.size) * 100;
-        updateProgress(Math.min(99.9, progress));
-
-        // Speed optimization: removed artificial yield - let SCTP + browser scheduler handle fairness
-    }
-
-    console.log('📤 File reading complete (legacy).');
-    console.log(`📊 Transfer stats: Bytes: ${transferStats.bytesTransferred}/${file.size}, Chunks sent: ${transferStats.chunksSent}, Chunks queued: ${transferStats.chunksQueued}`);
-
-    if (transferStats.chunksSent !== transferStats.chunksQueued) {
-        console.warn(`⚠️ Warning: Chunks sent (${transferStats.chunksSent}) != chunks queued (${transferStats.chunksQueued}). Some chunks may have failed.`);
-    }
-
-    let bufferWaitAttempts = 0;
-    const MAX_BUFFER_WAIT = 300; // Wait up to 30 seconds
-
-    while (dataChannel.bufferedAmount > 0 && bufferWaitAttempts < MAX_BUFFER_WAIT) {
-        if (bufferWaitAttempts % 20 === 0) {
-            console.log(`⏳ Waiting for buffer to clear. Buffered: ${(dataChannel.bufferedAmount / 1024 / 1024).toFixed(2)} MB (attempt ${bufferWaitAttempts + 1}/${MAX_BUFFER_WAIT})`);
-        }
-        bufferWaitAttempts++;
-        await sleep(100);
-    }
-
-    if (dataChannel.bufferedAmount > 0) {
-        console.warn(`⚠️ Buffer still has ${(dataChannel.bufferedAmount / 1024 / 1024).toFixed(2)} MB after waiting, but proceeding`);
-    } else {
-        console.log('✅ Buffer cleared successfully');
-    }
-
-    const fileSizeMB = file.size / (1024 * 1024);
-    const estimatedWaitSeconds = Math.min(30, Math.max(10, (fileSizeMB / 5) + 10));
-    console.log(`⏳ Waiting ${estimatedWaitSeconds}s for data to reach receiver (network latency, file: ${fileSizeMB.toFixed(2)}MB)...`);
-
-    let waitAttempts = 0;
-    const maxWaitAttempts = estimatedWaitSeconds * 10; // Check every 100ms
-    while (waitAttempts < maxWaitAttempts) {
-        if (dataChannel.readyState !== 'open') {
-            console.error('❌ DataChannel closed during wait! State:', dataChannel.readyState);
-            alert('Connection lost during file transfer. Please try again.');
-            return;
-        }
-        if (dataChannel.bufferedAmount > 0 && waitAttempts % 50 === 0) {
-            console.log(`⚠️ Buffer refilled during wait: ${(dataChannel.bufferedAmount / 1024 / 1024).toFixed(2)} MB`);
-        }
-        await sleep(100);
-        waitAttempts++;
-    }
-
-    let finalBufferCheckAttempts = 0;
-    let consecutiveEmptyChecks = 0;
-    const FINAL_BUFFER_CHECK = 500;
-    const REQUIRED_EMPTY_CHECKS = 100;
-
-    console.log('🔍 Starting final buffer verification...');
-    while (finalBufferCheckAttempts < FINAL_BUFFER_CHECK) {
-        const currentBuffer = dataChannel.bufferedAmount;
-        if (currentBuffer === 0) {
-            consecutiveEmptyChecks++;
-            if (consecutiveEmptyChecks >= REQUIRED_EMPTY_CHECKS) {
-                console.log(`✅ Buffer verified empty for ${(consecutiveEmptyChecks * 0.1).toFixed(1)}s - all data transmitted`);
-                break;
-            }
-        } else {
-            consecutiveEmptyChecks = 0;
-            if (finalBufferCheckAttempts % 10 === 0) {
-                console.log(`🔍 Buffer check: ${(currentBuffer / 1024 / 1024).toFixed(2)} MB still buffered (attempt ${finalBufferCheckAttempts + 1}/${FINAL_BUFFER_CHECK})`);
-            }
-        }
-        await sleep(100);
-        finalBufferCheckAttempts++;
-    }
-
-    if (dataChannel.bufferedAmount > 0) {
-        console.error(`❌ CRITICAL: Buffer still has ${(dataChannel.bufferedAmount / 1024 / 1024).toFixed(2)} MB after ${FINAL_BUFFER_CHECK} checks! This data may be lost.`);
-        console.error(`⚠️ Warning: Some data may not have been transmitted. Receiver may be missing ${(dataChannel.bufferedAmount / 1024 / 1024).toFixed(2)} MB`);
-    } else if (consecutiveEmptyChecks < REQUIRED_EMPTY_CHECKS) {
-        console.warn(`⚠️ Buffer cleared but didn't stay empty for required duration. Proceeding anyway.`);
-    }
-
-    const actualPercent = (transferStats.bytesTransferred / file.size) * 100;
-    console.log(`📊 Final verification: ${transferStats.bytesTransferred}/${file.size} bytes (${actualPercent.toFixed(2)}%), Buffer: ${dataChannel.bufferedAmount} bytes, Empty checks: ${consecutiveEmptyChecks}/${REQUIRED_EMPTY_CHECKS}`);
-    updateProgress(Math.min(99.9, actualPercent));
-
-    console.log('🔄 Flushing buffer before sending completion signal...');
-    await waitForDrain();
-    console.log('✅ Buffer flushed - waiting for ACKs before completion signal...');
-
-    // Wait until all chunks have been ACKed by receiver (MNC-grade gating)
-    try {
-        await waitForAllAcks(totalChunksSent);
-        console.log(`✅ All chunks ACKed by receiver (${totalChunksSent}/${totalChunksSent})`);
-    } catch (error) {
-        console.error('❌ Error while waiting for ACKs before completion:', error);
-        if (error.message === 'TRANSFER_ABORTED') {
-            console.warn('⚠️ Transfer aborted while waiting for ACKs');
-            return;
-        }
-        alert(`Error waiting for receiver ACKs: ${error.message}`);
-        return;
-    }
-
-    console.log('🔄 Final buffer drain before file-complete signal...');
-    await waitForDrain();
-
-    if (fileCompleteSent) {
-        console.warn('⚠️ file-complete already sent, skipping duplicate');
-        return;
-    }
-
-    let fileHash = null;
-    try {
-        const fileBuffer = await file.arrayBuffer();
-        const hashBuffer = await crypto.subtle.digest('SHA-256', fileBuffer);
-        const hashArray = Array.from(new Uint8Array(hashBuffer));
-        fileHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-        console.log(`🔐 Computed file hash: ${fileHash.substring(0, 16)}...`);
-    } catch (error) {
-        console.warn('⚠️ Could not compute file hash (non-critical):', error);
-    }
-
-    fileCompleteSent = true;
-
-    console.log('📨 Sending file-complete signal...');
-    try {
-        dataChannel.send(JSON.stringify({
-            type: 'file-complete',
-            size: file.size,
-            fileName: file.name,
-            hash: fileHash
-        }));
-        console.log('✅ File-complete signal sent (file:', file.name, ', size:', file.size, 'bytes, hash:', fileHash ? fileHash.substring(0, 16) + '...' : 'none', '). Waiting for receiver confirmation...');
-    } catch (error) {
-        console.error('❌ Error sending completion signal:', error);
-        fileCompleteSent = false;
-        alert('Error sending completion signal: ' + error.message);
-        return;
-    }
-
-    ackedChunks.clear();
-    highestReceivedAckedChunkIndex = -1;
-    highestContiguousAckedChunkIndex = -1;
-    totalChunksSent = 0;
-    senderChunkIndex = 0;
-
-    console.log('⏳ Waiting for receiver confirmation that all bytes were received...');
-    try {
-        await waitForAckWithTimeout(file.name, 30000);
-        console.log('✅ Receiver confirmed file receipt');
-    } catch (error) {
-        console.error(`❌ ${error.message}`);
-        console.warn('⚠️ Proceeding despite ACK timeout - file may have been received');
-    }
-
-    if (dataChannel.readyState !== 'open') {
-        console.error('❌ DataChannel closed while waiting for confirmation!');
-        alert('Connection lost while waiting for transfer confirmation.');
-        return;
-    }
-
-    updateProgress(100);
-    setTimeout(() => completeSendingFile(), 500);
-}
-
-// Data Channel Message Handling (Receiver)
-// 🔴 Step 1: Single authoritative counter
-let receivingFile = null;
-let receivedBytes = 0; // SINGLE SOURCE OF TRUTH - only incremented when chunks arrive
-let expectedFileSize = 0; // Set from file-complete signal
-let fileCompleteSignalReceived = false;
-
-// Keep these for IndexedDB storage (but don't use for completion logic)
-let receivingFileSize = 0; // For UI display
-let currentChunkIndex = 0; // Track current chunk index for IndexedDB
-let lastChunkReceivedTime = null;
-let allBytesReceivedTime = null; // Track when we first received all bytes
-
-// 🔹 Deterministic state machine (replaces overlapping booleans)
-const TransferState = {
-    IDLE: 'IDLE',
-    CONNECTING: 'CONNECTING',
-    TRANSFERRING: 'TRANSFERRING',
-    PAUSED: 'PAUSED',
-    RESUMING: 'RESUMING',
-    COMPLETED: 'COMPLETED',
-    FAILED: 'FAILED'
-};
-let transferState = TransferState.IDLE;
-
-// 🔴 Pillar 5: Integrity verification
-let receivedHash = null; // SHA-256 hash computed during receive
-let expectedHash = null; // Final hash from sender
-
-function handleDataChannelMessage(event) {
-    const data = event.data;
-
-    // DEBUG: Log ALL incoming messages to help diagnose issues
-    console.log('📥 DataChannel message received:', typeof data === 'string' ? data.substring(0, 100) : `Binary data (${data.byteLength} bytes)`);
-
-    // Check if it's a JSON message (metadata or control)
-    if (typeof data === 'string') {
-        let message;
-        try {
-            message = JSON.parse(data);
-            console.log('📨 Parsed message type:', message.type, message);
-        } catch (parseError) {
-            console.error('❌ Failed to parse JSON message:', parseError);
-            console.error('❌ Raw message data:', data);
-            return; // Don't process invalid JSON
-        }
-
-        if (!message || !message.type) {
-            console.error('❌ Message missing type field:', message);
-            return;
-        }
-
-        if (message.type === 'ping') {
-            // Receiver ignores ping - just acknowledge it's received
-            // This keeps the connection alive
-            return;
-        } else if (message.type === 'slowDown') {
-            // Receiver-driven flow control: reduce window immediately
-            maxInFlightChunks = Math.max(64, Math.floor(maxInFlightChunks / 2));
-            console.log(`⚠️ Receiver requested slowDown. Window reduced to ${maxInFlightChunks}`);
-            return;
-        } else if (message.type === 'speedUp') {
-            // Receiver-driven flow control: increase window gradually
-            maxInFlightChunks = Math.min(512, Math.floor(maxInFlightChunks * 1.5));
-            console.log(`✅ Receiver requested speedUp. Window increased to ${maxInFlightChunks}`);
-            return;
-        } else if (message.type === 'reduce-rate') {
-            // 🛠️ FIX #4: SCTP throttling detected - reduce send rate immediately
-            reduceSendRate();
-            return;
-        } else if (message.type === 'chunk-ack') {
-            // ✅ Sender receives cumulative ACK from receiver:
-            // - highestReceivedChunkIndex: highest index ever received (may have gaps)
-            // - highestContiguousChunkIndex: highest contiguous index where all [0..N] exist on receiver
-            const highestReceived = message.highestReceivedChunkIndex;
-            const highestContiguous = message.highestContiguousChunkIndex;
-
-            // Progress (window) is driven by highestReceived
-            if (highestReceived !== undefined && highestReceived !== null) {
-                if (highestReceived > highestReceivedAckedChunkIndex) {
-                    // Update RTT: find oldest unacked chunk that's now ACKed
-                    for (let i = highestReceivedAckedChunkIndex + 1; i <= highestReceived; i++) {
-                        if (sentAt.has(i)) {
-                            const rtt = performance.now() - sentAt.get(i);
-                            // Exponential moving average
-                            smoothedRTT = smoothedRTT === 0
-                                ? rtt
-                                : smoothedRTT * (1 - RTT_ALPHA) + rtt * RTT_ALPHA;
-                            sentAt.delete(i); // Clean up old entries
-                        }
-                    }
-
-                    highestReceivedAckedChunkIndex = highestReceived;
-                    lastAckTime = Date.now();
-
-                    // RTT-aware adaptive window (capped at conservative limits)
-                    if (smoothedRTT < 150) {
-                        maxInFlightChunks = Math.min(32, 24 * 1.5); // Cap at 32
-                    } else if (smoothedRTT < 300) {
-                        maxInFlightChunks = 24; // Base limit
-                    } else {
-                        maxInFlightChunks = Math.max(16, 24 * 0.75); // Lower for high RTT
-                    }
-                }
-            }
-
-            // Integrity (contiguous) is tracked separately for final validation
-            if (highestContiguous !== undefined && highestContiguous !== null) {
-                if (highestContiguous > highestContiguousAckedChunkIndex) {
-                    // Mark all contiguous chunks up to highestContiguous as ACKed
-                    for (let i = highestContiguousAckedChunkIndex + 1; i <= highestContiguous; i++) {
-                        ackedChunks.add(i);
-                    }
-                    highestContiguousAckedChunkIndex = highestContiguous;
-                    ackedChunkCount = ackedChunks.size;
-                }
-
-                // Log every 100th contiguous ACK to avoid spam
-                if (highestContiguous % 100 === 0) {
-                    console.log(`✅ Received windowed ACK (contiguous) up to chunk #${highestContiguous} (acked: ${ackedChunkCount})`);
-                }
-            }
-            return;
-        } else if (message.type === 'resume' || message.type === 'resume-request') {
-            // 🔴 Pillar 4: Deterministic Resume - Sender receives resume request from receiver
-            console.log(`🔄 Resume request received: ${message.fileName} from offset ${message.offset}`);
-
-            // 🔹 Idempotent handler
-            if (transferState === TransferState.COMPLETED) {
-                console.log('⚠️ Resume request ignored - transfer already completed');
-                return;
-            }
-
-            // Find the file in queue or current file
-            let fileToResume = null;
-            if (currentFile && currentFile.name === message.fileName) {
-                fileToResume = currentFile;
-            } else {
-                // Search in queue
-                fileToResume = fileQueue.find(f => f.name === message.fileName);
-            }
-
-            if (fileToResume && message.offset < fileToResume.size) {
-                console.log(`✅ Resuming file: ${message.fileName} from byte ${message.offset}`);
-                transferState = TransferState.RESUMING;
-
-                // Reset transfer stats but keep offset
-                resetTransferStats();
-                transferStats.bytesTransferred = message.offset;
-
-                // Resume streaming from offset
-                if (fileToResume === currentFile) {
-                    // Current file - resume it
-                    streamFile(fileToResume, message.offset);
-                } else {
-                    // File in queue - move to current and resume
-                    currentFile = fileToResume;
-                    streamFile(fileToResume, message.offset);
-                }
-
-                transferState = TransferState.TRANSFERRING;
-            } else {
-                console.warn(`⚠️ Cannot resume: file not found or invalid offset`);
-            }
-            return;
-        } else if (message.type === 'file-request') {
-            console.log('📨 Received file-request message:', message);
-            console.log('🔍 About to call handleFileRequest. Current state:', {
-                transferSection: !!transferSection,
-                fileRequest: !!fileRequest,
-                requestFileName: !!requestFileName,
-                acceptFileBtn: !!acceptFileBtn,
-                rejectFileBtn: !!rejectFileBtn,
-                pendingFileRequestsQueueLength: pendingFileRequestsQueue.length
-            });
-            handleFileRequest(message);
-        } else if (message.type === 'file-accepted') {
-            handleFileAccepted();
-        } else if (message.type === 'file-rejected') {
-            handleFileRejected();
-        } else if (message.type === 'file-metadata') {
-            // Reset any previous file state before starting new file
-            if (receivingFile) {
-                console.warn('⚠️ Received file-metadata while still receiving previous file. Resetting...');
-                // Clean up previous file from IndexedDB
-                deleteFileFromIndexedDB(receivingFile.name).catch(err => console.error('Error cleaning up:', err));
-                deleteFileMetadataFromLocalStorage(receivingFile.name);
-                receivingFile = null;
-                receivingFileSize = 0;
-                receivedBytes = 0;
-                currentChunkIndex = 0;
-            }
-            // Check if this is a resume (metadata includes offset)
-            const resumeOffset = message.resumeOffset || 0;
-            startReceivingFile(message, resumeOffset);
-        } else if (message.type === 'file-complete') {
-            // 🔴 Step 4: On file-complete signal
-            // 🔹 Idempotent handler
-            if (transferState === TransferState.COMPLETED) {
-                console.log('⚠️ File-complete signal ignored - already completed');
-                return;
-            }
-
-            const signalFileName = message.fileName || null;
-            const signalFileSize = message.size || null;
-            const signalHash = message.hash || null; // 🔴 Pillar 5: Integrity hash from sender
-
-            // Verify signal matches current file
-            if (receivingFile) {
-                const nameMatches = signalFileName && signalFileName === receivingFile.name;
-                const sizeMatches = signalFileSize && signalFileSize === receivingFileSize;
-
-                if (!nameMatches && !sizeMatches && signalFileSize) {
-                    console.warn(`⚠️ File-complete signal ignored: size ${signalFileSize} doesn't match current file "${receivingFile.name}" (${receivingFileSize} bytes).`);
-                    return;
-                }
-
-                console.log(`📨 File-complete signal received for "${receivingFile.name}". Expected size: ${signalFileSize || receivingFileSize} bytes`);
-
-                // Store expected hash for integrity verification
-                if (signalHash) {
-                    expectedHash = signalHash;
-                    console.log(`🔐 Expected hash: ${signalHash.substring(0, 16)}...`);
-                }
-            } else {
-                console.warn(`⚠️ File-complete signal received but no active file transfer. Ignoring.`);
-                return;
-            }
-
-            // Set expected size and signal flag
-            expectedFileSize = signalFileSize || receivingFileSize;
-            fileCompleteSignalReceived = true;
-
-            // ✅ FIX 5: Store expected total chunks from sender
-            if (message.totalChunks !== undefined && message.totalChunks > 0) {
-                expectedTotalChunks = message.totalChunks;
-                console.log(`📊 Expected total chunks: ${expectedTotalChunks}`);
-            } else {
-                // Estimate from file size if not provided
-                expectedTotalChunks = Math.ceil(expectedFileSize / CONNECTED_CHUNK_SIZE);
-                console.log(`📊 Estimated total chunks: ${expectedTotalChunks} (from size)`);
-            }
-
-            // Check completion immediately
-            checkAndCompleteFile();
-        } else if (message.type === 'file-received-confirmed') {
-            // Sender receives this confirmation from receiver
-            console.log(`✅ Received confirmation from receiver: ${message.bytesReceived || 'all'} bytes received (expected: ${message.expectedBytes || 'unknown'})`);
-
-            // Trust the receiver's confirmation - if receiver says all bytes received, mark as success
-            if (fileTransferConfirmationResolver) {
-                fileTransferConfirmationResolver();
-                fileTransferConfirmationResolver = null;
-            }
-
-            // Ensure completion is triggered - don't check byte counts, receiver confirmed success
-            if (currentFile) {
-                setTimeout(() => {
-                    completeSendingFile();
-                }, 500);
-            }
-        } else {
-            // Unknown message type - log it for debugging
-            console.warn('⚠️ Unknown message type received:', message.type, message);
-        }
-        return;
-    }
-
-    // Handle binary file data - ONLY if we're actively receiving a file
-    // This prevents chunks from being processed before file metadata arrives
-    if (receivingFile && receivingFileSize > 0) {
-        // 🔴 SCTP FRAGMENTATION: Binary chunk framing: 8-byte header (chunkIndex: 4 bytes LE, part: 4 bytes LE), then payload
-        const processBinary = (buffer) => {
-            if (!buffer || buffer.byteLength <= 8) {
-                console.warn('⚠️ Received binary data too small to contain header, ignoring');
-                return;
-            }
-            const view = new DataView(buffer);
-            const chunkIndex = view.getUint32(0, true);
-            const part = view.getUint32(4, true);
-            const payload = buffer.slice(8);
-
-            // 🛠️ FIX #4: Detect SCTP throttling early - if binary data < 32KB repeatedly, signal sender
-            // Track small binary data count (outside function scope for persistence)
-            if (typeof window.smallBinaryCount === 'undefined') {
-                window.smallBinaryCount = 0;
-            }
-            const SMALL_BINARY_THRESHOLD = 32 * 1024; // 32KB
-            if (payload.byteLength < SMALL_BINARY_THRESHOLD) {
-                window.smallBinaryCount++;
-                if (window.smallBinaryCount >= 5) {
-                    // Signal sender to reduce rate immediately (do not wait for ACK timeout)
-                    if (dataChannel && dataChannel.readyState === 'open') {
-                        try {
-                            dataChannel.send(JSON.stringify({ type: 'reduce-rate' }));
-                            console.warn('⚠️ SCTP throttling detected - signaling sender to reduce rate');
-                            window.smallBinaryCount = 0; // Reset counter
-                        } catch (err) {
-                            // Non-critical
-                        }
-                    }
-                }
-            } else {
-                window.smallBinaryCount = 0; // Reset on normal-sized data
-            }
-
-            // Reassemble fragmented chunks
-            if (!chunkFragments.has(chunkIndex)) {
-                chunkFragments.set(chunkIndex, new Map());
-            }
-            const parts = chunkFragments.get(chunkIndex);
-            parts.set(part, payload);
-
-            // Check if we have all parts: look for consecutive parts starting from 0
-            // Since sender sends parts sequentially, if we have part N and not part N+1, we're complete
-            let isComplete = false;
-            let consecutiveParts = 0;
-            while (parts.has(consecutiveParts)) {
-                consecutiveParts++;
-            }
-            // If we have consecutive parts from 0 and the next part doesn't exist, we're complete
-            // (This works because sender sends parts sequentially and we receive them in order)
-            if (consecutiveParts > 0 && !parts.has(consecutiveParts)) {
-                isComplete = true;
-            }
-
-            // If complete, reassemble and process
-            if (isComplete) {
-                const sortedParts = Array.from(parts.keys()).sort((a, b) => a - b);
-                const totalSize = sortedParts.reduce((sum, p) => sum + parts.get(p).byteLength, 0);
-                const reassembled = new Uint8Array(totalSize);
-                let offset = 0;
-                for (const p of sortedParts) {
-                    const partData = new Uint8Array(parts.get(p));
-                    reassembled.set(partData, offset);
-                    offset += partData.length;
-                }
-                chunkFragments.delete(chunkIndex);
-                handleFileChunk(reassembled.buffer, chunkIndex);
-            }
-        };
-
-        if (data instanceof ArrayBuffer) {
-            processBinary(data);
-        } else if (data && typeof data.arrayBuffer === 'function') {
-            data.arrayBuffer().then(processBinary).catch(err => {
-                console.error('❌ Failed to read binary chunk data:', err);
-            });
-        } else {
-            console.warn('⚠️ Received unsupported binary data type:', typeof data);
-        }
-    } else {
-        // Chunk arrived but we're not ready - this shouldn't happen but log it
-        console.warn('⚠️ Received chunk but no active file transfer. Waiting for file-metadata...');
-    }
-}
-
-// File Request Handling
-function handleFileRequest(request) {
-    console.log('📥 File transfer request received:', request.name, 'Size:', request.size);
-    console.log('🔍 handleFileRequest called. Full request:', request);
-
-    // Validate request
-    if (!request || !request.name) {
-        console.error('❌ Invalid file request received:', request);
-        return;
-    }
-
-    // CRITICAL: Ensure transferSection is visible FIRST
-    if (!transferSection) {
-        console.error('❌ transferSection element not found! Cannot show file request UI.');
-        return;
-    }
-
-    transferSection.style.display = 'block';
-    transferSection.style.visibility = 'visible';
-    console.log('✅ Transfer section is now visible (display: block, visibility: visible)');
-
-    // Add to pending requests queue
-    if (!pendingFileRequestsQueue) {
-        pendingFileRequestsQueue = [];
-    }
-    pendingFileRequestsQueue.push(request);
-    console.log(`📋 Total pending requests: ${pendingFileRequestsQueue.length}`);
-
-    // If we're already receiving a file, just queue it
-    if (receivingFile || pendingFileRequest) {
-        console.log(`⏸️ File request queued (already receiving). Total pending: ${pendingFileRequestsQueue.length}`);
-        // Still show UI if not already showing
-        if (fileRequest && fileRequest.style.display === 'none') {
-            showFileRequestUI();
-        }
-        return;
-    }
-
-    // Show the first file request with bulk info
-    console.log('🎯 Calling showFileRequestUI...');
-    showFileRequestUI();
-}
-
-function showFileRequestUI() {
-    console.log('🎨 showFileRequestUI called');
-    console.log('🔍 Current state:', {
-        pendingFileRequestsQueueLength: pendingFileRequestsQueue?.length || 0,
-        transferSection: !!transferSection,
-        fileRequest: !!fileRequest,
-        dropZone: !!dropZone,
-        requestFileName: !!requestFileName,
-        requestFileSize: !!requestFileSize,
-        acceptFileBtn: !!acceptFileBtn,
-        rejectFileBtn: !!rejectFileBtn
-    });
-
-    if (!pendingFileRequestsQueue || pendingFileRequestsQueue.length === 0) {
-        console.warn('⚠️ showFileRequestUI called but no pending requests');
-        return;
-    }
-
-    const firstRequest = pendingFileRequestsQueue[0];
-    const totalFiles = pendingFileRequestsQueue.length;
-    const totalSize = pendingFileRequestsQueue.reduce((sum, req) => sum + (req.size || 0), 0);
-
-    console.log(`📋 Showing file request UI: ${firstRequest.name}, Total files: ${totalFiles}, Total size: ${formatFileSize(totalSize)}`);
-
-    // CRITICAL: Ensure transferSection is visible
-    if (!transferSection) {
-        console.error('❌ transferSection element not found!');
-        return;
-    }
-    transferSection.style.display = 'block';
-    transferSection.style.visibility = 'visible';
-    console.log('✅ Transfer section forced visible');
-
-    // Hide drop zone, show file request UI
     if (dropZone) {
-        dropZone.style.display = 'none';
-        console.log('✅ Drop zone hidden');
-    } else {
-        console.warn('⚠️ dropZone element not found');
+        dropZone.addEventListener('click', () => fileInput && fileInput.click());
+        dropZone.addEventListener('dragover', handleDragOver);
+        dropZone.addEventListener('dragleave', handleDragLeave);
+        dropZone.addEventListener('drop', handleDrop);
     }
 
-    if (!fileRequest) {
-        console.error('❌ fileRequest element not found! Cannot show UI.');
-        // Try to re-query it
-        const fileRequestRetry = document.getElementById('fileRequest');
-        if (fileRequestRetry) {
-            console.log('✅ Found fileRequest on retry');
-            fileRequestRetry.style.display = 'block';
-            fileRequestRetry.style.visibility = 'visible';
-        } else {
-            console.error('❌ fileRequest still not found after retry');
-            return;
-        }
-    } else {
-        fileRequest.style.display = 'block';
-        fileRequest.style.visibility = 'visible';
-        console.log('✅ File request UI is now visible (display: block, visibility: visible)');
+    if (fileInput) {
+        fileInput.addEventListener('change', handleFileSelect);
     }
 
-    // Show first file name + X more files
-    if (!requestFileName) {
-        console.error('❌ requestFileName element not found!');
-    } else {
-        if (totalFiles > 1) {
-            requestFileName.textContent = `${firstRequest.name} +${totalFiles - 1} more file${totalFiles - 1 > 1 ? 's' : ''}`;
-        } else {
-            requestFileName.textContent = firstRequest.name;
-        }
-        console.log('✅ File name set:', requestFileName.textContent);
-    }
+    if (acceptFileBtn) acceptFileBtn.addEventListener('click', handleAcceptFile);
+    if (rejectFileBtn) rejectFileBtn.addEventListener('click', handleRejectFile);
 
-    if (!requestFileSize) {
-        console.error('❌ requestFileSize element not found!');
-    } else {
-        requestFileSize.textContent = formatFileSize(totalSize);
-        console.log('✅ File size set:', requestFileSize.textContent);
-    }
-
-    // Ensure buttons are enabled and visible
-    if (!acceptFileBtn) {
-        console.error('❌ acceptFileBtn element not found!');
-    } else {
-        acceptFileBtn.disabled = false;
-        acceptFileBtn.style.display = 'block';
-        acceptFileBtn.style.visibility = 'visible';
-        console.log('✅ Accept button enabled and visible');
-    }
-
-    if (!rejectFileBtn) {
-        console.error('❌ rejectFileBtn element not found!');
-    } else {
-        rejectFileBtn.disabled = false;
-        rejectFileBtn.style.display = 'block';
-        rejectFileBtn.style.visibility = 'visible';
-        console.log('✅ Reject button enabled and visible');
-    }
-
-    // Store first request as current (for backward compatibility)
-    pendingFileRequest = firstRequest;
-
-    // Force a reflow to ensure visibility
-    void fileRequest.offsetHeight;
-
-    console.log('✅ File request UI displayed successfully. Final check:', {
-        fileRequestDisplay: fileRequest?.style.display,
-        fileRequestVisibility: fileRequest?.style.visibility,
-        acceptBtnDisabled: acceptFileBtn?.disabled,
-        rejectBtnDisabled: rejectFileBtn?.disabled
-    });
-}
-
-function handleAcceptFile() {
-    if (pendingFileRequestsQueue.length === 0) {
-        console.warn('No pending file requests to accept');
-        return;
-    }
-
-    if (!dataChannel || dataChannel.readyState !== 'open') {
-        alert('Connection not ready. Please wait for connection to be established.');
-        return;
-    }
-
-    const totalFiles = pendingFileRequestsQueue.length;
-    console.log(`Accepting ${totalFiles} file(s) for transfer`);
-
-    // Disable buttons to prevent double-clicking
-    if (acceptFileBtn) acceptFileBtn.disabled = true;
-    if (rejectFileBtn) rejectFileBtn.disabled = true;
-
-    // Accept all files - send a single acceptance message for all files
-    try {
-        dataChannel.send(JSON.stringify({
-            type: 'file-accepted',
-            total: totalFiles,
-            files: pendingFileRequestsQueue.map(req => ({ name: req.name, size: req.size }))
-        }));
-        console.log(`Acceptance message sent for ${totalFiles} file(s)`);
-    } catch (error) {
-        console.error(`Error sending acceptance:`, error);
-    }
-
-    // Store all requests but DON'T start receiving yet
-    // Wait for sender to send file-metadata for the first file
-    // The sender will send metadata before each file
-
-    // Hide request UI, show transfer info (will be populated when metadata arrives)
-    fileRequest.style.display = 'none';
-    transferInfo.style.display = 'block';
-
-    // Keep the queue - we'll process files one by one as metadata arrives
-    // Don't clear pendingFileRequestsQueue yet - we'll use it to track remaining files
-}
-
-function handleRejectFile() {
-    if (pendingFileRequestsQueue.length === 0) {
-        console.warn('No pending file requests to reject');
-        return;
-    }
-
-    if (!dataChannel || dataChannel.readyState !== 'open') {
-        alert('Connection not ready. Please wait for connection to be established.');
-        return;
-    }
-
-    const totalFiles = pendingFileRequestsQueue.length;
-    console.log(`Rejecting ${totalFiles} file(s)`);
-
-    // Disable buttons to prevent double-clicking
-    if (acceptFileBtn) acceptFileBtn.disabled = true;
-    if (rejectFileBtn) rejectFileBtn.disabled = true;
-
-    // Reject all files - send rejection for each
-    pendingFileRequestsQueue.forEach((request, index) => {
-        try {
-            dataChannel.send(JSON.stringify({
-                type: 'file-rejected',
-                fileName: request.name,
-                index: index,
-                total: totalFiles
-            }));
-            console.log(`Rejection message sent for file ${index + 1}/${totalFiles}: ${request.name}`);
-        } catch (error) {
-            console.error(`Error sending rejection for ${request.name}:`, error);
-        }
-    });
-
-    // Reset UI
-    fileRequest.style.display = 'none';
-    dropZone.style.display = 'block';
-    pendingFileRequest = null;
-    pendingFileRequestsQueue = [];
-
-    // Re-enable buttons after a short delay
-    setTimeout(() => {
-        if (acceptFileBtn) acceptFileBtn.disabled = false;
-        if (rejectFileBtn) rejectFileBtn.disabled = false;
-    }, 500);
-}
-
-function handleFileAccepted() {
-    console.log('File transfer accepted by receiver, starting upload...');
-    // Mark that all files have been accepted (bulk acceptance)
-    allFilesAccepted = true;
-
-    // Start sending the current file (first in queue)
-    if (currentFile) {
-        // Update UI to show uploading and queue status
-        const queueInfo = fileQueue.length > 1 ? ` (${fileQueue.length - 1} more in queue)` : '';
-        showTransferUI(currentFile, `Uploading...${queueInfo}`);
-
-        // Send file metadata FIRST, then start streaming
-        // This ensures receiver is ready before chunks arrive
-        const metadata = {
-            type: 'file-metadata',
-            name: currentFile.name,
-            size: currentFile.size,
-            mimeType: currentFile.type
-        };
-        dataChannel.send(JSON.stringify(metadata));
-        console.log(`📤 Sent file-metadata for: ${currentFile.name}`);
-
-        // Small delay to ensure metadata arrives before chunks
-        setTimeout(() => {
-            streamFile(currentFile);
-        }, 100);
-    } else {
-        console.warn('File accepted but no currentFile set. Processing queue...');
-        // Try to process queue if no current file
-        if (fileQueue.length > 0) {
-            processFileQueue();
-        }
-    }
-}
-
-function handleFileRejected() {
-    console.log('File transfer rejected by receiver');
-    // Show rejection message
-    alert('File transfer was rejected by the receiver.');
-
-    // Release wake lock if transfer was rejected
-    releaseWakeLock();
-
-    // Remove rejected file from queue
-    if (fileQueue.length > 0 && fileQueue[0] === currentFile) {
-        fileQueue.shift();
-    }
-
-    currentFile = null;
-
-    // If there are more files in queue, continue processing
-    if (fileQueue.length > 0) {
-        isProcessingQueue = false;
-        processFileQueue();
-    } else {
-        // No more files, show drop zone
-        isProcessingQueue = false;
-        dropZone.style.display = 'block';
-        transferInfo.style.display = 'none';
-    }
-}
-
-let pendingFileRequest = null;
-let pendingFileRequestsQueue = []; // Queue for multiple file requests
-
-async function startReceivingFile(metadata, resumeOffset = 0) {
-    receivingFile = {
-        name: metadata.name,
-        size: metadata.size,
-        type: metadata.mimeType || 'application/octet-stream'
-    };
-    receivingFileSize = metadata.size;
-    fileCompleteSignalReceived = false;
-    completionCheckAttempts = 0;
-    lastChunkReceivedTime = Date.now();
-    allBytesReceivedTime = null;
-
-    // Check localStorage and IndexedDB for existing partial file (resume capability)
-    const savedMetadata = getFileMetadataFromLocalStorage(metadata.name);
-    if (savedMetadata && savedMetadata.fileSize === metadata.size) {
-        // Check IndexedDB for existing chunks
-        try {
-            const { totalBytes, chunkCount } = await getTotalBytesFromIndexedDB(metadata.name);
-            if (totalBytes > 0 && totalBytes < metadata.size) {
-                // We have partial file - resume from this point
-                receivedBytes = totalBytes;
-                currentChunkIndex = chunkCount;
-                console.log(`🔄 Resuming file transfer: ${metadata.name} (${totalBytes}/${metadata.size} bytes already received)`);
-
-                // Request sender to resume from this offset
-                if (dataChannel && dataChannel.readyState === 'open') {
-                    try {
-                        dataChannel.send(JSON.stringify({
-                            type: 'resume',
-                            fileName: metadata.name,
-                            offset: totalBytes
-                        }));
-                        console.log(`📤 Sent resume request: ${metadata.name} from byte ${totalBytes}`);
-                    } catch (error) {
-                        console.error('❌ Error sending resume request:', error);
-                    }
-                }
-            } else {
-                // Start fresh
-                receivedBytes = 0;
-                currentChunkIndex = 0;
-                // Clean up old data if file size changed
-                if (totalBytes > 0) {
-                    await deleteFileFromIndexedDB(metadata.name);
-                    deleteFileMetadataFromLocalStorage(metadata.name);
-                }
+    // Donation modal
+    if (donateBtn) {
+        donateBtn.addEventListener('click', () => {
+            if (donateModal && donationImage) {
+                donationImage.src = 'image.png';
+                donateModal.style.display = 'flex';
             }
-        } catch (error) {
-            console.error('❌ Error checking IndexedDB for resume:', error);
-            receivedBytes = 0;
-            currentChunkIndex = 0;
-        }
-    } else {
-        // No saved metadata - start fresh
-        receivedBytes = 0;
-        currentChunkIndex = 0;
-    }
-
-    // Save metadata to localStorage
-    saveFileMetadataToLocalStorage(metadata.name, metadata.size, metadata.mimeType || 'application/octet-stream', receivedBytes);
-
-    // Clear any existing completion check interval
-    if (completionCheckInterval) {
-        clearInterval(completionCheckInterval);
-        completionCheckInterval = null;
-    }
-
-    // 🔹 Update state machine
-    transferState = receivedBytes > 0 ? TransferState.RESUMING : TransferState.TRANSFERRING;
-
-    // 🔴 Pillar 5: Reset hash for new file
-    receivedHash = null;
-    expectedHash = null;
-
-    // ✅ FIX 3: Reset chunk tracking map for new file
-    receivedChunks.clear();
-    lastAckedChunkIndex = -1;
-    expectedTotalChunks = 0; // ✅ FIX 5: Reset expected chunks
-    highestContiguousChunkIndex = -1; // ✅ FIX 1: Reset contiguous tracking
-
-    showReceivingFileUI(receivingFile);
-    resetTransferStats();
-    transferStats.startTime = Date.now();
-    transferStats.lastUpdateTime = Date.now();
-
-    console.log('📥 Started receiving file:', metadata.name, 'Size:', metadata.size, 'bytes', receivedBytes > 0 ? `(Resuming from ${receivedBytes} bytes)` : '');
-}
-
-// RECEIVER: Batched IndexedDB writes (every 10 chunks) for optimal disk I/O
-let chunkBuffer = []; // Buffer chunks before batch write (in-memory queue, flushed by background worker)
-const BATCH_SIZE = 10; // Write every 10 chunks to reduce disk I/O bottleneck
-
-// ✅ FIX 3: Store chunkIndex → boolean map (enterprise pattern)
-let receivedChunks = new Map(); // chunkIndex -> chunkSize (tracks which chunks were received)
-let lastAckedChunkIndex = -1; // Track last chunk we ACKed to sender
-let expectedTotalChunks = 0; // ✅ FIX 5: Expected total chunks for completion check
-let highestContiguousChunkIndex = -1; // ✅ FIX 1: Track highest contiguous chunk on receiver
-let highestReceivedChunkIndex = -1; // Highest index ever received on receiver (may have gaps)
-let isChunkFlushInProgress = false;   // Background worker flag
-// 🔴 SCTP FRAGMENTATION: Reassemble fragmented chunks (chunkIndex -> Map<part -> payload>)
-let chunkFragments = new Map(); // chunkIndex -> Map<partNumber -> ArrayBuffer>
-
-async function handleFileChunk(chunk, chunkIndex) {
-    // 🔹 Idempotent handler - safe to call multiple times
-    if (!receivingFile || transferState === TransferState.COMPLETED) return;
-
-    // Update state to TRANSFERRING if we were RESUMING
-    if (transferState === TransferState.RESUMING) {
-        transferState = TransferState.TRANSFERRING;
-    } else if (transferState === TransferState.IDLE || transferState === TransferState.CONNECTING) {
-        transferState = TransferState.TRANSFERRING;
-    }
-
-    const chunkSize = chunk.byteLength || chunk.length;
-
-    // 🔴 Step 2: Increment ONLY here - single authoritative counter
-    receivedBytes += chunkSize;
-
-    // Note: Hash verification is done at finalizeFile() from the complete assembled file
-    // This ensures we verify the final file, not individual chunks
-
-    // ✅ FIX 2: Use immutable chunkIndex from sender (don't increment our own counter)
-    // Add chunk to in-memory buffer queue for async storage
-    chunkBuffer.push({
-        chunkIndex: chunkIndex,
-        chunkData: chunk
-    });
-
-    // ✅ FIX 3: Track received chunks in map (for completion + ACKs)
-    receivedChunks.set(chunkIndex, chunkSize);
-
-    // Track highest index ever received (may have gaps)
-    highestReceivedChunkIndex = Math.max(highestReceivedChunkIndex, chunkIndex);
-
-    // ✅ FIX 1: Update highest contiguous chunk index (0..N all present)
-    let contiguous = highestContiguousChunkIndex;
-    while (receivedChunks.has(contiguous + 1)) {
-        contiguous++;
-    }
-    highestContiguousChunkIndex = Math.max(highestContiguousChunkIndex, contiguous);
-
-    // CRITICAL: Update last chunk received time - used to detect stale connections
-    lastChunkReceivedTime = Date.now();
-
-    // ✅ FIX 1 (MNC): ACK MUST be decoupled from storage.
-    // ACK on receive (after state update), not on persist. Send cumulative ACKs immediately.
-    // ACK coalescing: send ranges instead of single index (reduces signaling overhead)
-    if (highestReceivedChunkIndex >= 0 &&
-        highestReceivedChunkIndex >= lastAckedChunkIndex + ACK_EVERY_N_CHUNKS) {
-        if (dataChannel && dataChannel.readyState === 'open') {
-            try {
-                // ACK coalescing: send range from lastAckedChunkIndex+1 to highestReceivedChunkIndex
-                const ackFrom = lastAckedChunkIndex + 1;
-                const ackTo = highestReceivedChunkIndex;
-                dataChannel.send(JSON.stringify({
-                    type: 'chunk-ack',
-                    from: ackFrom,
-                    to: ackTo,
-                    highestReceivedChunkIndex: highestReceivedChunkIndex,
-                    highestContiguousChunkIndex: highestContiguousChunkIndex
-                }));
-                lastAckedChunkIndex = highestReceivedChunkIndex;
-            } catch (error) {
-                console.warn('⚠️ ACK send failed, will recover:', error);
-                // ACK failure is recoverable - channel will be recovered on next send
-                // Don't block here, just log and continue
-            }
-        }
-    }
-
-    // Calculate progress but cap at 99.9% until actually complete
-    const progressPercent = (receivedBytes / receivingFileSize) * 100;
-    updateReceivingProgress(Math.min(99.9, progressPercent));
-
-    // Log every 100th chunk or when close to completion to avoid spam
-    if ((currentChunkIndex - 1) % 100 === 0 || progressPercent > 90) {
-        console.log(`📥 Chunk #${currentChunkIndex - 1}: ${chunkSize} bytes. Total: ${receivedBytes}/${receivingFileSize} (${progressPercent.toFixed(1)}%), Buffer: ${chunkBuffer.length} chunks`);
-    }
-
-    // Kick off background storage worker (non-blocking)
-    if (!isChunkFlushInProgress && chunkBuffer.length > 0) {
-        // Fire-and-forget; worker yields between batches to keep event loop alive
-        (async () => {
-            isChunkFlushInProgress = true;
-            try {
-                while (chunkBuffer.length && receivingFile && transferState !== TransferState.FAILED) {
-                    const progress = (receivedBytes / receivingFileSize) * 100;
-                    const effectiveBatchSize = progress > 90 ? 5 : BATCH_SIZE;
-                    const batchSize = Math.min(effectiveBatchSize, chunkBuffer.length);
-
-                    const batch = chunkBuffer.slice(0, batchSize);
-                    try {
-                        const writeStart = performance.now();
-                        const writePromises = batch.map(item => {
-                            if (!item || item.chunkIndex === undefined) {
-                                throw new Error(`❌ CRITICAL: Corrupted chunk in batch! Item: ${JSON.stringify(item)}`);
-                            }
-                            return storeChunkInIndexedDB(receivingFile.name, item.chunkIndex, item.chunkData);
-                        });
-                        await Promise.all(writePromises);
-                        const writeLatency = performance.now() - writeStart;
-
-                        // Receiver-driven flow control: signal sender if storage is slow
-                        if (writeLatency > 500 && dataChannel && dataChannel.readyState === 'open') {
-                            try {
-                                dataChannel.send(JSON.stringify({ type: 'slowDown' }));
-                            } catch (err) {
-                                // Non-critical
-                            }
-                        } else if (writeLatency < 50 && dataChannel && dataChannel.readyState === 'open') {
-                            try {
-                                dataChannel.send(JSON.stringify({ type: 'speedUp' }));
-                            } catch (err) {
-                                // Non-critical
-                            }
-                        }
-
-                        console.log(`💾 Stored batch of ${batch.length} chunks to IndexedDB (head chunk ${batch[0].chunkIndex}, latency: ${writeLatency.toFixed(1)}ms)`);
-                        chunkBuffer.splice(0, batch.length);
-                        saveFileMetadataToLocalStorage(receivingFile.name, receivingFileSize, receivingFile.type, receivedBytes);
-                    } catch (error) {
-                        console.error('❌ CRITICAL: Error storing chunk batch in IndexedDB (background):', error);
-                        if (error.message && error.message.includes('Corrupted chunk')) {
-                            console.error('❌ CRITICAL: Corrupted batch detected! Aborting transfer.');
-                            transferState = TransferState.FAILED;
-                            alert('CRITICAL ERROR: Internal receiver corruption detected. Transfer aborted. Please restart.');
-                            resetReceivingState();
-                            break;
-                        }
-                        console.warn('⚠️ Batch store failed in background, will retry later');
-                        await new Promise(resolve => setTimeout(resolve, 500));
-                    }
-
-                    // Yield to event loop between batches
-                    await new Promise(resolve => setTimeout(resolve, 0));
-                }
-            } finally {
-                isChunkFlushInProgress = false;
-            }
-        })();
-    }
-
-    // 🔴 Step 3: Check completion when signal received
-    if (fileCompleteSignalReceived) {
-        checkAndCompleteFile();
-    }
-}
-
-// Flush remaining chunks from buffer (called on file completion)
-async function flushChunkBuffer() {
-    // ✅ FIX 1: Never flush empty buffer (MANDATORY)
-    if (!chunkBuffer.length) {
-        return; // HARD GUARD - prevent empty flush
-    }
-
-    if (!receivingFile) {
-        console.warn('⚠️ flushChunkBuffer called but no receiving file');
-        return;
-    }
-
-    // ✅ FIX 2: Two-phase commit - copy buffer BEFORE clearing
-    const batch = [...chunkBuffer]; // Create copy for atomic operation
-    const chunksToFlush = batch.length;
-
-    // ✅ FIX 5: Validate batch before processing
-    for (let i = 0; i < batch.length; i++) {
-        if (!batch[i] || batch[i].chunkIndex === undefined) {
-            console.error(`❌ CRITICAL: Corrupted chunk at index ${i} in batch!`);
-            console.error(`❌ Batch item:`, batch[i]);
-            transferState = TransferState.FAILED;
-            throw new Error(`CRITICAL: Corrupted batch detected at index ${i}. Transfer aborted.`);
-        }
-    }
-
-    try {
-        const firstChunkIndex = batch[0].chunkIndex;
-        const lastChunkIndex = batch[batch.length - 1].chunkIndex;
-
-        console.log(`💾 Flushing ${chunksToFlush} chunks to IndexedDB (chunks ${firstChunkIndex} to ${lastChunkIndex})...`);
-
-        // Write all chunks in parallel
-        await Promise.all(batch.map(item =>
-            storeChunkInIndexedDB(receivingFile.name, item.chunkIndex, item.chunkData)
-        ));
-
-        console.log(`✅ Successfully flushed ${chunksToFlush} chunks to IndexedDB`);
-
-        // ✅ FIX 2: Clear buffer ONLY after DB confirms success
-        chunkBuffer.splice(0, batch.length); // Remove only the successfully stored chunks
-    } catch (error) {
-        console.error('❌ CRITICAL: Error flushing chunk buffer:', error);
-        console.error(`❌ Failed to flush ${chunksToFlush} chunks! Buffer preserved for retry.`);
-
-        // ✅ FIX 5: Hard stop on corrupted batch
-        if (error.message && error.message.includes('Corrupted')) {
-            console.error('❌ CRITICAL: Corrupted batch detected! Aborting transfer.');
-            transferState = TransferState.FAILED;
-            alert('CRITICAL ERROR: Internal receiver corruption detected. Transfer aborted. Please restart.');
-            resetReceivingState();
-            throw error;
-        }
-
-        // Don't clear buffer on error - keep for potential retry
-        throw error; // Re-throw so caller knows it failed
-    }
-}
-
-function completeReceivingFile() {
-    if (!receivingFile) return;
-
-    // Mark that we received the completion signal
-    fileCompleteSignalReceived = true;
-    console.log('File completion signal received. Current progress:', receivedBytes, '/', receivingFileSize, `(${((receivedBytes / receivingFileSize) * 100).toFixed(1)}%)`);
-
-    // Start checking immediately and continue checking until complete
-    // Don't wait - start the interval right away
-    if (!completionCheckInterval) {
-        completionCheckInterval = setInterval(() => {
-            checkAndCompleteFile();
-        }, 100);
-    }
-
-    // Also check immediately
-    checkAndCompleteFile();
-}
-
-let completionCheckInterval = null;
-let completionCheckAttempts = 0;
-const MAX_COMPLETION_CHECK_ATTEMPTS = 1000; // Max 100 seconds (100 * 100ms)
-
-// 🔴 Step 3: Completion logic MUST use single authoritative counter
-async function checkAndCompleteFile() {
-    if (!receivingFile) {
-        if (completionCheckInterval) {
-            clearInterval(completionCheckInterval);
-            completionCheckInterval = null;
-        }
-        completionCheckAttempts = 0;
-        return;
-    }
-
-    // 🔴 Step 5: REMOVE all DB-based byte checks - use single counter only
-    if (!fileCompleteSignalReceived) return;
-
-    // Flush any remaining chunks from buffer before checking
-    await flushChunkBuffer();
-
-    // ✅ FIX 5: Completion condition MUST be chunk-based
-    const receivedChunkCount = receivedChunks.size;
-
-    // Primary check: receivedChunks.size === expectedTotalChunks
-    if (expectedTotalChunks > 0 && receivedChunkCount === expectedTotalChunks) {
-        console.log(`✅ File complete! Received all ${receivedChunkCount} chunks (${receivedBytes}/${expectedFileSize} bytes)`);
-        await finalizeFile();
-    } else if (receivedBytes === expectedFileSize && expectedTotalChunks === 0) {
-        // Fallback: If totalChunks not provided, use byte count
-        console.log(`✅ File complete! Received: ${receivedBytes}/${expectedFileSize} bytes, ${receivedChunkCount} chunks`);
-        await finalizeFile();
-    } else {
-        const missing = expectedFileSize - receivedBytes;
-        if (completionCheckAttempts % 10 === 0) {
-            console.warn(`Waiting for bytes: ${receivedBytes}/${expectedFileSize} (missing ${missing} bytes)`);
-        }
-        completionCheckAttempts++;
-
-        // Keep checking - chunks might still be arriving
-        if (!completionCheckInterval) {
-            completionCheckInterval = setInterval(() => {
-                checkAndCompleteFile();
-            }, 100);
-        }
-
-        // Timeout after max attempts
-        if (completionCheckAttempts > MAX_COMPLETION_CHECK_ATTEMPTS) {
-            console.error(`Timeout: Received ${receivedBytes}/${expectedFileSize} bytes. Missing ${missing} bytes.`);
-            alert(`File transfer incomplete. Received ${receivedBytes} of ${expectedFileSize} bytes. Missing ${missing} bytes.`);
-            resetReceivingState();
-            return;
-        }
-    }
-}
-
-// Finalize file - assemble from IndexedDB and complete
-async function finalizeFile() {
-    // 🔹 Idempotent handler - safe to call multiple times
-    if (!receivingFile || transferState === TransferState.COMPLETED) {
-        console.log('⚠️ finalizeFile called but already completed or no file');
-        return;
-    }
-
-    // Update state to prevent duplicate calls
-    transferState = TransferState.COMPLETED;
-
-    // Clear the interval
-    if (completionCheckInterval) {
-        clearInterval(completionCheckInterval);
-        completionCheckInterval = null;
-    }
-
-    console.log('✅ File transfer complete! All bytes received and signal confirmed.');
-    console.log(`Final stats: ${receivedBytes}/${expectedFileSize} bytes, ${currentChunkIndex} chunks`);
-
-    // Flush any remaining buffered chunks
-    await flushChunkBuffer();
-
-    // Read all chunks from IndexedDB and assemble file
-    console.log('📦 Reading all chunks from IndexedDB for final assembly...');
-    let allChunks;
-    try {
-        allChunks = await getAllChunksFromIndexedDB(receivingFile.name);
-        console.log(`✅ Read ${allChunks.length} chunks from IndexedDB`);
-    } catch (error) {
-        console.error('❌ Error reading chunks from IndexedDB:', error);
-        transferState = TransferState.FAILED;
-        alert('Error reading file from storage. Please try again.');
-        resetReceivingState();
-        return;
-    }
-
-    // Sort chunks by index
-    allChunks.sort((a, b) => (a.chunkIndexNum || 0) - (b.chunkIndexNum || 0));
-
-    // Combine all chunks
-    const totalSize = allChunks.reduce((sum, chunk) => sum + (chunk.chunkData?.byteLength || 0), 0);
-    const combined = new Uint8Array(totalSize);
-    let offset = 0;
-
-    for (const chunk of allChunks) {
-        if (chunk.chunkData) {
-            const chunkData = chunk.chunkData instanceof ArrayBuffer
-                ? new Uint8Array(chunk.chunkData)
-                : new Uint8Array(chunk.chunkData.buffer || chunk.chunkData);
-            combined.set(chunkData, offset);
-            offset += chunkData.length;
-        }
-    }
-
-    // 🔴 Pillar 5: Integrity verification - compute final hash and compare
-    let computedHash = null;
-    try {
-        const hashBuffer = await crypto.subtle.digest('SHA-256', combined);
-        const hashArray = Array.from(new Uint8Array(hashBuffer));
-        computedHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-        console.log(`🔐 Computed hash: ${computedHash.substring(0, 16)}...`);
-    } catch (error) {
-        console.error('❌ Error computing file hash:', error);
-    }
-
-    // Verify hash if expected hash was provided
-    if (expectedHash && computedHash) {
-        if (computedHash !== expectedHash) {
-            console.error(`❌ CRITICAL: Hash mismatch! Computed: ${computedHash.substring(0, 16)}..., Expected: ${expectedHash.substring(0, 16)}...`);
-            transferState = TransferState.FAILED;
-            alert(`File integrity check failed! The file may be corrupted. Computed hash doesn't match expected hash.`);
-            resetReceivingState();
-            return;
-        } else {
-            console.log(`✅ Hash verification passed! File integrity confirmed.`);
-        }
-    } else if (expectedHash && !computedHash) {
-        console.warn('⚠️ Expected hash provided but could not compute hash. Skipping verification.');
-    }
-
-    // Create blob and download
-    const blob = new Blob([combined], { type: receivingFile.type || 'application/octet-stream' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = receivingFile.name;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-
-    console.log(`✅ File "${receivingFile.name}" downloaded successfully!`);
-
-    // Send confirmation back to sender
-    try {
-        dataChannel.send(JSON.stringify({
-            type: 'file-received-confirmed',
-            bytesReceived: receivedBytes,
-            expectedBytes: expectedFileSize,
-            hashMatch: expectedHash ? (computedHash === expectedHash) : null
-        }));
-        console.log(`✅ Sent confirmation to sender: ${receivedBytes}/${expectedFileSize} bytes received`);
-    } catch (error) {
-        console.error('❌ Error sending confirmation to sender:', error);
-    }
-
-    // Show 100% progress
-    updateReceivingProgress(100);
-
-    // Clean up IndexedDB
-    await deleteFileFromIndexedDB(receivingFile.name);
-    deleteFileMetadataFromLocalStorage(receivingFile.name);
-
-    // Reset state
-    resetReceivingState();
-
-    // Show success message
-    showSuccessMessage(`File "${receivingFile.name}" received successfully!`);
-}
-
-// Helper to reset receiving state
-function resetReceivingState() {
-    receivingFile = null;
-    receivingFileSize = 0;
-    receivedBytes = 0;
-    expectedFileSize = 0;
-    currentChunkIndex = 0;
-    fileCompleteSignalReceived = false;
-    lastChunkReceivedTime = null;
-    allBytesReceivedTime = null;
-    if (completionCheckInterval) {
-        clearInterval(completionCheckInterval);
-        completionCheckInterval = null;
-    }
-    completionCheckAttempts = 0;
-    transferInfo.style.display = 'none';
-    dropZone.style.display = 'block';
-}
-
-// Legacy function - keeping for compatibility but simplifying
-async function checkAndCompleteFile_OLD() {
-    if (!receivingFile) {
-        if (completionCheckInterval) {
-            clearInterval(completionCheckInterval);
-            completionCheckInterval = null;
-        }
-        completionCheckAttempts = 0;
-        return;
-    }
-
-    completionCheckAttempts++;
-
-    // CRITICAL: Flush any remaining chunks from buffer before checking
-    await flushChunkBuffer();
-
-    // CRITICAL: Verify we received all bytes - read from IndexedDB
-    let totalReceived = 0;
-    let chunkCount = 0;
-    try {
-        const result = await getTotalBytesFromIndexedDB(receivingFile.name);
-        totalReceived = result.totalBytes;
-        chunkCount = result.chunkCount;
-    } catch (error) {
-        console.error('❌ Error reading from IndexedDB:', error);
-        // Fallback to tracked counter
-        totalReceived = receivedBytes;
-    }
-
-    // Also check the tracked counter
-    const bytesMatch = Math.abs(totalReceived - receivedBytes) < 100; // Allow small discrepancy
-
-    const percentComplete = ((totalReceived / receivingFileSize) * 100).toFixed(1);
-    const missingBytes = receivingFileSize - totalReceived;
-
-    // Log every 10th attempt to avoid spam, or if we're close to completion
-    if (completionCheckAttempts % 10 === 0 || totalReceived >= receivingFileSize * 0.9) {
-        console.log(`[${completionCheckAttempts}] Checking: ${totalReceived}/${receivingFileSize} bytes (${percentComplete}%), Missing: ${missingBytes}, Signal: ${fileCompleteSignalReceived}, BytesMatch: ${bytesMatch}, ChunksInDB: ${chunkCount}, ChunkCounter: ${currentChunkIndex}, BufferSize: ${chunkBuffer.length}`);
-    }
-
-    // Only proceed if we received the complete file AND got the completion signal
-    if (totalReceived < receivingFileSize) {
-        // Check if chunks have stopped arriving (connection might be dead)
-        const timeSinceLastChunk = lastChunkReceivedTime ? (Date.now() - lastChunkReceivedTime) : Infinity;
-        const STALE_CHUNK_THRESHOLD = 5000; // 5 seconds without new chunks
-
-        if (fileCompleteSignalReceived && timeSinceLastChunk > STALE_CHUNK_THRESHOLD && completionCheckAttempts > 50) {
-            // Signal received, but no chunks for 5+ seconds and we've checked 50+ times
-            console.warn(`⚠️ No chunks received for ${(timeSinceLastChunk / 1000).toFixed(1)}s. Missing ${missingBytes} bytes. Connection may be dead.`);
-            console.warn(`⚠️ Stats: IndexedDB has ${chunkCount} chunks, Counter shows ${currentChunkIndex} chunks, Buffer has ${chunkBuffer.length} chunks`);
-
-            // Try to request missing chunks from sender (resume from current position)
-            if (dataChannel && dataChannel.readyState === 'open' && missingBytes > 0) {
-                console.log(`🔄 Requesting resume from byte ${totalReceived} (missing ${missingBytes} bytes)`);
-                try {
-                    dataChannel.send(JSON.stringify({
-                        type: 'resume',
-                        fileName: receivingFile.name,
-                        offset: totalReceived
-                    }));
-                } catch (error) {
-                    console.error('❌ Error sending resume request:', error);
-                }
-            }
-        }
-
-        // Keep checking - chunks might still be arriving
-        // But also check if we've been waiting too long (might indicate an issue)
-        if (completionCheckAttempts > MAX_COMPLETION_CHECK_ATTEMPTS) {
-            console.error('Timeout waiting for file completion. Received:', totalReceived, 'Expected:', receivingFileSize, 'Missing:', missingBytes);
-            alert(`File transfer incomplete. Received ${totalReceived} of ${receivingFileSize} bytes (${percentComplete}%). Missing ${missingBytes} bytes. The transfer may have been interrupted.`);
-            // Reset everything
-            receivingFile = null;
-            receivingFileSize = 0;
-            receivedBytes = 0;
-            currentChunkIndex = 0;
-            fileCompleteSignalReceived = false;
-            lastChunkReceivedTime = null;
-            allBytesReceivedTime = null;
-            if (completionCheckInterval) {
-                clearInterval(completionCheckInterval);
-                completionCheckInterval = null;
-            }
-            completionCheckAttempts = 0;
-            transferInfo.style.display = 'none';
-            dropZone.style.display = 'block';
-            return;
-        }
-
-        // Ensure interval is running
-        if (!completionCheckInterval) {
-            completionCheckInterval = setInterval(() => {
-                checkAndCompleteFile();
-            }, 100);
-        }
-        return;
-    }
-
-    // CRITICAL: Check if we received MORE bytes than expected (chunks from multiple files mixed)
-    if (totalReceived > receivingFileSize) {
-        const excessBytes = totalReceived - receivingFileSize;
-        console.error(`❌ CRITICAL: Received MORE bytes than expected! Got: ${totalReceived}, Expected: ${receivingFileSize}, Excess: ${excessBytes} bytes`);
-        console.error('This indicates chunks from multiple files are being mixed. Resetting and waiting for proper file metadata.');
-
-        // Reset and wait for proper file metadata
-        // Clean up IndexedDB and localStorage
-        await deleteFileFromIndexedDB(receivingFile.name);
-        deleteFileMetadataFromLocalStorage(receivingFile.name);
-
-        receivingFile = null;
-        receivingFileSize = 0;
-        receivedBytes = 0;
-        currentChunkIndex = 0;
-        fileCompleteSignalReceived = false;
-        allBytesReceivedTime = null;
-        if (completionCheckInterval) {
-            clearInterval(completionCheckInterval);
-            completionCheckInterval = null;
-        }
-        completionCheckAttempts = 0;
-        transferInfo.style.display = 'none';
-        dropZone.style.display = 'block';
-        alert(`Error: Received more data than expected. This may indicate a file transfer error. Please try again.`);
-        return;
-    }
-
-    // If we have all bytes but no signal yet, track when we first got all bytes
-    if (totalReceived >= receivingFileSize && !fileCompleteSignalReceived) {
-        if (!allBytesReceivedTime) {
-            allBytesReceivedTime = Date.now();
-            console.log('✅ All bytes received! Waiting for completion signal (max 5 seconds)...');
-        }
-
-        // If we've had all bytes for more than 5 seconds, complete anyway
-        const timeSinceAllBytes = Date.now() - allBytesReceivedTime;
-        if (timeSinceAllBytes > 5000) {
-            console.log(`⏰ All bytes received for ${(timeSinceAllBytes / 1000).toFixed(1)}s. Completing transfer even without signal.`);
-            // Proceed to completion (treat as if signal received)
-        } else {
-            // Keep checking for the signal, but we'll timeout after 5 seconds
-            if (!completionCheckInterval) {
-                completionCheckInterval = setInterval(() => {
-                    checkAndCompleteFile();
-                }, 100);
-            }
-            return;
-        }
-    } else if (!fileCompleteSignalReceived) {
-        // Still missing bytes, keep checking
-        if (!completionCheckInterval) {
-            completionCheckInterval = setInterval(() => {
-                checkAndCompleteFile();
-            }, 100);
-        }
-        return;
-    }
-
-    // Clear the interval since we're completing
-    if (completionCheckInterval) {
-        clearInterval(completionCheckInterval);
-        completionCheckInterval = null;
-    }
-
-    completionCheckAttempts = 0;
-
-    // CRITICAL: Double-check we actually have ALL bytes before confirming
-    if (totalReceived !== receivingFileSize) {
-        console.error(`❌ CRITICAL ERROR: Cannot confirm completion! Received: ${totalReceived}, Expected: ${receivingFileSize}, Missing: ${receivingFileSize - totalReceived} bytes`);
-        console.error('This should not happen - checkAndCompleteFile should have prevented this');
-        // Don't send confirmation - let sender timeout
-        // Keep checking for missing chunks
-        if (!completionCheckInterval) {
-            completionCheckInterval = setInterval(() => {
-                checkAndCompleteFile();
-            }, 100);
-        }
-        return;
-    }
-
-    console.log('✅ File transfer complete! All bytes received and signal confirmed.');
-    console.log('Final stats:', {
-        totalReceived,
-        expected: receivingFileSize,
-        chunks: currentChunkIndex,
-        percent: ((totalReceived / receivingFileSize) * 100).toFixed(2) + '%'
-    });
-
-    // Send confirmation back to sender that we received all bytes
-    try {
-        dataChannel.send(JSON.stringify({
-            type: 'file-received-confirmed',
-            bytesReceived: totalReceived,
-            expectedBytes: receivingFileSize
-        }));
-        console.log(`✅ Sent confirmation to sender: ${totalReceived}/${receivingFileSize} bytes received`);
-    } catch (error) {
-        console.error('❌ Error sending confirmation to sender:', error);
-    }
-
-    // Now show 100% - file is actually complete
-    updateReceivingProgress(100);
-
-    // CRITICAL: Flush any remaining buffered chunks before assembly
-    await flushChunkBuffer();
-
-    // CRITICAL: Read all chunks from IndexedDB and assemble file
-    console.log('📦 Reading all chunks from IndexedDB for final assembly...');
-    let allChunks;
-    try {
-        allChunks = await getAllChunksFromIndexedDB(receivingFile.name);
-        console.log(`✅ Read ${allChunks.length} chunks from IndexedDB`);
-    } catch (error) {
-        console.error('❌ Error reading chunks from IndexedDB:', error);
-        alert('Error reading file from storage. Please try again.');
-        return;
-    }
-
-    // Combine all chunks from IndexedDB
-    const combined = new Uint8Array(totalReceived);
-    let offset = 0;
-
-    for (const chunkData of allChunks) {
-        const chunkArray = chunkData instanceof Uint8Array ? chunkData : new Uint8Array(chunkData);
-        combined.set(chunkArray, offset);
-        offset += chunkArray.length;
-    }
-
-    // Create blob and download
-    const blob = new Blob([combined], { type: receivingFile.type });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = receivingFile.name;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-
-    // FREE TIER SAFE: Clean up IndexedDB and localStorage after successful download
-    const fileName = receivingFile.name;
-    try {
-        await deleteFileFromIndexedDB(fileName);
-        deleteFileMetadataFromLocalStorage(fileName);
-        console.log(`✅ Cleaned up storage for ${fileName}`);
-    } catch (error) {
-        console.error('❌ Error cleaning up storage:', error);
-        // Continue anyway - file was downloaded successfully
-    }
-
-    // Hide transfer info, show drop zone and success message
-    transferInfo.style.display = 'none';
-    dropZone.style.display = 'block';
-    successMessage.style.display = 'flex';
-    successText.textContent = `File "${receivingFile.name}" downloaded successfully!`;
-
-    // Add to success history
-    if (receivedFiles) {
-        showReceivedFileComplete({
-            name: receivingFile.name,
-            size: receivingFileSize
         });
     }
 
-    // Reset transfer stats but keep success message visible
-    resetTransferStats();
-
-    // Reset file variables
-    receivingFile = null;
-    receivingFileSize = 0;
-    receivedBytes = 0;
-    currentChunkIndex = 0;
-    fileCompleteSignalReceived = false;
-    allBytesReceivedTime = null;
-    pendingFileRequest = null;
-
-    // Clear completion check interval
-    if (completionCheckInterval) {
-        clearInterval(completionCheckInterval);
-        completionCheckInterval = null;
+    if (developerAvatar) {
+        developerAvatar.addEventListener('click', () => {
+            if (donateModal && donationImage) {
+                donationImage.src = 'aiks.jpg';
+                donateModal.style.display = 'flex';
+            }
+        });
+        developerAvatar.style.cursor = 'pointer';
     }
 
-    // Re-enable accept/reject buttons for next file if any
-    setTimeout(() => {
-        if (acceptFileBtn) acceptFileBtn.disabled = false;
-        if (rejectFileBtn) rejectFileBtn.disabled = false;
-    }, 500);
-
-    // After file completes, wait for next file-metadata from sender
-    console.log('Waiting for next file metadata from sender...');
-
-    // Hide success message after delay but keep drop zone visible
-    setTimeout(() => {
-        successMessage.style.display = 'none';
-    }, 5000);
-}
-
-async function completeSendingFile() {
-    const fileName = currentFile?.name;
-
-    // Release wake lock when transfer completes
-    releaseWakeLock();
-
-    // CRITICAL: Flush buffer before sending next file
-    // This ensures clean file boundaries under load
-    if (dataChannel && dataChannel.readyState === 'open' && dataChannel.bufferedAmount > 0) {
-        console.log(`🔄 Flushing buffer before next file (${(dataChannel.bufferedAmount / 1024 / 1024).toFixed(2)}MB remaining)...`);
-        await waitForDrain();
-        console.log('✅ Buffer flushed - ready for next file');
+    if (closeModal) {
+        closeModal.addEventListener('click', () => {
+            if (donateModal) donateModal.style.display = 'none';
+        });
     }
 
-    // Show success message
-    successMessage.style.display = 'flex';
-    successText.textContent = `File "${fileName}" uploaded successfully!`;
-
-    // Reset transfer stats
-    resetTransferStats();
-
-    // Remove completed file from queue
-    if (fileQueue.length > 0 && fileQueue[0] === currentFile) {
-        fileQueue.shift();
+    if (donateModal) {
+        donateModal.addEventListener('click', (e) => {
+            if (e.target === donateModal) donateModal.style.display = 'none';
+        });
     }
 
-    currentFile = null;
-
-    // If there are more files in queue, continue processing
-    if (fileQueue.length > 0) {
-        // Hide success message after short delay
-        setTimeout(() => {
-            successMessage.style.display = 'none';
-        }, 2000);
-        // Continue processing queue (if all files were accepted, will auto-start next file)
-        isProcessingQueue = false;
-        processFileQueue();
-    } else {
-        // No more files, show drop zone
-        isProcessingQueue = false;
-        transferInfo.style.display = 'none';
-        dropZone.style.display = 'block';
-
-        // Hide success message after delay
-        setTimeout(() => {
-            successMessage.style.display = 'none';
-        }, 5000);
-    }
-}
-
-// UI Updates
-function showTransferUI(file, label = 'Uploading...') {
-    transferInfo.style.display = 'block';
-    fileNameEl.textContent = file.name;
-    fileSizeEl.textContent = formatFileSize(file.size);
-    if (progressLabel) {
-        progressLabel.textContent = label;
-    }
-    resetTransferStats();
-}
-
-function showReceivingFileUI(file) {
-    transferInfo.style.display = 'block';
-    fileNameEl.textContent = `Receiving: ${file.name}`;
-    fileSizeEl.textContent = formatFileSize(file.size);
-    if (progressLabel) {
-        progressLabel.textContent = 'Downloading...';
-    }
-    resetTransferStats();
-}
-
-function updateProgress(percent) {
-    // Sender-side UI: prefer ACK-based progress when available
-    let percentToShow = percent;
-
-    if (totalChunksSent > 0 && ackedChunks && ackedChunks.size > 0) {
-        const ackPercent = (ackedChunks.size / totalChunksSent) * 100;
-        // Don't over-report beyond what was actually ACKed
-        percentToShow = Math.min(100, Math.max(0, ackPercent));
-    }
-
-    progressFill.style.width = `${Math.min(100, Math.max(0, percentToShow))}%`;
-    progressPercent.textContent = `${Math.round(percentToShow)}%`;
-
-    // Calculate speed and time remaining
-    const now = Date.now();
-    const elapsed = (now - transferStats.startTime) / 1000;
-    const speed = transferStats.bytesTransferred / elapsed;
-    const remaining = currentFile ? (currentFile.size - transferStats.bytesTransferred) : 0;
-    const timeRemainingSeconds = speed > 0 ? remaining / speed : 0;
-
-    transferSpeed.textContent = formatSpeed(speed);
-    timeRemaining.textContent = formatTime(timeRemainingSeconds);
-}
-
-function updateReceivingProgress(percent) {
-    // Clamp percent between 0 and 100
-    const clampedPercent = Math.min(100, Math.max(0, percent));
-    progressFill.style.width = `${clampedPercent}%`;
-    progressPercent.textContent = `${Math.round(clampedPercent)}%`;
-
-    // Calculate speed and time remaining
-    const now = Date.now();
-    const elapsed = (now - transferStats.startTime) / 1000;
-    const speed = receivedBytes / elapsed;
-    const remaining = receivingFileSize - receivedBytes;
-    const timeRemainingSeconds = speed > 0 ? remaining / speed : 0;
-
-    transferSpeed.textContent = formatSpeed(speed);
-    timeRemaining.textContent = formatTime(timeRemainingSeconds);
-}
-
-function resetTransferStats() {
-    transferStats.bytesTransferred = 0;
-    transferStats.startTime = null;
-    transferStats.lastUpdateTime = null;
-    transferStats.lastBytesTransferred = 0;
-    progressFill.style.width = '0%';
-    progressPercent.textContent = '0%';
-    transferSpeed.textContent = '0 MB/s';
-    timeRemaining.textContent = '--';
-}
-
-function resetTransferUI() {
-    transferInfo.style.display = 'none';
-    fileRequest.style.display = 'none';
-    allFilesAccepted = false; // Reset bulk acceptance flag
-    dropZone.style.display = 'block';
-    currentFile = null;
-    pendingFileRequest = null;
-    fileQueue = []; // Clear file queue
-    isProcessingQueue = false;
-    allFilesAccepted = false; // Reset bulk acceptance flag
-    if (currentFileResolve) {
-        currentFileResolve();
-        currentFileResolve = null;
-    }
-    resetTransferStats();
-}
-
-function showReceivedFileComplete(file) {
-    const item = document.createElement('div');
-    item.className = 'received-file-item completed';
-    item.innerHTML = `
-        <div class="file-name">${file.name}</div>
-        <div class="file-size">${formatFileSize(file.size)} - Completed</div>
-    `;
-    receivedFiles.insertBefore(item, receivedFiles.firstChild);
-}
-
-function updateConnectionStatus(status, text) {
-    statusIndicator.className = `status-indicator ${status}`;
-    statusText.textContent = text;
-
-    // Show server URL when connecting or connected
-    if (status === 'connecting' || status === 'connected' || status === 'relayed') {
-        if (connectionInfo && serverUrl) {
-            connectionInfo.style.display = 'flex';
-            serverUrl.textContent = WS_URL;
+    // Escape key closes modal
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && donateModal) {
+            donateModal.style.display = 'none';
         }
-    } else {
-        if (connectionInfo) {
-            connectionInfo.style.display = 'none';
-        }
-    }
+    });
 }
 
-// Utility Functions
-function formatFileSize(bytes) {
-    if (bytes === 0) return '0 Bytes';
-    const k = 1024;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + ' ' + sizes[i];
-}
-
-function formatSpeed(bytesPerSecond) {
-    return formatFileSize(bytesPerSecond) + '/s';
-}
-
-function formatTime(seconds) {
-    if (!isFinite(seconds) || seconds < 0) return '--';
-    if (seconds < 60) return `${Math.round(seconds)}s`;
-    if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
-    const hours = Math.floor(seconds / 3600);
-    const minutes = Math.round((seconds % 3600) / 60);
-    return `${hours}h ${minutes}m`;
-}
+// Start the application
+init();
