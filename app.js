@@ -1,22 +1,31 @@
 // ============================================================================
-// POJO FILES - HYBRID TRANSFER MODEL
+// POJO FILES - OPTIMIZED DATACHANNEL TRANSFER
 // ============================================================================
-// WebRTC: Signaling, peer discovery, metadata, control messages
-// HTTP: All file data transfer (resumable, high-speed)
+// High-speed P2P file transfer with:
+// - RAM buffer queue (non-blocking receive)
+// - Background IndexedDB writer
+// - Unordered DataChannel for max speed
+// - Network-based speed calculation
 // ============================================================================
 
-// WebRTC Configuration (for signaling only, not file data)
+// WebRTC Configuration - TURN required for production reliability
+// TURN handles: CGNAT, mobile networks, firewalls, long-running transfers
 const ICE_SERVERS = [
     { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" }
+    {
+        urls: "turn:free.expressturn.com:3478?transport=tcp",
+        username: "000000002083986270",
+        credential: "yaZXTjsDpaLSnBGYVnDxMZ+acj8="
+    }
 ];
 
 // ============================================================================
-// HTTP TRANSFER CONFIGURATION
+// TRANSFER CONFIGURATION - OPTIMIZED FOR SPEED
 // ============================================================================
-const HTTP_CHUNK_SIZE = 4 * 1024 * 1024;  // 4MB chunks (balance of speed and memory)
-const MAX_PARALLEL_UPLOADS = 2;            // Parallel upload streams
-const PROGRESS_UPDATE_INTERVAL = 500;      // Progress updates every 500ms
+const CHUNK_SIZE = 64 * 1024;              // 64KB chunks
+const HIGH_WATER_MARK = 16 * 1024 * 1024;  // 16MB buffer before backpressure
+const MAX_RAM_MB = 256;                     // Max RAM buffer size
+const MAX_RAM_BYTES = MAX_RAM_MB * 1024 * 1024;
 
 // ============================================================================
 // WEBSOCKET URL CONFIGURATION
@@ -48,17 +57,8 @@ function getWebSocketURL() {
     return `${protocol}//${hostname}:${port}`;
 }
 
-function getHttpBaseURL() {
-    const hostname = window.location.hostname;
-    const protocol = window.location.protocol;
-    const port = window.location.port || '';
-    return port ? `${protocol}//${hostname}:${port}` : `${protocol}//${hostname}`;
-}
-
 const WS_URL = getWebSocketURL();
-const HTTP_BASE_URL = getHttpBaseURL();
 console.log('WebSocket URL:', WS_URL);
-console.log('HTTP Base URL:', HTTP_BASE_URL);
 
 // ============================================================================
 // STATE MANAGEMENT
@@ -74,33 +74,34 @@ let currentFile = null;
 let fileQueue = [];
 let isProcessingQueue = false;
 
-// Upload session state
-let currentUploadSession = null;  // { uploadId, fileName, fileSize, offset }
-let uploadAbortController = null;
-
 // Transfer state
-const TransferState = {
-    IDLE: 'IDLE',
-    CONNECTING: 'CONNECTING',
-    SENDING: 'SENDING',
-    RECEIVING: 'RECEIVING',
-    PAUSED: 'PAUSED',
-    COMPLETED: 'COMPLETED',
-    FAILED: 'FAILED'
-};
-let transferState = TransferState.IDLE;
+let transferActive = false;
+let transferAborted = false;
 
-// Receiver state
-let pendingFileOffer = null;      // { fileId, fileName, fileSize, mimeType, uploadId }
-let pendingFileOfferQueue = [];    // Queue for multiple file offers
+// Sender state
+let senderChunkIndex = 0;
+let totalBytesSent = 0;
 
-// Transfer statistics
-let transferStats = {
-    bytesTransferred: 0,
-    startTime: null,
-    lastUpdateTime: null,
-    lastBytesTransferred: 0
-};
+// Receiver state - RAM BUFFER (KEY OPTIMIZATION)
+const RAM_QUEUE = [];
+let ramBytes = 0;
+let receivingFile = null;
+let receivingFileSize = 0;
+let receivingFileName = '';
+let receivingMimeType = '';
+let totalBytesReceived = 0;       // Network bytes (for speed calc)
+let totalBytesWrittenToDisk = 0;  // Disk bytes (for progress)
+let expectedTotalChunks = 0;
+let receivedChunkCount = 0;
+
+// Speed calculation (NETWORK-BASED)
+let speedStartTime = null;
+let lastSpeedUpdate = null;
+let lastBytesForSpeed = 0;
+
+// Pending file requests
+let pendingFileRequest = null;
+let pendingFileRequestQueue = [];
 
 // Mobile detection
 const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
@@ -109,64 +110,144 @@ const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
 let wakeLock = null;
 
 // ============================================================================
-// LOCALSTORAGE PERSISTENCE
+// INDEXEDDB STORAGE
 // ============================================================================
+let db = null;
+const DB_NAME = 'P2PFileTransferDB';
+const DB_VERSION = 1;
+const STORE_NAME = 'fileChunks';
 
-function saveUploadSession(session) {
-    try {
-        localStorage.setItem(`uploadSession_${session.uploadId}`, JSON.stringify({
-            ...session,
-            timestamp: Date.now()
-        }));
-        console.log(`💾 Saved upload session: ${session.uploadId}`);
-    } catch (error) {
-        console.error('Error saving upload session:', error);
-    }
+async function initIndexedDB() {
+    return new Promise((resolve, reject) => {
+        const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+        request.onerror = () => {
+            console.error('❌ IndexedDB open failed:', request.error);
+            reject(request.error);
+        };
+
+        request.onsuccess = () => {
+            db = request.result;
+            console.log('✅ IndexedDB initialized');
+            resolve(db);
+        };
+
+        request.onupgradeneeded = (event) => {
+            const database = event.target.result;
+            if (!database.objectStoreNames.contains(STORE_NAME)) {
+                const store = database.createObjectStore(STORE_NAME, { keyPath: 'id' });
+                store.createIndex('fileName', 'fileName', { unique: false });
+                console.log('✅ IndexedDB store created');
+            }
+        };
+    });
 }
 
-function getUploadSession(uploadId) {
-    try {
-        const data = localStorage.getItem(`uploadSession_${uploadId}`);
-        return data ? JSON.parse(data) : null;
-    } catch (error) {
-        console.error('Error reading upload session:', error);
-        return null;
-    }
+// NON-BLOCKING chunk save (no await in caller)
+function saveChunkToIndexedDB(fileName, chunkIndex, chunkData) {
+    if (!db) return;
+
+    const transaction = db.transaction([STORE_NAME], 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+
+    store.put({
+        id: `${fileName}_${chunkIndex}`,
+        fileName: fileName,
+        chunkIndex: chunkIndex,
+        data: chunkData,
+        timestamp: Date.now()
+    });
+
+    // No await, fire and forget
 }
 
-function deleteUploadSession(uploadId) {
-    try {
-        localStorage.removeItem(`uploadSession_${uploadId}`);
-        console.log(`🗑️ Deleted upload session: ${uploadId}`);
-    } catch (error) {
-        console.error('Error deleting upload session:', error);
-    }
+async function getAllChunksFromIndexedDB(fileName) {
+    if (!db) await initIndexedDB();
+
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction([STORE_NAME], 'readonly');
+        const store = transaction.objectStore(STORE_NAME);
+        const index = store.index('fileName');
+        const request = index.getAll(fileName);
+
+        request.onsuccess = () => {
+            const chunks = request.result;
+            chunks.sort((a, b) => a.chunkIndex - b.chunkIndex);
+            resolve(chunks.map(c => c.data));
+        };
+
+        request.onerror = () => reject(request.error);
+    });
 }
 
-// ============================================================================
-// SCREEN WAKE LOCK (Mobile)
-// ============================================================================
+async function deleteFileFromIndexedDB(fileName) {
+    if (!db) return;
 
-async function requestWakeLock() {
-    try {
-        if ('wakeLock' in navigator) {
-            wakeLock = await navigator.wakeLock.request('screen');
-            console.log('📱 Screen Wake Lock active');
+    return new Promise((resolve) => {
+        const transaction = db.transaction([STORE_NAME], 'readwrite');
+        const store = transaction.objectStore(STORE_NAME);
+        const index = store.index('fileName');
+        const request = index.openKeyCursor(IDBKeyRange.only(fileName));
+
+        request.onsuccess = (event) => {
+            const cursor = event.target.result;
+            if (cursor) {
+                store.delete(cursor.primaryKey);
+                cursor.continue();
+            } else {
+                resolve();
+            }
+        };
+
+        request.onerror = () => resolve();
+    });
+}
+
+// Initialize IndexedDB on load
+initIndexedDB().catch(console.error);
+
+// ============================================================================
+// BACKGROUND INDEXEDDB WRITER (NON-BLOCKING) - KEY OPTIMIZATION
+// ============================================================================
+let diskWriterRunning = false;
+
+async function diskWriterLoop() {
+    if (diskWriterRunning) return;
+    diskWriterRunning = true;
+
+    console.log('💾 Background disk writer started');
+
+    while (transferActive || RAM_QUEUE.length > 0) {
+        if (RAM_QUEUE.length === 0) {
+            await sleep(5);
+            continue;
         }
-    } catch (err) {
-        console.warn(`Wake Lock not available: ${err.message}`);
+
+        const item = RAM_QUEUE.shift();
+        ramBytes -= item.data.byteLength;
+
+        // NO await - fire and forget to IndexedDB
+        saveChunkToIndexedDB(item.fileName, item.chunkIndex, item.data);
+        totalBytesWrittenToDisk += item.data.byteLength;
+
+        // Update disk progress occasionally
+        if (RAM_QUEUE.length % 100 === 0) {
+            updateDiskProgress();
+        }
     }
+
+    diskWriterRunning = false;
+    console.log('💾 Background disk writer finished');
 }
 
-function releaseWakeLock() {
-    if (wakeLock) {
-        try {
-            wakeLock.release();
-            wakeLock = null;
-            console.log('📱 Screen Wake Lock released');
-        } catch (err) {
-            console.warn(`Error releasing wake lock: ${err.message}`);
-        }
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function updateDiskProgress() {
+    if (receivingFileSize > 0) {
+        const diskPercent = (totalBytesWrittenToDisk / receivingFileSize) * 100;
+        // Could show separate disk progress if needed
     }
 }
 
@@ -199,54 +280,47 @@ function updateProgress(percent) {
     const progressFill = document.getElementById('progressFill');
     const progressPercent = document.getElementById('progressPercent');
 
-    if (progressFill) {
-        progressFill.style.width = `${percent}%`;
-    }
-    if (progressPercent) {
-        progressPercent.textContent = `${percent.toFixed(1)}%`;
-    }
+    if (progressFill) progressFill.style.width = `${percent}%`;
+    if (progressPercent) progressPercent.textContent = `${percent.toFixed(1)}%`;
 }
 
-function updateTransferSpeed() {
+// NETWORK-BASED speed calculation (inside onmessage context)
+function updateNetworkSpeed() {
     const now = Date.now();
-    const elapsedSinceLastUpdate = (now - transferStats.lastUpdateTime) / 1000;
-    const bytesSinceLastUpdate = transferStats.bytesTransferred - transferStats.lastBytesTransferred;
+    if (!lastSpeedUpdate) {
+        lastSpeedUpdate = now;
+        lastBytesForSpeed = totalBytesReceived;
+        return;
+    }
 
-    if (elapsedSinceLastUpdate > 0) {
-        const speedBps = bytesSinceLastUpdate / elapsedSinceLastUpdate;
-        const speedText = document.getElementById('transferSpeed');
-        const timeRemaining = document.getElementById('timeRemaining');
+    const elapsed = (now - lastSpeedUpdate) / 1000;
+    if (elapsed < 0.5) return; // Update every 500ms
 
-        if (speedText) {
-            if (speedBps > 1024 * 1024) {
-                speedText.textContent = `${(speedBps / (1024 * 1024)).toFixed(1)} MB/s`;
-            } else if (speedBps > 1024) {
-                speedText.textContent = `${(speedBps / 1024).toFixed(1)} KB/s`;
-            } else {
-                speedText.textContent = `${speedBps.toFixed(0)} B/s`;
-            }
-        }
+    const bytesDelta = totalBytesReceived - lastBytesForSpeed;
+    const speedBps = bytesDelta / elapsed;
 
-        if (timeRemaining && currentFile) {
-            const remainingBytes = currentFile.size - transferStats.bytesTransferred;
-            if (speedBps > 0) {
-                const remainingSeconds = remainingBytes / speedBps;
-                timeRemaining.textContent = formatTime(remainingSeconds);
-            }
+    const speedText = document.getElementById('transferSpeed');
+    const timeRemaining = document.getElementById('timeRemaining');
+
+    if (speedText) {
+        if (speedBps > 1024 * 1024) {
+            speedText.textContent = `${(speedBps / (1024 * 1024)).toFixed(1)} MB/s`;
+        } else if (speedBps > 1024) {
+            speedText.textContent = `${(speedBps / 1024).toFixed(1)} KB/s`;
+        } else {
+            speedText.textContent = `${speedBps.toFixed(0)} B/s`;
         }
     }
 
-    transferStats.lastUpdateTime = now;
-    transferStats.lastBytesTransferred = transferStats.bytesTransferred;
-}
+    if (timeRemaining && receivingFileSize > 0) {
+        const remaining = receivingFileSize - totalBytesReceived;
+        if (speedBps > 0) {
+            timeRemaining.textContent = formatTime(remaining / speedBps);
+        }
+    }
 
-function resetTransferStats() {
-    transferStats = {
-        bytesTransferred: 0,
-        startTime: null,
-        lastUpdateTime: null,
-        lastBytesTransferred: 0
-    };
+    lastSpeedUpdate = now;
+    lastBytesForSpeed = totalBytesReceived;
 }
 
 function updateConnectionStatus(status, text) {
@@ -255,30 +329,26 @@ function updateConnectionStatus(status, text) {
 
     if (statusIndicator) {
         statusIndicator.className = 'status-indicator';
-        if (status === 'connected') {
-            statusIndicator.classList.add('connected');
-        } else if (status === 'connecting') {
-            statusIndicator.classList.add('connecting');
-        }
+        if (status === 'connected') statusIndicator.classList.add('connected');
+        else if (status === 'connecting') statusIndicator.classList.add('connecting');
     }
-
-    if (statusText) {
-        statusText.textContent = text;
-    }
+    if (statusText) statusText.textContent = text;
 }
 
-function showTransferInfo(fileName, fileSize) {
+function showTransferInfo(fileName, fileSize, label = 'Transferring...') {
     const transferInfo = document.getElementById('transferInfo');
     const fileNameEl = document.getElementById('fileName');
     const fileSizeEl = document.getElementById('fileSize');
     const dropZone = document.getElementById('dropZone');
     const transferSection = document.getElementById('transferSection');
+    const progressLabel = document.getElementById('progressLabel');
 
     if (transferSection) transferSection.style.display = 'block';
     if (dropZone) dropZone.style.display = 'none';
     if (transferInfo) transferInfo.style.display = 'block';
     if (fileNameEl) fileNameEl.textContent = fileName;
     if (fileSizeEl) fileSizeEl.textContent = formatFileSize(fileSize);
+    if (progressLabel) progressLabel.textContent = label;
 
     updateProgress(0);
 }
@@ -291,18 +361,14 @@ function hideTransferInfo() {
     if (dropZone) dropZone.style.display = 'flex';
 }
 
-function showSuccessMessage(fileName) {
+function showSuccessMessage(text) {
     const successMessage = document.getElementById('successMessage');
     const successText = document.getElementById('successText');
 
     if (successMessage) {
         successMessage.style.display = 'flex';
-        if (successText) {
-            successText.textContent = `${fileName} transferred successfully!`;
-        }
-        setTimeout(() => {
-            successMessage.style.display = 'none';
-        }, 5000);
+        if (successText) successText.textContent = text;
+        setTimeout(() => successMessage.style.display = 'none', 5000);
     }
 }
 
@@ -311,437 +377,464 @@ function showUserMessage(message) {
 }
 
 // ============================================================================
-// HTTP UPLOAD API (Sender)
+// WAKE LOCK
 // ============================================================================
 
-async function createUploadSession(file) {
-    console.log(`📤 Creating upload session for: ${file.name}`);
+async function requestWakeLock() {
+    try {
+        if ('wakeLock' in navigator) {
+            wakeLock = await navigator.wakeLock.request('screen');
+            console.log('📱 Wake Lock active');
+        }
+    } catch (err) {
+        console.warn('Wake Lock not available:', err.message);
+    }
+}
 
-    const response = await fetch(`${HTTP_BASE_URL}/upload/session`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            fileName: file.name,
-            fileSize: file.size,
-            mimeType: file.type || 'application/octet-stream',
-            chunkSize: HTTP_CHUNK_SIZE
-        })
+function releaseWakeLock() {
+    if (wakeLock) {
+        wakeLock.release().catch(() => { });
+        wakeLock = null;
+    }
+}
+
+// ============================================================================
+// WEBSOCKET SINGLETON
+// ============================================================================
+
+let wsReconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 10;
+const RECONNECT_DELAY_MS = 2000;
+
+function getSocket() {
+    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+        ws = createWebSocket();
+    }
+    return ws;
+}
+
+async function ensureSocketConnected() {
+    const socket = getSocket();
+    if (socket.readyState === WebSocket.OPEN) return socket;
+
+    if (socket.readyState === WebSocket.CONNECTING) {
+        return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => reject(new Error('Timeout')), 10000);
+            socket.addEventListener('open', () => { clearTimeout(timeout); resolve(socket); }, { once: true });
+            socket.addEventListener('error', () => { clearTimeout(timeout); reject(new Error('Failed')); }, { once: true });
+        });
+    }
+
+    return reconnectSocket();
+}
+
+async function reconnectSocket() {
+    if (wsReconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+        updateConnectionStatus('disconnected', 'Connection failed');
+        return null;
+    }
+
+    wsReconnectAttempts++;
+    console.log(`🔄 Reconnecting (${wsReconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
+
+    return new Promise((resolve, reject) => {
+        ws = createWebSocket();
+        const timeout = setTimeout(() => reject(new Error('Timeout')), 10000);
+
+        ws.addEventListener('open', () => {
+            clearTimeout(timeout);
+            wsReconnectAttempts = 0;
+            if (currentRoom) {
+                ws.send(JSON.stringify({ type: 'join', room: currentRoom }));
+            }
+            resolve(ws);
+        }, { once: true });
+
+        ws.addEventListener('error', () => {
+            clearTimeout(timeout);
+            setTimeout(() => reconnectSocket().then(resolve).catch(reject), RECONNECT_DELAY_MS);
+        }, { once: true });
+    });
+}
+
+function createWebSocket() {
+    console.log(`📡 Connecting to: ${WS_URL}`);
+    updateConnectionStatus('connecting', 'Connecting...');
+
+    const socket = new WebSocket(WS_URL);
+
+    socket.onopen = () => {
+        console.log('✅ WebSocket connected');
+        wsReconnectAttempts = 0;
+        if (currentRoom) {
+            socket.send(JSON.stringify({ type: 'join', room: currentRoom }));
+        }
+    };
+
+    socket.onmessage = (event) => {
+        try {
+            handleSignalingMessage(JSON.parse(event.data));
+        } catch (e) {
+            console.error('Parse error:', e);
+        }
+    };
+
+    socket.onerror = (e) => {
+        console.error('WebSocket error:', e);
+        updateConnectionStatus('disconnected', 'Error');
+    };
+
+    socket.onclose = (event) => {
+        console.log(`WebSocket closed: ${event.code}`);
+        if (currentRoom && event.code !== 1000) {
+            updateConnectionStatus('disconnected', 'Reconnecting...');
+            setTimeout(() => reconnectSocket().catch(console.error), RECONNECT_DELAY_MS);
+        } else {
+            updateConnectionStatus('disconnected', 'Disconnected');
+        }
+    };
+
+    return socket;
+}
+
+// Keep connection alive on visibility change
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'ping' }));
+        }
+    } else {
+        if (ws && ws.readyState !== WebSocket.OPEN && currentRoom) {
+            reconnectSocket().catch(console.error);
+        }
+    }
+});
+
+function connectWebSocket() {
+    ws = getSocket();
+}
+
+// ============================================================================
+// SIGNALING MESSAGE HANDLERS
+// ============================================================================
+
+function handleSignalingMessage(msg) {
+    switch (msg.type) {
+        case 'joined':
+            console.log(`✅ Joined: ${msg.room}`);
+            if (msg.isInitiator !== undefined) isInitiator = msg.isInitiator;
+            showRoomDisplay();
+            updateConnectionStatus('connecting', 'Waiting for peer...');
+            if (isInitiator) createPeerConnection();
+            break;
+
+        case 'room-state':
+            console.log(`📊 Peers: ${msg.peerCount}`);
+            if (msg.hasPeer) {
+                updateConnectionStatus('connecting', 'Connecting to peer...');
+                if (!peerConnection) createPeerConnection();
+                if (isInitiator && !dataChannel) {
+                    createDataChannel();
+                    createOffer();
+                }
+            }
+            break;
+
+        case 'peer-joined':
+            console.log('👤 Peer joined');
+            if (!peerConnection) createPeerConnection();
+            if (isInitiator) {
+                createDataChannel();
+                createOffer();
+            }
+            break;
+
+        case 'peer-left':
+            console.log('👋 Peer left');
+            updateConnectionStatus('connecting', 'Peer disconnected');
+            if (dataChannel) { dataChannel.close(); dataChannel = null; }
+            if (peerConnection) { peerConnection.close(); peerConnection = null; }
+            break;
+
+        case 'offer':
+            handleOffer(msg.offer);
+            break;
+
+        case 'answer':
+            handleAnswer(msg.answer);
+            break;
+
+        case 'ice-candidate':
+            handleIceCandidate(msg.candidate);
+            break;
+
+        case 'pong':
+            break;
+
+        case 'error':
+            console.error('Server error:', msg.message);
+            showUserMessage(msg.message);
+            break;
+    }
+}
+
+// ============================================================================
+// WEBRTC
+// ============================================================================
+
+function createPeerConnection() {
+    console.log('🔗 Creating peer connection');
+    peerConnection = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+
+    peerConnection.onicecandidate = (e) => {
+        if (e.candidate && ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                type: 'ice-candidate',
+                candidate: e.candidate,
+                room: currentRoom
+            }));
+        }
+    };
+
+    peerConnection.onconnectionstatechange = () => {
+        console.log(`🔗 State: ${peerConnection.connectionState}`);
+        if (peerConnection.connectionState === 'connected') {
+            updateConnectionStatus('connected', 'P2P Connected');
+        } else if (peerConnection.connectionState === 'failed') {
+            updateConnectionStatus('disconnected', 'Connection failed');
+        }
+    };
+
+    peerConnection.ondatachannel = (e) => {
+        console.log('📡 Received DataChannel');
+        setupDataChannel(e.channel);
+    };
+}
+
+// OPTIMIZED DataChannel: unordered for max speed
+function createDataChannel() {
+    console.log('📡 Creating DataChannel (unordered, maxPacketLifeTime: 300)');
+
+    dataChannel = peerConnection.createDataChannel('file', {
+        ordered: false,           // Unordered for speed
+        maxPacketLifeTime: 300    // 300ms max lifetime
     });
 
-    if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.error || 'Failed to create upload session');
-    }
-
-    const session = await response.json();
-    console.log(`✅ Upload session created: ${session.uploadId}`);
-
-    currentUploadSession = {
-        uploadId: session.uploadId,
-        uploadUrl: session.uploadUrl,
-        fileName: file.name,
-        fileSize: file.size,
-        offset: 0,
-        maxChunkSize: session.maxChunkSize
-    };
-
-    saveUploadSession(currentUploadSession);
-    return session;
+    setupDataChannel(dataChannel);
 }
 
-async function uploadFileHTTP(file, session, startOffset = 0) {
-    console.log(`📤 Starting HTTP upload: ${file.name} from offset ${startOffset}`);
+function setupDataChannel(channel) {
+    dataChannel = channel;
+    channel.binaryType = 'arraybuffer';
 
-    await requestWakeLock();
+    channel.onopen = () => {
+        console.log('✅ DataChannel opened');
+        updateConnectionStatus('connected', 'Ready to transfer');
+    };
 
-    transferState = TransferState.SENDING;
-    transferStats.startTime = Date.now();
-    transferStats.lastUpdateTime = Date.now();
-    transferStats.bytesTransferred = startOffset;
+    channel.onclose = () => {
+        console.log('📡 DataChannel closed');
+        updateConnectionStatus('disconnected', 'Channel closed');
+    };
 
-    showTransferInfo(file.name, file.size);
-    updateProgress((startOffset / file.size) * 100);
+    channel.onerror = (e) => console.error('DataChannel error:', e);
 
-    uploadAbortController = new AbortController();
-    const { signal } = uploadAbortController;
+    // CRITICAL: Non-blocking message handler
+    channel.onmessage = (event) => {
+        const data = event.data;
 
-    let offset = startOffset;
-    const chunkSize = session.maxChunkSize || HTTP_CHUNK_SIZE;
-
-    // Progress update interval
-    const progressInterval = setInterval(() => {
-        updateTransferSpeed();
-        sendProgressUpdate(transferStats.bytesTransferred, file.size);
-    }, PROGRESS_UPDATE_INTERVAL);
-
-    try {
-        while (offset < file.size) {
-            // Check for abort
-            if (signal.aborted) {
-                throw new Error('Upload aborted');
-            }
-
-            const end = Math.min(offset + chunkSize, file.size);
-            const chunk = file.slice(offset, end);
-
-            const response = await fetch(`${HTTP_BASE_URL}/upload/${session.uploadId}`, {
-                method: 'PUT',
-                headers: {
-                    'Content-Type': 'application/octet-stream',
-                    'Content-Range': `bytes ${offset}-${end - 1}/${file.size}`
-                },
-                body: chunk,
-                signal
-            });
-
-            if (!response.ok) {
-                const error = await response.json().catch(() => ({ error: 'Upload failed' }));
-                throw new Error(error.error || `HTTP ${response.status}`);
-            }
-
-            const result = await response.json();
-            offset = result.bytesReceived;
-
-            // Update state
-            transferStats.bytesTransferred = offset;
-            currentUploadSession.offset = offset;
-            saveUploadSession(currentUploadSession);
-
-            // Update UI
-            const percent = (offset / file.size) * 100;
-            updateProgress(percent);
-        }
-
-        clearInterval(progressInterval);
-
-        // Upload complete
-        console.log(`✅ Upload complete: ${file.name}`);
-        transferState = TransferState.COMPLETED;
-        updateProgress(100);
-
-        // Send completion via WebRTC
-        sendUploadComplete(session.uploadId, file.name, file.size);
-
-        // Cleanup
-        deleteUploadSession(session.uploadId);
-        showSuccessMessage(file.name);
-
-        setTimeout(() => {
-            hideTransferInfo();
-            currentFile = null;
-            currentUploadSession = null;
-            processFileQueue();
-        }, 2000);
-
-    } catch (error) {
-        clearInterval(progressInterval);
-
-        if (error.name === 'AbortError' || error.message === 'Upload aborted') {
-            console.log('📤 Upload aborted by user');
-            transferState = TransferState.PAUSED;
+        if (typeof data === 'string') {
+            handleControlMessage(JSON.parse(data));
         } else {
-            console.error('❌ Upload error:', error);
-            transferState = TransferState.FAILED;
-            showUserMessage(`Upload failed: ${error.message}`);
+            // Binary chunk - push to RAM queue (NO await)
+            handleBinaryChunk(data);
         }
-    } finally {
-        releaseWakeLock();
-        uploadAbortController = null;
-    }
-}
-
-async function resumeUpload(file) {
-    if (!currentUploadSession) {
-        console.log('No upload session to resume');
-        return false;
-    }
-
-    // Check session on server
-    try {
-        const response = await fetch(`${HTTP_BASE_URL}/upload/${currentUploadSession.uploadId}`);
-        if (!response.ok) {
-            console.log('Upload session expired, starting new upload');
-            currentUploadSession = null;
-            return false;
-        }
-
-        const serverSession = await response.json();
-        const resumeOffset = serverSession.receivedBytes || 0;
-
-        console.log(`🔄 Resuming upload from byte ${resumeOffset}`);
-        await uploadFileHTTP(file, currentUploadSession, resumeOffset);
-        return true;
-
-    } catch (error) {
-        console.error('Failed to check upload session:', error);
-        return false;
-    }
-}
-
-// ============================================================================
-// WEBRTC CONTROL MESSAGES
-// ============================================================================
-
-function sendFileOffer(uploadId, file) {
-    if (!dataChannel || dataChannel.readyState !== 'open') {
-        console.error('Cannot send file offer: DataChannel not open');
-        return false;
-    }
-
-    const offer = {
-        type: 'file-offer',
-        fileId: uploadId,
-        uploadId: uploadId,
-        fileName: file.name,
-        fileSize: file.size,
-        mimeType: file.type || 'application/octet-stream'
     };
-
-    dataChannel.send(JSON.stringify(offer));
-    console.log(`📤 Sent file offer: ${file.name} (${uploadId})`);
-    return true;
 }
 
-function sendFileAccept(fileId) {
-    if (!dataChannel || dataChannel.readyState !== 'open') {
-        console.error('Cannot send file accept: DataChannel not open');
-        return;
+// ============================================================================
+// BINARY CHUNK HANDLER (RAM BUFFER - NO AWAIT)
+// ============================================================================
+
+function handleBinaryChunk(buffer) {
+    if (!receivingFile) return;
+
+    // Extract chunk index from header (first 4 bytes)
+    const view = new DataView(buffer);
+    const chunkIndex = view.getUint32(0, true);
+    const payload = buffer.slice(4);
+
+    // Update network stats IMMEDIATELY (for speed calc)
+    totalBytesReceived += payload.byteLength;
+    receivedChunkCount++;
+
+    // Update speed from network bytes
+    updateNetworkSpeed();
+
+    // Update progress from network bytes
+    const percent = (totalBytesReceived / receivingFileSize) * 100;
+    updateProgress(Math.min(99.9, percent));
+
+    // Push to RAM queue (NON-BLOCKING)
+    RAM_QUEUE.push({
+        fileName: receivingFileName,
+        chunkIndex: chunkIndex,
+        data: payload
+    });
+    ramBytes += payload.byteLength;
+
+    // Check RAM limit
+    if (ramBytes > MAX_RAM_BYTES) {
+        console.warn(`⚠️ RAM buffer full: ${(ramBytes / 1024 / 1024).toFixed(0)}MB`);
+        // Writer will catch up
     }
 
-    dataChannel.send(JSON.stringify({
-        type: 'file-accept',
-        fileId: fileId
-    }));
-    console.log(`✅ Sent file accept: ${fileId}`);
-}
-
-function sendFileReject(fileId) {
-    if (!dataChannel || dataChannel.readyState !== 'open') {
-        console.error('Cannot send file reject: DataChannel not open');
-        return;
+    // Start background writer if not running
+    if (!diskWriterRunning) {
+        diskWriterLoop();
     }
 
-    dataChannel.send(JSON.stringify({
-        type: 'file-reject',
-        fileId: fileId
-    }));
-    console.log(`❌ Sent file reject: ${fileId}`);
+    // ACK every 100 chunks for flow control
+    if (receivedChunkCount % 100 === 0) {
+        sendAck(chunkIndex);
+    }
+
+    // Check completion
+    if (totalBytesReceived >= receivingFileSize) {
+        completeReceive();
+    }
 }
 
-function sendProgressUpdate(bytesUploaded, totalBytes) {
-    if (!dataChannel || dataChannel.readyState !== 'open') return;
-
-    try {
+function sendAck(chunkIndex) {
+    if (dataChannel && dataChannel.readyState === 'open') {
         dataChannel.send(JSON.stringify({
-            type: 'progress',
-            bytesUploaded,
-            totalBytes,
-            percent: Math.round((bytesUploaded / totalBytes) * 100)
+            type: 'ack',
+            chunkIndex: chunkIndex,
+            bytesReceived: totalBytesReceived
         }));
-    } catch (error) {
-        // Non-critical, ignore
     }
 }
 
-function sendUploadComplete(uploadId, fileName, fileSize) {
-    if (!dataChannel || dataChannel.readyState !== 'open') return;
+async function completeReceive() {
+    console.log('✅ All bytes received, finalizing...');
+    transferActive = false;
 
-    dataChannel.send(JSON.stringify({
-        type: 'upload-complete',
-        uploadId,
-        fileName,
-        fileSize
-    }));
-    console.log(`✅ Sent upload complete: ${fileName}`);
-}
+    // Update UI to show finalizing
+    const progressLabel = document.getElementById('progressLabel');
+    if (progressLabel) progressLabel.textContent = 'Finalizing file...';
 
-// ============================================================================
-// WEBRTC MESSAGE HANDLERS
-// ============================================================================
-
-function handleDataChannelMessage(event) {
-    const data = event.data;
-
-    // All messages should be JSON (no binary on DataChannel anymore)
-    if (typeof data !== 'string') {
-        console.warn('⚠️ Received unexpected binary data on DataChannel');
-        return;
+    // Wait for disk writer to finish
+    while (RAM_QUEUE.length > 0) {
+        await sleep(50);
     }
+
+    console.log('💾 Assembling file from IndexedDB...');
 
     try {
-        const message = JSON.parse(data);
+        // Get all chunks from IndexedDB
+        const chunks = await getAllChunksFromIndexedDB(receivingFileName);
 
-        switch (message.type) {
-            case 'ping':
-                dataChannel.send(JSON.stringify({ type: 'pong' }));
-                break;
+        // Create blob
+        const blob = new Blob(chunks, { type: receivingMimeType });
 
-            case 'pong':
-                // Keepalive acknowledged
-                break;
-
-            case 'file-offer':
-                handleFileOffer(message);
-                break;
-
-            case 'file-accept':
-                handleFileAccepted(message.fileId);
-                break;
-
-            case 'file-reject':
-                handleFileRejected(message.fileId);
-                break;
-
-            case 'progress':
-                handleProgressUpdate(message);
-                break;
-
-            case 'upload-complete':
-                handleUploadComplete(message);
-                break;
-
-            default:
-                console.warn('Unknown message type:', message.type);
-        }
-    } catch (error) {
-        console.error('Error parsing DataChannel message:', error);
-    }
-}
-
-function handleFileOffer(offer) {
-    console.log(`📥 Received file offer: ${offer.fileName} (${formatFileSize(offer.fileSize)})`);
-
-    pendingFileOfferQueue.push(offer);
-
-    // Show first offer in queue
-    if (pendingFileOfferQueue.length === 1) {
-        showFileOfferUI();
-    }
-}
-
-function handleFileAccepted(fileId) {
-    console.log(`✅ File accepted by peer: ${fileId}`);
-
-    // Start upload now that peer accepted
-    if (currentFile && currentUploadSession && currentUploadSession.uploadId === fileId) {
-        uploadFileHTTP(currentFile, currentUploadSession, 0);
-    }
-}
-
-function handleFileRejected(fileId) {
-    console.log(`❌ File rejected by peer: ${fileId}`);
-
-    // Cleanup
-    if (currentUploadSession && currentUploadSession.uploadId === fileId) {
-        deleteUploadSession(fileId);
-        currentUploadSession = null;
-        currentFile = null;
-        hideTransferInfo();
-        showUserMessage('File transfer was rejected by the receiver.');
-        processFileQueue();
-    }
-}
-
-function handleProgressUpdate(progress) {
-    // Update UI with sender's progress
-    if (transferState === TransferState.RECEIVING) {
-        updateProgress(progress.percent);
-        transferStats.bytesTransferred = progress.bytesUploaded;
-    }
-}
-
-function handleUploadComplete(message) {
-    console.log(`✅ Upload complete notification: ${message.fileName}`);
-
-    if (pendingFileOffer && pendingFileOffer.uploadId === message.uploadId) {
-        // Download the file
-        downloadFile(message.uploadId, message.fileName);
-    }
-}
-
-// ============================================================================
-// HTTP DOWNLOAD API (Receiver)
-// ============================================================================
-
-async function downloadFile(uploadId, fileName) {
-    console.log(`📥 Starting download: ${fileName}`);
-
-    await requestWakeLock();
-    transferState = TransferState.RECEIVING;
-
-    try {
-        const response = await fetch(`${HTTP_BASE_URL}/download/${uploadId}`);
-
-        if (!response.ok) {
-            throw new Error(`Download failed: HTTP ${response.status}`);
-        }
-
-        const contentLength = response.headers.get('content-length');
-        const total = parseInt(contentLength, 10) || 0;
-
-        // Read the response as a stream
-        const reader = response.body.getReader();
-        const chunks = [];
-        let received = 0;
-
-        transferStats.startTime = Date.now();
-        transferStats.lastUpdateTime = Date.now();
-
-        showTransferInfo(fileName, total);
-
-        while (true) {
-            const { done, value } = await reader.read();
-
-            if (done) break;
-
-            chunks.push(value);
-            received += value.length;
-
-            // Update progress
-            if (total > 0) {
-                const percent = (received / total) * 100;
-                updateProgress(percent);
-                transferStats.bytesTransferred = received;
-                updateTransferSpeed();
-            }
-        }
-
-        // Create blob and trigger download
-        const blob = new Blob(chunks);
+        // Trigger download
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = fileName;
+        a.download = receivingFileName;
         a.click();
         URL.revokeObjectURL(url);
 
-        console.log(`✅ Download complete: ${fileName}`);
-        transferState = TransferState.COMPLETED;
-        showSuccessMessage(fileName);
-
         // Cleanup
-        pendingFileOffer = null;
-        hideTransferInfo();
-        processNextFileOffer();
+        await deleteFileFromIndexedDB(receivingFileName);
+
+        updateProgress(100);
+        showSuccessMessage(`${receivingFileName} downloaded!`);
+
+        // Send completion to sender
+        if (dataChannel && dataChannel.readyState === 'open') {
+            dataChannel.send(JSON.stringify({
+                type: 'file-complete',
+                bytesReceived: totalBytesReceived
+            }));
+        }
 
     } catch (error) {
-        console.error('❌ Download error:', error);
-        transferState = TransferState.FAILED;
+        console.error('Error assembling file:', error);
         showUserMessage(`Download failed: ${error.message}`);
-    } finally {
-        releaseWakeLock();
     }
+
+    // Reset state
+    resetReceiverState();
+    hideTransferInfo();
+    releaseWakeLock();
+}
+
+function resetReceiverState() {
+    receivingFile = null;
+    receivingFileName = '';
+    receivingFileSize = 0;
+    receivingMimeType = '';
+    totalBytesReceived = 0;
+    totalBytesWrittenToDisk = 0;
+    receivedChunkCount = 0;
+    RAM_QUEUE.length = 0;
+    ramBytes = 0;
+    speedStartTime = null;
+    lastSpeedUpdate = null;
+    lastBytesForSpeed = 0;
 }
 
 // ============================================================================
-// FILE OFFER UI
+// CONTROL MESSAGE HANDLERS
 // ============================================================================
 
-function showFileOfferUI() {
-    if (pendingFileOfferQueue.length === 0) return;
+function handleControlMessage(msg) {
+    switch (msg.type) {
+        case 'file-request':
+            handleFileRequest(msg);
+            break;
 
-    const offer = pendingFileOfferQueue[0];
-    pendingFileOffer = offer;
+        case 'file-accept':
+            handleFileAccepted();
+            break;
+
+        case 'file-reject':
+            handleFileRejected();
+            break;
+
+        case 'ack':
+            handleAck(msg);
+            break;
+
+        case 'file-complete':
+            handleFileComplete(msg);
+            break;
+
+        case 'ping':
+            dataChannel.send(JSON.stringify({ type: 'pong' }));
+            break;
+
+        case 'pong':
+            break;
+    }
+}
+
+function handleFileRequest(request) {
+    console.log(`📥 File request: ${request.name} (${formatFileSize(request.size)})`);
+
+    pendingFileRequestQueue.push(request);
+
+    if (pendingFileRequestQueue.length === 1) {
+        showFileRequestUI();
+    }
+}
+
+function showFileRequestUI() {
+    if (pendingFileRequestQueue.length === 0) return;
+
+    const req = pendingFileRequestQueue[0];
+    pendingFileRequest = req;
 
     const transferSection = document.getElementById('transferSection');
     const dropZone = document.getElementById('dropZone');
@@ -754,135 +847,108 @@ function showFileOfferUI() {
     if (fileRequest) fileRequest.style.display = 'block';
 
     if (requestFileName) {
-        if (pendingFileOfferQueue.length > 1) {
-            requestFileName.textContent = `${offer.fileName} (+${pendingFileOfferQueue.length - 1} more files)`;
-        } else {
-            requestFileName.textContent = offer.fileName;
-        }
+        requestFileName.textContent = pendingFileRequestQueue.length > 1
+            ? `${req.name} (+${pendingFileRequestQueue.length - 1} more)`
+            : req.name;
     }
 
     if (requestFileSize) {
-        const totalSize = pendingFileOfferQueue.reduce((sum, o) => sum + o.fileSize, 0);
-        requestFileSize.textContent = formatFileSize(totalSize);
-    }
-}
-
-function hideFileOfferUI() {
-    const fileRequest = document.getElementById('fileRequest');
-    const dropZone = document.getElementById('dropZone');
-
-    if (fileRequest) fileRequest.style.display = 'none';
-    if (dropZone) dropZone.style.display = 'flex';
-}
-
-function processNextFileOffer() {
-    if (pendingFileOfferQueue.length > 0) {
-        pendingFileOfferQueue.shift();
-        if (pendingFileOfferQueue.length > 0) {
-            showFileOfferUI();
-        } else {
-            pendingFileOffer = null;
-            hideFileOfferUI();
-        }
+        const total = pendingFileRequestQueue.reduce((s, r) => s + r.size, 0);
+        requestFileSize.textContent = formatFileSize(total);
     }
 }
 
 function handleAcceptFile() {
-    if (!pendingFileOffer) return;
+    if (!pendingFileRequest) return;
 
-    console.log(`✅ Accepting file: ${pendingFileOffer.fileName}`);
+    const req = pendingFileRequest;
+    console.log(`✅ Accepting: ${req.name}`);
 
-    // Accept all pending files
-    for (const offer of pendingFileOfferQueue) {
-        sendFileAccept(offer.fileId);
-    }
+    // Setup receiver state
+    receivingFile = true;
+    receivingFileName = req.name;
+    receivingFileSize = req.size;
+    receivingMimeType = req.mimeType || 'application/octet-stream';
+    expectedTotalChunks = Math.ceil(req.size / CHUNK_SIZE);
+    totalBytesReceived = 0;
+    receivedChunkCount = 0;
+    transferActive = true;
 
-    hideFileOfferUI();
+    // Send accept
+    dataChannel.send(JSON.stringify({ type: 'file-accept' }));
 
-    // Show progress UI for first file
-    transferState = TransferState.RECEIVING;
-    showTransferInfo(pendingFileOffer.fileName, pendingFileOffer.fileSize);
+    // Hide request UI, show progress
+    const fileRequest = document.getElementById('fileRequest');
+    if (fileRequest) fileRequest.style.display = 'none';
 
-    // Update progress label
-    const progressLabel = document.getElementById('progressLabel');
-    if (progressLabel) {
-        progressLabel.textContent = 'Downloading...';
-    }
+    showTransferInfo(req.name, req.size, 'Receiving...');
+    requestWakeLock();
+
+    // Clear queue
+    pendingFileRequestQueue.shift();
+    pendingFileRequest = null;
 }
 
 function handleRejectFile() {
-    if (!pendingFileOffer) return;
+    if (!pendingFileRequest) return;
 
-    console.log(`❌ Rejecting files`);
+    dataChannel.send(JSON.stringify({ type: 'file-reject' }));
 
-    // Reject all pending files
-    for (const offer of pendingFileOfferQueue) {
-        sendFileReject(offer.fileId);
-    }
+    pendingFileRequestQueue = [];
+    pendingFileRequest = null;
 
-    pendingFileOfferQueue = [];
-    pendingFileOffer = null;
-    hideFileOfferUI();
+    const fileRequest = document.getElementById('fileRequest');
+    if (fileRequest) fileRequest.style.display = 'none';
+
+    const dropZone = document.getElementById('dropZone');
+    if (dropZone) dropZone.style.display = 'flex';
+}
+
+function handleFileAccepted() {
+    console.log('✅ File accepted, starting transfer');
+    startSendingFile();
+}
+
+function handleFileRejected() {
+    console.log('❌ File rejected');
+    showUserMessage('Transfer rejected by receiver');
+    currentFile = null;
+    hideTransferInfo();
+    processFileQueue();
+}
+
+function handleAck(msg) {
+    // Could use for flow control if needed
+}
+
+function handleFileComplete(msg) {
+    console.log(`✅ Transfer complete: ${msg.bytesReceived} bytes received`);
+    showSuccessMessage('File sent successfully!');
+    currentFile = null;
+    hideTransferInfo();
+    releaseWakeLock();
+    processFileQueue();
 }
 
 // ============================================================================
-// FILE HANDLING (Sender)
+// FILE SENDING
 // ============================================================================
-
-function handleDragOver(e) {
-    e.preventDefault();
-    e.stopPropagation();
-    const dropZone = document.getElementById('dropZone');
-    if (dropZone) dropZone.classList.add('drag-over');
-}
-
-function handleDragLeave(e) {
-    e.preventDefault();
-    const dropZone = document.getElementById('dropZone');
-    if (dropZone) dropZone.classList.remove('drag-over');
-}
-
-function handleDrop(e) {
-    e.preventDefault();
-    e.stopPropagation();
-
-    const dropZone = document.getElementById('dropZone');
-    if (dropZone) dropZone.classList.remove('drag-over');
-
-    const files = e.dataTransfer.files;
-    if (files.length > 0) {
-        addFilesToQueue(Array.from(files));
-    }
-}
-
-function handleFileSelect(e) {
-    const files = e.target.files;
-    if (files.length > 0) {
-        addFilesToQueue(Array.from(files));
-    }
-    e.target.value = '';  // Reset input
-}
 
 async function addFilesToQueue(files) {
-    // CRITICAL GUARD: Ensure WebSocket is connected before file transfer
     const socket = getSocket();
     if (socket.readyState !== WebSocket.OPEN) {
-        console.log('⚠️ WebSocket not connected, attempting reconnect...');
-        updateConnectionStatus('connecting', 'Reconnecting...');
         try {
             await ensureSocketConnected();
-        } catch (error) {
-            showUserMessage('Connection lost. Please wait for reconnection or refresh the page.');
+        } catch (e) {
+            showUserMessage('Connection lost. Please wait.');
             return;
         }
     }
 
     if (!dataChannel || dataChannel.readyState !== 'open') {
-        showUserMessage('Please wait for peer connection to be established.');
+        showUserMessage('Waiting for peer connection...');
         return;
     }
-
-    console.log(`📁 Adding ${files.length} file(s) to queue`);
 
     for (const file of files) {
         fileQueue.push(file);
@@ -893,7 +959,7 @@ async function addFilesToQueue(files) {
     }
 }
 
-async function processFileQueue() {
+function processFileQueue() {
     if (fileQueue.length === 0) {
         isProcessingQueue = false;
         return;
@@ -902,35 +968,123 @@ async function processFileQueue() {
     isProcessingQueue = true;
     currentFile = fileQueue.shift();
 
-    console.log(`📤 Processing file: ${currentFile.name}`);
+    console.log(`📤 Sending request: ${currentFile.name}`);
+
+    // Send file request
+    dataChannel.send(JSON.stringify({
+        type: 'file-request',
+        name: currentFile.name,
+        size: currentFile.size,
+        mimeType: currentFile.type || 'application/octet-stream'
+    }));
+
+    showTransferInfo(currentFile.name, currentFile.size, 'Waiting for accept...');
+}
+
+async function startSendingFile() {
+    if (!currentFile) return;
+
+    console.log(`📤 Starting: ${currentFile.name}`);
+
+    transferActive = true;
+    senderChunkIndex = 0;
+    totalBytesSent = 0;
+    speedStartTime = Date.now();
+    lastSpeedUpdate = Date.now();
+    lastBytesForSpeed = 0;
+
+    const progressLabel = document.getElementById('progressLabel');
+    if (progressLabel) progressLabel.textContent = 'Uploading...';
+
+    await requestWakeLock();
+
+    const file = currentFile;
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
 
     try {
-        // Create upload session
-        const session = await createUploadSession(currentFile);
+        for (let i = 0; i < totalChunks; i++) {
+            if (transferAborted) throw new Error('Aborted');
 
-        // Update progress label
-        const progressLabel = document.getElementById('progressLabel');
-        if (progressLabel) {
-            progressLabel.textContent = 'Uploading...';
+            const start = i * CHUNK_SIZE;
+            const end = Math.min(start + CHUNK_SIZE, file.size);
+            const chunk = file.slice(start, end);
+            const buffer = await chunk.arrayBuffer();
+
+            // Create framed chunk: [4 bytes index][payload]
+            const framed = new ArrayBuffer(4 + buffer.byteLength);
+            const view = new DataView(framed);
+            view.setUint32(0, i, true);
+            new Uint8Array(framed, 4).set(new Uint8Array(buffer));
+
+            // Backpressure check
+            while (dataChannel.bufferedAmount > HIGH_WATER_MARK) {
+                await waitForDrain();
+            }
+
+            dataChannel.send(framed);
+
+            totalBytesSent += buffer.byteLength;
+            senderChunkIndex++;
+
+            // Update progress
+            const percent = (totalBytesSent / file.size) * 100;
+            updateProgress(percent);
+            updateSenderSpeed();
         }
 
-        // Send file offer to peer via WebRTC
-        if (!sendFileOffer(session.uploadId, currentFile)) {
-            throw new Error('Failed to send file offer');
-        }
-
-        // Show waiting UI
-        showTransferInfo(currentFile.name, currentFile.size);
-        updateConnectionStatus('connected', 'Waiting for peer to accept...');
-
-        // Upload will start when peer accepts (handleFileAccepted)
+        console.log('✅ All chunks sent');
+        updateProgress(100);
 
     } catch (error) {
-        console.error('Error processing file:', error);
-        showUserMessage(`Failed to start transfer: ${error.message}`);
-        currentFile = null;
-        processFileQueue();
+        console.error('Send error:', error);
+        showUserMessage(`Transfer failed: ${error.message}`);
+        hideTransferInfo();
     }
+
+    transferActive = false;
+}
+
+function waitForDrain() {
+    return new Promise(resolve => {
+        const check = () => {
+            if (dataChannel.bufferedAmount <= HIGH_WATER_MARK / 2) {
+                resolve();
+            } else {
+                setTimeout(check, 10);
+            }
+        };
+        check();
+    });
+}
+
+function updateSenderSpeed() {
+    const now = Date.now();
+    const elapsed = (now - lastSpeedUpdate) / 1000;
+    if (elapsed < 0.5) return;
+
+    const bytesDelta = totalBytesSent - lastBytesForSpeed;
+    const speedBps = bytesDelta / elapsed;
+
+    const speedText = document.getElementById('transferSpeed');
+    const timeRemaining = document.getElementById('timeRemaining');
+
+    if (speedText) {
+        if (speedBps > 1024 * 1024) {
+            speedText.textContent = `${(speedBps / (1024 * 1024)).toFixed(1)} MB/s`;
+        } else {
+            speedText.textContent = `${(speedBps / 1024).toFixed(1)} KB/s`;
+        }
+    }
+
+    if (timeRemaining && currentFile) {
+        const remaining = currentFile.size - totalBytesSent;
+        if (speedBps > 0) {
+            timeRemaining.textContent = formatTime(remaining / speedBps);
+        }
+    }
+
+    lastSpeedUpdate = now;
+    lastBytesForSpeed = totalBytesSent;
 }
 
 // ============================================================================
@@ -939,59 +1093,40 @@ async function processFileQueue() {
 
 function createRoom(e) {
     if (e) e.preventDefault();
-    const roomId = generateRoomId();
-    joinRoom(roomId, true);
+    joinRoom(generateRoomId(), true);
 }
 
 function joinRoom(roomId = null, isCreator = false) {
     if (!roomId) {
-        const roomIdInput = document.getElementById('roomId');
-        roomId = roomIdInput ? roomIdInput.value.trim() : '';
+        const input = document.getElementById('roomId');
+        roomId = input ? input.value.trim() : '';
     }
 
     if (!roomId) {
-        showUserMessage('Please enter a room ID');
+        showUserMessage('Enter room ID');
         return;
     }
 
-    console.log(`🚪 Joining room: ${roomId}`);
     currentRoom = roomId;
     isInitiator = isCreator;
-
     connectWebSocket();
 }
 
 function leaveRoom() {
-    console.log('🚪 Leaving room');
+    transferAborted = true;
 
-    // Abort any ongoing upload
-    if (uploadAbortController) {
-        uploadAbortController.abort();
-    }
+    if (dataChannel) { dataChannel.close(); dataChannel = null; }
+    if (peerConnection) { peerConnection.close(); peerConnection = null; }
 
-    // Close WebRTC
-    if (dataChannel) {
-        dataChannel.close();
-        dataChannel = null;
-    }
-    if (peerConnection) {
-        peerConnection.close();
-        peerConnection = null;
-    }
-
-    // Notify server
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'leave', room: currentRoom }));
     }
 
-    // Reset state
     currentRoom = null;
     isInitiator = false;
     fileQueue = [];
     currentFile = null;
-    transferState = TransferState.IDLE;
 
-    // Update UI
     hideRoomDisplay();
     hideTransferInfo();
     updateConnectionStatus('disconnected', 'Disconnected');
@@ -1020,385 +1155,60 @@ function hideRoomDisplay() {
 }
 
 // ============================================================================
-// WEBSOCKET SINGLETON (Signaling) - RULE 1: Singleton & Persistent
+// WEBRTC SIGNALING
 // ============================================================================
-
-let wsReconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 10;
-const RECONNECT_DELAY_MS = 2000;
-
-// RULE 1: Singleton WebSocket - lives outside UI lifecycle
-function getSocket() {
-    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
-        console.log('📡 Creating new WebSocket connection...');
-        ws = createWebSocket();
-    }
-    return ws;
-}
-
-// Check if socket is ready, reconnect if needed
-async function ensureSocketConnected() {
-    const socket = getSocket();
-
-    if (socket.readyState === WebSocket.OPEN) {
-        return socket;
-    }
-
-    if (socket.readyState === WebSocket.CONNECTING) {
-        // Wait for connection
-        return new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => {
-                reject(new Error('WebSocket connection timeout'));
-            }, 10000);
-
-            socket.addEventListener('open', () => {
-                clearTimeout(timeout);
-                resolve(socket);
-            }, { once: true });
-
-            socket.addEventListener('error', () => {
-                clearTimeout(timeout);
-                reject(new Error('WebSocket connection failed'));
-            }, { once: true });
-        });
-    }
-
-    // Socket is closed, reconnect
-    return reconnectSocket();
-}
-
-// Reconnect WebSocket
-async function reconnectSocket() {
-    if (wsReconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-        console.error('❌ Max reconnection attempts reached');
-        updateConnectionStatus('disconnected', 'Connection failed - please refresh');
-        return null;
-    }
-
-    wsReconnectAttempts++;
-    console.log(`� Reconnecting WebSocket (attempt ${wsReconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
-
-    return new Promise((resolve, reject) => {
-        ws = createWebSocket();
-
-        const timeout = setTimeout(() => {
-            reject(new Error('WebSocket reconnection timeout'));
-        }, 10000);
-
-        ws.addEventListener('open', () => {
-            clearTimeout(timeout);
-            wsReconnectAttempts = 0; // Reset on successful connection
-
-            // Rejoin room if we were in one
-            if (currentRoom) {
-                ws.send(JSON.stringify({
-                    type: 'join',
-                    room: currentRoom
-                }));
-            }
-
-            resolve(ws);
-        }, { once: true });
-
-        ws.addEventListener('error', () => {
-            clearTimeout(timeout);
-            setTimeout(() => {
-                reconnectSocket().then(resolve).catch(reject);
-            }, RECONNECT_DELAY_MS);
-        }, { once: true });
-    });
-}
-
-// Create WebSocket with event handlers
-function createWebSocket() {
-    console.log(`�📡 Connecting to WebSocket: ${WS_URL}`);
-    updateConnectionStatus('connecting', 'Connecting to server...');
-
-    const socket = new WebSocket(WS_URL);
-
-    socket.onopen = () => {
-        console.log('✅ WebSocket connected');
-        wsReconnectAttempts = 0;
-        updateConnectionStatus('connecting', 'Connected to server');
-
-        // Join room if specified
-        if (currentRoom) {
-            socket.send(JSON.stringify({
-                type: 'join',
-                room: currentRoom
-            }));
-        }
-    };
-
-    socket.onmessage = (event) => {
-        try {
-            const message = JSON.parse(event.data);
-            handleSignalingMessage(message);
-        } catch (error) {
-            console.error('Error parsing WebSocket message:', error);
-        }
-    };
-
-    socket.onerror = (error) => {
-        console.error('WebSocket error:', error);
-        updateConnectionStatus('disconnected', 'Connection error');
-    };
-
-    socket.onclose = (event) => {
-        console.log(`WebSocket closed (code: ${event.code}, reason: ${event.reason})`);
-
-        // Only show disconnected if we were connected and it wasn't intentional
-        if (currentRoom && event.code !== 1000) {
-            updateConnectionStatus('disconnected', 'Disconnected - reconnecting...');
-            // Auto-reconnect
-            setTimeout(() => {
-                reconnectSocket().catch(err => {
-                    console.error('Reconnection failed:', err);
-                });
-            }, RECONNECT_DELAY_MS);
-        } else {
-            updateConnectionStatus('disconnected', 'Disconnected');
-        }
-    };
-
-    return socket;
-}
-
-// RULE 2: DO NOT close WebSocket on visibility change
-document.addEventListener('visibilitychange', () => {
-    if (document.hidden) {
-        console.log('📱 Page hidden — keeping WebSocket connection alive');
-        // Send keepalive ping to prevent server timeout
-        if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'ping' }));
-        }
-    } else {
-        console.log('📱 Page visible — checking connection status');
-        // Verify connection is still alive on return
-        if (ws && ws.readyState !== WebSocket.OPEN && currentRoom) {
-            console.log('🔄 Connection lost while hidden, reconnecting...');
-            reconnectSocket().catch(err => {
-                console.error('Reconnection failed:', err);
-            });
-        }
-    }
-});
-
-// Legacy function kept for compatibility
-function connectWebSocket() {
-    ws = getSocket();
-}
-
-function handleSignalingMessage(message) {
-    switch (message.type) {
-        case 'joined':
-            console.log(`✅ Joined room: ${message.room}`);
-            // Use isInitiator from server if provided
-            if (message.isInitiator !== undefined) {
-                isInitiator = message.isInitiator;
-            }
-            showRoomDisplay();
-            updateConnectionStatus('connecting', 'Waiting for peer...');
-
-            if (isInitiator) {
-                createPeerConnection();
-            }
-            break;
-
-        // RULE 3: State-replayable peer presence
-        case 'room-state':
-            console.log(`📊 Room state: ${message.peerCount} peer(s), hasPeer: ${message.hasPeer}`);
-            if (message.hasPeer) {
-                updateConnectionStatus('connecting', 'Peer found, connecting...');
-                // Trigger connection if we have a peer and aren't connected yet
-                if (!peerConnection) {
-                    createPeerConnection();
-                }
-                if (isInitiator && !dataChannel) {
-                    createDataChannel();
-                    createOffer();
-                }
-            } else {
-                updateConnectionStatus('connecting', 'Waiting for peer...');
-            }
-            break;
-
-        case 'peer-joined':
-            console.log('👤 Peer joined the room');
-
-            if (!peerConnection) {
-                createPeerConnection();
-            }
-
-            if (isInitiator) {
-                createDataChannel();
-                createOffer();
-            }
-            break;
-
-        case 'peer-left':
-            console.log('👋 Peer left the room');
-            updateConnectionStatus('connecting', 'Peer disconnected, waiting...');
-
-            // Close DataChannel and PeerConnection, but stay in room
-            if (dataChannel) {
-                dataChannel.close();
-                dataChannel = null;
-            }
-            if (peerConnection) {
-                peerConnection.close();
-                peerConnection = null;
-            }
-            break;
-
-        case 'offer':
-            handleOffer(message.offer);
-            break;
-
-        case 'answer':
-            handleAnswer(message.answer);
-            break;
-
-        case 'ice-candidate':
-            handleIceCandidate(message.candidate);
-            break;
-
-        case 'pong':
-            // Server keepalive response
-            break;
-
-        case 'error':
-            console.error('Server error:', message.message);
-            showUserMessage(message.message);
-            break;
-    }
-}
-
-// ============================================================================
-// WEBRTC (Signaling Only - No File Data)
-// ============================================================================
-
-function createPeerConnection() {
-    console.log('🔗 Creating peer connection');
-
-    peerConnection = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-
-    peerConnection.onicecandidate = (event) => {
-        if (event.candidate && ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({
-                type: 'ice-candidate',
-                candidate: event.candidate,
-                room: currentRoom
-            }));
-        }
-    };
-
-    peerConnection.onconnectionstatechange = () => {
-        console.log(`🔗 Connection state: ${peerConnection.connectionState}`);
-
-        if (peerConnection.connectionState === 'connected') {
-            updateConnectionStatus('connected', 'P2P Connected');
-        } else if (peerConnection.connectionState === 'failed') {
-            updateConnectionStatus('disconnected', 'Connection failed');
-        }
-    };
-
-    peerConnection.oniceconnectionstatechange = () => {
-        console.log(`🧊 ICE state: ${peerConnection.iceConnectionState}`);
-    };
-
-    peerConnection.ondatachannel = (event) => {
-        console.log('📡 Received DataChannel');
-        setupDataChannel(event.channel);
-    };
-}
-
-function createDataChannel() {
-    console.log('📡 Creating DataChannel');
-
-    dataChannel = peerConnection.createDataChannel('control', {
-        ordered: true
-    });
-
-    setupDataChannel(dataChannel);
-}
-
-function setupDataChannel(channel) {
-    dataChannel = channel;
-
-    channel.onopen = () => {
-        console.log('✅ DataChannel opened (control channel only)');
-        updateConnectionStatus('connected', 'P2P Connected - Ready');
-    };
-
-    channel.onclose = () => {
-        console.log('📡 DataChannel closed');
-        updateConnectionStatus('disconnected', 'DataChannel closed');
-    };
-
-    channel.onerror = (error) => {
-        console.error('DataChannel error:', error);
-    };
-
-    channel.onmessage = handleDataChannelMessage;
-}
 
 async function createOffer() {
-    try {
-        console.log('📤 Creating offer');
-        const offer = await peerConnection.createOffer();
-        await peerConnection.setLocalDescription(offer);
-
-        ws.send(JSON.stringify({
-            type: 'offer',
-            offer: offer,
-            room: currentRoom
-        }));
-    } catch (error) {
-        console.error('Error creating offer:', error);
-    }
+    const offer = await peerConnection.createOffer();
+    await peerConnection.setLocalDescription(offer);
+    ws.send(JSON.stringify({ type: 'offer', offer, room: currentRoom }));
 }
 
 async function handleOffer(offer) {
-    try {
-        console.log('📥 Received offer');
-
-        if (!peerConnection) {
-            createPeerConnection();
-        }
-
-        await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
-
-        const answer = await peerConnection.createAnswer();
-        await peerConnection.setLocalDescription(answer);
-
-        ws.send(JSON.stringify({
-            type: 'answer',
-            answer: answer,
-            room: currentRoom
-        }));
-    } catch (error) {
-        console.error('Error handling offer:', error);
-    }
+    if (!peerConnection) createPeerConnection();
+    await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+    const answer = await peerConnection.createAnswer();
+    await peerConnection.setLocalDescription(answer);
+    ws.send(JSON.stringify({ type: 'answer', answer, room: currentRoom }));
 }
 
 async function handleAnswer(answer) {
-    try {
-        console.log('📥 Received answer');
-        await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
-    } catch (error) {
-        console.error('Error handling answer:', error);
-    }
+    await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
 }
 
 async function handleIceCandidate(candidate) {
-    try {
-        if (peerConnection && candidate) {
-            await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
-        }
-    } catch (error) {
-        console.error('Error adding ICE candidate:', error);
+    if (peerConnection && candidate) {
+        await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
     }
+}
+
+// ============================================================================
+// FILE INPUT HANDLERS
+// ============================================================================
+
+function handleDragOver(e) {
+    e.preventDefault();
+    document.getElementById('dropZone')?.classList.add('drag-over');
+}
+
+function handleDragLeave(e) {
+    e.preventDefault();
+    document.getElementById('dropZone')?.classList.remove('drag-over');
+}
+
+function handleDrop(e) {
+    e.preventDefault();
+    document.getElementById('dropZone')?.classList.remove('drag-over');
+    if (e.dataTransfer.files.length > 0) {
+        addFilesToQueue(Array.from(e.dataTransfer.files));
+    }
+}
+
+function handleFileSelect(e) {
+    if (e.target.files.length > 0) {
+        addFilesToQueue(Array.from(e.target.files));
+    }
+    e.target.value = '';
 }
 
 // ============================================================================
@@ -1406,95 +1216,69 @@ async function handleIceCandidate(candidate) {
 // ============================================================================
 
 function init() {
-    console.log('🚀 POJO Files - Hybrid Transfer Model');
-    console.log('📡 WebRTC: Signaling & Control');
-    console.log('📤 HTTP: File Data Transfer');
+    console.log('🚀 POJO Files - Optimized DataChannel Transfer');
+    console.log(`📦 Chunk: ${CHUNK_SIZE / 1024}KB | RAM: ${MAX_RAM_MB}MB | HWM: ${HIGH_WATER_MARK / 1024 / 1024}MB`);
 
     setupEventListeners();
     updateConnectionStatus('disconnected', 'Disconnected');
 }
 
 function setupEventListeners() {
-    const createRoomBtn = document.getElementById('createRoomBtn');
-    const joinRoomBtn = document.getElementById('joinRoomBtn');
-    const leaveRoomBtn = document.getElementById('leaveRoomBtn');
-    const roomIdInput = document.getElementById('roomId');
+    document.getElementById('createRoomBtn')?.addEventListener('click', createRoom);
+    document.getElementById('joinRoomBtn')?.addEventListener('click', () => joinRoom());
+    document.getElementById('leaveRoomBtn')?.addEventListener('click', leaveRoom);
+
+    document.getElementById('roomId')?.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); joinRoom(); }
+    });
+
     const dropZone = document.getElementById('dropZone');
     const fileInput = document.getElementById('fileInput');
-    const acceptFileBtn = document.getElementById('acceptFileBtn');
-    const rejectFileBtn = document.getElementById('rejectFileBtn');
+
+    if (dropZone) {
+        dropZone.addEventListener('click', () => fileInput?.click());
+        dropZone.addEventListener('dragover', handleDragOver);
+        dropZone.addEventListener('dragleave', handleDragLeave);
+        dropZone.addEventListener('drop', handleDrop);
+    }
+
+    fileInput?.addEventListener('change', handleFileSelect);
+
+    document.getElementById('acceptFileBtn')?.addEventListener('click', handleAcceptFile);
+    document.getElementById('rejectFileBtn')?.addEventListener('click', handleRejectFile);
+
+    // Modal handlers
     const donateBtn = document.getElementById('donateBtn');
     const donateModal = document.getElementById('donateModal');
     const closeModal = document.getElementById('closeModal');
     const developerAvatar = document.querySelector('.developer-avatar');
     const donationImage = document.querySelector('.donation-image');
 
-    if (createRoomBtn) createRoomBtn.addEventListener('click', createRoom);
-    if (joinRoomBtn) joinRoomBtn.addEventListener('click', () => joinRoom());
-    if (leaveRoomBtn) leaveRoomBtn.addEventListener('click', leaveRoom);
-
-    if (roomIdInput) {
-        roomIdInput.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') {
-                e.preventDefault();
-                joinRoom();
-            }
-        });
-    }
-
-    if (dropZone) {
-        dropZone.addEventListener('click', () => fileInput && fileInput.click());
-        dropZone.addEventListener('dragover', handleDragOver);
-        dropZone.addEventListener('dragleave', handleDragLeave);
-        dropZone.addEventListener('drop', handleDrop);
-    }
-
-    if (fileInput) {
-        fileInput.addEventListener('change', handleFileSelect);
-    }
-
-    if (acceptFileBtn) acceptFileBtn.addEventListener('click', handleAcceptFile);
-    if (rejectFileBtn) rejectFileBtn.addEventListener('click', handleRejectFile);
-
-    // Donation modal
-    if (donateBtn) {
-        donateBtn.addEventListener('click', () => {
-            if (donateModal && donationImage) {
-                donationImage.src = 'image.png';
-                donateModal.style.display = 'flex';
-            }
-        });
-    }
-
-    if (developerAvatar) {
-        developerAvatar.addEventListener('click', () => {
-            if (donateModal && donationImage) {
-                donationImage.src = 'aiks.jpg';
-                donateModal.style.display = 'flex';
-            }
-        });
-        developerAvatar.style.cursor = 'pointer';
-    }
-
-    if (closeModal) {
-        closeModal.addEventListener('click', () => {
-            if (donateModal) donateModal.style.display = 'none';
-        });
-    }
-
-    if (donateModal) {
-        donateModal.addEventListener('click', (e) => {
-            if (e.target === donateModal) donateModal.style.display = 'none';
-        });
-    }
-
-    // Escape key closes modal
-    document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && donateModal) {
-            donateModal.style.display = 'none';
+    donateBtn?.addEventListener('click', () => {
+        if (donateModal && donationImage) {
+            donationImage.src = 'image.png';
+            donateModal.style.display = 'flex';
         }
+    });
+
+    developerAvatar?.addEventListener('click', () => {
+        if (donateModal && donationImage) {
+            donationImage.src = 'aiks.jpg';
+            donateModal.style.display = 'flex';
+        }
+    });
+
+    closeModal?.addEventListener('click', () => {
+        if (donateModal) donateModal.style.display = 'none';
+    });
+
+    donateModal?.addEventListener('click', (e) => {
+        if (e.target === donateModal) donateModal.style.display = 'none';
+    });
+
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && donateModal) donateModal.style.display = 'none';
     });
 }
 
-// Start the application
 init();
