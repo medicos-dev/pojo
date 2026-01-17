@@ -25,7 +25,7 @@ export const WelcomeScreen = ({ onJoin, onCreate }: Props) => {
                 textAlign: 'center',
                 marginBottom: '2rem'
             }}>
-                POJO TRANSFER
+                POJO FILES
             </h1>
 
             <div className="retro-card" style={{ width: '100%', maxWidth: '400px' }}>

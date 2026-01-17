@@ -428,3 +428,73 @@ h2 {
         transform: translateY(0);
     }
 }
+
+/* ============ MOBILE RESPONSIVENESS ============ */
+@media (max-width: 600px) {
+    .app-container {
+        padding: 1rem;
+        justify-content: flex-start;
+        /* Align top on mobile to avoid centering issues with keyboards */
+    }
+
+    .retro-card {
+        padding: 1.25rem;
+        border-radius: 16px;
+    }
+
+    h2 {
+        font-size: 0.95rem;
+        margin-bottom: 1rem;
+    }
+
+    .retro-btn {
+        padding: 0.75rem 1.2rem;
+        font-size: 0.8rem;
+    }
+
+    .room-code {
+        font-size: 1.1rem;
+        /* Slightly smaller to prevent overflow */
+    }
+
+    .status-bar {
+        flex-direction: column;
+        gap: 0.75rem;
+        padding: 0.75rem 1rem;
+        text-align: center;
+    }
+
+    .status-left {
+        width: 100%;
+        justify-content: center;
+    }
+
+    .status-right {
+        font-size: 0.7rem;
+    }
+
+    .footer-content {
+        flex-direction: column;
+        gap: 1.5rem;
+    }
+
+    .developer-info {
+        width: 100%;
+        justify-content: center;
+        padding: 0.6rem 1rem;
+    }
+
+    .btn-donate {
+        width: 100%;
+    }
+
+    .file-info {
+        padding: 0.8rem 1rem;
+    }
+
+    /* Ensure nice wrapping for very small screens */
+    .retro-card>div:first-child {
+        flex-wrap: wrap;
+        gap: 1rem;
+    }
+}
