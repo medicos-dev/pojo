@@ -12,7 +12,7 @@ export const joinRoom = (room: string) => {
     currentRoom = room;
     if (ws && ws.readyState === WebSocket.OPEN) {
         // Force join if connection is already open
-        console.log('📡 Sending Join Signal:', room);
+
         sendSignal({ type: 'join', room });
     }
 };
@@ -31,11 +31,11 @@ export const connectWebSocket = (): Promise<WebSocket> => {
         }
 
         const url = getWebSocketURL();
-        console.log(`📡 Connecting: ${url}`);
+
         ws = new WebSocket(url);
 
         ws.onopen = () => {
-            console.log('✅ WebSocket connected');
+
             reconnectAttempts = 0;
             if (currentRoom) {
                 sendSignal({ type: 'join', room: currentRoom });
@@ -48,19 +48,19 @@ export const connectWebSocket = (): Promise<WebSocket> => {
                 const msg = JSON.parse(e.data);
                 if (signalHandler) signalHandler(msg);
             } catch (err) {
-                console.error('Parse error:', err);
+
             }
         };
 
         ws.onclose = (e) => {
-            console.log(`WebSocket closed: ${e.code}`);
+
             if (currentRoom && e.code !== 1000) {
                 setTimeout(() => reconnectSocket(), RECONNECT_DELAY_MS);
             }
         };
 
         ws.onerror = (e) => {
-            console.error('WebSocket Error:', e);
+
             // Reject only if initial connect fails
             if (reconnectAttempts === 0) reject(e);
         };
@@ -69,15 +69,15 @@ export const connectWebSocket = (): Promise<WebSocket> => {
 
 async function reconnectSocket() {
     if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-        console.error('Max reconnect attempts reached');
+
         return;
     }
     reconnectAttempts++;
-    console.log(`🔄 Reconnecting (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
+
     try {
         await connectWebSocket();
     } catch (e) {
-        console.error('Reconnect failed', e);
+
     }
 }
 
@@ -85,7 +85,7 @@ export const sendSignal = (msg: SignalingMessage) => {
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify(msg));
     } else {
-        console.warn('WebSocket not open, cannot send signal', msg);
+
     }
 };
 

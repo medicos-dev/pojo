@@ -14,7 +14,7 @@ export const registerPCStateCallback = (cb: PCStateCallback) => {
 };
 
 export const createPeerConnection = (room: string, isInitiator: boolean) => {
-    console.log('🔗 Creating peer connection');
+
     currentRoom = room;
 
     peerConnection = new RTCPeerConnection({ iceServers: ICE_SERVERS });
@@ -27,14 +27,14 @@ export const createPeerConnection = (room: string, isInitiator: boolean) => {
     };
 
     peerConnection.onconnectionstatechange = () => {
-        console.log(`🔗 State: ${peerConnection?.connectionState}`);
+
         if (onStateChange && peerConnection) {
             onStateChange(peerConnection.connectionState);
         }
     };
 
     peerConnection.ondatachannel = (e) => {
-        console.log(`📡 Received channel: ${e.channel.label}`);
+
         if (e.channel.label === 'control') {
             setupControlChannel(e.channel);
         } else if (e.channel.label === 'data') {
@@ -50,7 +50,7 @@ export const createPeerConnection = (room: string, isInitiator: boolean) => {
 };
 
 function createChannels(pc: RTCPeerConnection) {
-    console.log('📡 Creating dual channels');
+
 
     // CONTROL channel: ordered, reliable - for signaling
     const controlChannel = pc.createDataChannel('control', {
@@ -72,16 +72,16 @@ let candidateQueue: RTCIceCandidateInit[] = [];
 
 async function flushCandidateQueue() {
     if (!peerConnection || !peerConnection.remoteDescription) {
-        console.log('⚠️ Cannot flush candidates: PC or RemoteDesc missing');
+
         return;
     }
-    console.log(`🚿 Flushing ${candidateQueue.length} buffered candidates`);
+
     while (candidateQueue.length > 0) {
         const candidate = candidateQueue.shift();
         if (candidate) {
             try {
                 await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
-                console.log('✅ Buffered candidate added');
+
             } catch (e) {
                 console.error('Error flushing buffered candidate', e);
             }
@@ -90,7 +90,7 @@ async function flushCandidateQueue() {
 }
 
 export const handleOffer = async (offer: RTCSessionDescriptionInit) => {
-    console.log('📩 Handling Offer...');
+
     if (!peerConnection) createPeerConnection(currentRoom!, false);
     if (!peerConnection) {
         console.error('❌ Failed to create PC for offer');
@@ -107,7 +107,7 @@ export const handleOffer = async (offer: RTCSessionDescriptionInit) => {
     }
 
     try {
-        console.log('🛠️ Setting Remote Description (Offer)...');
+
         await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
         console.log('✅ Remote Description Set');
 
