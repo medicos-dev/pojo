@@ -21,13 +21,15 @@ const ICE_SERVERS = [
 ];
 
 // ============================================================================
-// TRANSFER CONFIGURATION
+// TRANSFER CONFIGURATION - SPEED OPTIMIZED
 // ============================================================================
-const CHUNK_SIZE = 64 * 1024;              // 64KB chunks
-const HIGH_WATER_MARK = 16 * 1024 * 1024;  // 16MB backpressure threshold
-const MAX_RAM_MB = 256;
+const CHUNK_SIZE = 512 * 1024;             // 512KB chunks (FIX #1 - bigger = faster)
+const HIGH_WATER_MARK = 16 * 1024 * 1024;  // 16MB buffer before backpressure
+const LOW_WATER_MARK = 8 * 1024 * 1024;    // 8MB - resume pumping
+const ACK_EVERY = 64;                       // ACK every 64 chunks (FIX #3)
+const MAX_RAM_MB = 512;                     // 512MB RAM buffer for speed
 const MAX_RAM_BYTES = MAX_RAM_MB * 1024 * 1024;
-const HEARTBEAT_INTERVAL_MS = 5000;        // 5 second heartbeat
+const HEARTBEAT_INTERVAL_MS = 5000;
 
 // ============================================================================
 // WEBSOCKET URL CONFIGURATION
@@ -587,10 +589,10 @@ function createChannels() {
     });
     setupControlChannel(controlChannel);
 
-    // DATA channel: unordered for speed - DISPOSABLE
+    // DATA channel: unordered for speed - DISPOSABLE (FIX #2)
     dataChannel = peerConnection.createDataChannel('data', {
-        ordered: false,
-        maxPacketLifeTime: 300
+        ordered: false,    // Fix #2: Unordered for max speed
+        maxRetransmits: 0  // Fix #2: No retransmits (SCTP congestion control only)
     });
     setupDataChannel(dataChannel);
 }
@@ -791,8 +793,8 @@ function handleBinaryChunk(buffer) {
     // Start disk writer
     if (!diskWriterRunning) diskWriterLoop();
 
-    // ACK every 100 chunks
-    if (receivedChunkCount % 100 === 0) {
+    // ACK every N chunks (FIX #3: Reduced traffic)
+    if (receivedChunkCount % ACK_EVERY === 0) {
         sendControl({ type: 'ack', chunkIndex, bytesReceived: totalBytesReceived });
     }
 
@@ -903,7 +905,7 @@ async function startSendingFile() {
         return;
     }
 
-    console.log(`📤 Starting: ${currentFile.name}`);
+    console.log(`📤 Starting: ${currentFile.name} (Speed Optimized)`);
     transferActive = true;
     senderChunkIndex = 0;
     totalBytesSent = 0;
@@ -919,9 +921,35 @@ async function startSendingFile() {
     const file = currentFile;
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
 
+    // FIX #4: bufferedAmount pumping loop
+    // We want to keep filling the buffer until HIGH_WATER_MARK
+    // Then wait for LOW_WATER_MARK to resume
+
+    // Set low threshold callback
+    dataChannel.bufferedAmountLowThreshold = LOW_WATER_MARK;
+
     try {
+        let isDraining = false;
+
+        // Helper to wait for buffer drain
+        const waitForDrain = () => {
+            return new Promise(resolve => {
+                isDraining = true;
+                dataChannel.onbufferedamountlow = () => {
+                    isDraining = false;
+                    dataChannel.onbufferedamountlow = null; // Clear listener
+                    resolve();
+                };
+            });
+        };
+
         for (let i = 0; i < totalChunks; i++) {
             if (transferAborted) throw new Error('Aborted');
+
+            // FIX #4: Backpressure - wait if buffer is full
+            if (dataChannel.bufferedAmount > HIGH_WATER_MARK) {
+                await waitForDrain();
+            }
 
             const start = i * CHUNK_SIZE;
             const end = Math.min(start + CHUNK_SIZE, file.size);
@@ -933,12 +961,8 @@ async function startSendingFile() {
             new DataView(framed).setUint32(0, i, true);
             new Uint8Array(framed, 4).set(new Uint8Array(buffer));
 
-            // Backpressure
-            while (dataChannel.bufferedAmount > HIGH_WATER_MARK) {
-                await waitForDrain();
-            }
-
             // CRITICAL FIX #1: Guard before send
+            // FIX #5: Zero delays, push fast
             if (!sendData(framed)) {
                 throw new Error('Data channel closed during transfer');
             }
@@ -946,8 +970,11 @@ async function startSendingFile() {
             totalBytesSent += buffer.byteLength;
             senderChunkIndex++;
 
-            updateProgress((totalBytesSent / file.size) * 100);
-            updateSenderSpeed();
+            // Only update UI occasionally to prevent thread blocking
+            if (i % 5 === 0) {
+                updateProgress((totalBytesSent / file.size) * 100);
+                updateSenderSpeed();
+            }
         }
 
         console.log('✅ All chunks sent');
@@ -961,15 +988,7 @@ async function startSendingFile() {
     transferActive = false;
 }
 
-function waitForDrain() {
-    return new Promise(r => {
-        const check = () => {
-            if (!dataChannel || dataChannel.bufferedAmount <= HIGH_WATER_MARK / 2) r();
-            else setTimeout(check, 10);
-        };
-        check();
-    });
-}
+
 
 function updateSenderSpeed() {
     const now = Date.now();
