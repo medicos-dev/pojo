@@ -23,18 +23,16 @@ const ICE_SERVERS = [
 // ============================================================================
 // TRANSFER CONFIGURATION
 // ============================================================================
-const CHUNK_SIZE = 256 * 1024;             // 256KB chunks (Recommended sweet spot)
-const HIGH_WATER_MARK = 48 * 1024 * 1024;  // 48MB backpressure threshold (Deeper buffering)
-const LOW_WATER_MARK = 8 * 1024 * 1024;    // 8MB low threshold for resume
+const CHUNK_SIZE = 64 * 1024;              // 64KB chunks
+const HIGH_WATER_MARK = 16 * 1024 * 1024;  // 16MB backpressure threshold
 const MAX_RAM_MB = 256;
 const MAX_RAM_BYTES = MAX_RAM_MB * 1024 * 1024;
-const HEARTBEAT_INTERVAL_MS = 5000;
+const HEARTBEAT_INTERVAL_MS = 5000;        // 5 second heartbeat
 
 // ============================================================================
 // WEBSOCKET URL CONFIGURATION
 // ============================================================================
 function getWebSocketURL() {
-    // ... existing code ...
     const params = new URLSearchParams(window.location.search);
     const wsParam = params.get('ws');
 
@@ -48,79 +46,6 @@ function getWebSocketURL() {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     if (hostname.includes('onrender.com')) return `${protocol}//${hostname}`;
     return `${protocol}//${hostname}:${window.location.port || '8080'}`;
-}
-
-// ...
-
-function createChannels() {
-    console.log('📡 Creating dual channels');
-
-    // CONTROL channel: ordered, reliable - ALWAYS ALIVE
-    controlChannel = peerConnection.createDataChannel('control', {
-        ordered: true
-    });
-    setupControlChannel(controlChannel);
-
-    // DATA channel: unordered, RELIABLE (no maxPacketLifeTime) - DISPOSABLE
-    // Optimization #5 & #6: ordered: false, let WebRTC handle reliability
-    dataChannel = peerConnection.createDataChannel('data', {
-        ordered: false
-    });
-    setupDataChannel(dataChannel);
-}
-
-function setupControlChannel(channel) {
-    controlChannel = channel;
-    // ... existing setup ... (keep as is, just showing context)
-    controlChannelClosed = false;
-
-    channel.onopen = () => {
-        console.log('✅ Control channel opened');
-        controlChannelClosed = false;
-        updateConnectionStatus('connected', 'Ready');
-        startHeartbeat();
-    };
-
-    channel.onclose = () => {
-        console.warn('⚠️ Control channel closed - waiting for resume');
-        controlChannelClosed = true;
-        stopHeartbeat();
-    };
-
-    channel.onerror = (e) => console.error('Control channel error:', e);
-
-    channel.onmessage = (e) => {
-        try { handleControlMessage(JSON.parse(e.data)); }
-        catch (err) { console.error('Control parse error:', err); }
-    };
-}
-
-function setupDataChannel(channel) {
-    dataChannel = channel;
-    dataChannelClosed = false;
-    channel.binaryType = 'arraybuffer';
-
-    // Optimization #1: Increase bufferedAmountLowThreshold
-    // This fires onbufferedamountlow when buffer drains to this level
-    channel.bufferedAmountLowThreshold = LOW_WATER_MARK;
-
-    channel.onopen = () => {
-        console.log('✅ Data channel opened');
-        dataChannelClosed = false;
-    };
-
-    channel.onclose = () => {
-        console.warn('⚠️ Data channel closed - waiting for resume');
-        dataChannelClosed = true;
-    };
-
-    channel.onerror = (e) => console.error('Data channel error:', e);
-
-    channel.onmessage = (e) => {
-        if (e.data instanceof ArrayBuffer) {
-            handleBinaryChunk(e.data);
-        }
-    };
 }
 
 const WS_URL = getWebSocketURL();
@@ -457,7 +382,15 @@ function showTransferInfo(fileName, fileSize, label = 'Transferring...') {
     updateProgress(0);
 }
 
-// (hideTransferInfo moved to UI HELPERS section with fix)
+function hideTransferInfo() {
+    const transferInfo = document.getElementById('transferInfo');
+    const dropZone = document.getElementById('dropZone');
+    if (transferInfo) transferInfo.style.display = 'none';
+    if (dropZone) {
+        dropZone.style.display = 'flex';
+        fixUIAlignment();
+    }
+}
 
 function showSuccessMessage(text) {
     const el = document.getElementById('successMessage');
@@ -648,7 +581,73 @@ function createPeerConnection() {
 // DUAL CHANNEL CREATION - CRITICAL FIX #2
 // ============================================================================
 
-// (Duplicate DataChannel setup removed - using optimized versions defined above)
+function createChannels() {
+    console.log('📡 Creating dual channels');
+
+    // CONTROL channel: ordered, reliable - ALWAYS ALIVE
+    controlChannel = peerConnection.createDataChannel('control', {
+        ordered: true
+    });
+    setupControlChannel(controlChannel);
+
+    // DATA channel: unordered for speed - DISPOSABLE
+    dataChannel = peerConnection.createDataChannel('data', {
+        ordered: false,
+        maxPacketLifeTime: 300
+    });
+    setupDataChannel(dataChannel);
+}
+
+function setupControlChannel(channel) {
+    controlChannel = channel;
+    controlChannelClosed = false;
+
+    channel.onopen = () => {
+        console.log('✅ Control channel opened');
+        controlChannelClosed = false;
+        updateConnectionStatus('connected', 'Ready');
+        startHeartbeat();
+    };
+
+    // CRITICAL FIX #4: Don't nullify on close
+    channel.onclose = () => {
+        console.warn('⚠️ Control channel closed - waiting for resume');
+        controlChannelClosed = true;
+        stopHeartbeat();
+    };
+
+    channel.onerror = (e) => console.error('Control channel error:', e);
+
+    channel.onmessage = (e) => {
+        try { handleControlMessage(JSON.parse(e.data)); }
+        catch (err) { console.error('Control parse error:', err); }
+    };
+}
+
+function setupDataChannel(channel) {
+    dataChannel = channel;
+    dataChannelClosed = false;
+    channel.binaryType = 'arraybuffer';
+
+    channel.onopen = () => {
+        console.log('✅ Data channel opened');
+        dataChannelClosed = false;
+    };
+
+    // CRITICAL FIX #4: Don't nullify on close
+    channel.onclose = () => {
+        console.warn('⚠️ Data channel closed - waiting for resume');
+        dataChannelClosed = true;
+    };
+
+    channel.onerror = (e) => console.error('Data channel error:', e);
+
+    channel.onmessage = (e) => {
+        if (e.data instanceof ArrayBuffer) {
+            handleBinaryChunk(e.data);
+        }
+    };
+}
 
 // ============================================================================
 // CONTROL MESSAGE HANDLERS
@@ -907,7 +906,7 @@ async function startSendingFile() {
         return;
     }
 
-    console.log(`📤 Starting: ${currentFile.name} (Chunk: ${CHUNK_SIZE / 1024}KB)`);
+    console.log(`📤 Starting: ${currentFile.name}`);
     transferActive = true;
     senderChunkIndex = 0;
     totalBytesSent = 0;
@@ -922,11 +921,6 @@ async function startSendingFile() {
 
     const file = currentFile;
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-
-    // Optimization #7: Avoid repeatedly converting buffers
-    // Note: slice() creates a Blob, arrayBuffer() reads it. 
-    // This is reasonably efficient but creates garbage. 
-    // Streams would be better but slice is robust for now.
 
     try {
         for (let i = 0; i < totalChunks; i++) {
@@ -943,17 +937,11 @@ async function startSendingFile() {
             new Uint8Array(framed, 4).set(new Uint8Array(buffer));
 
             // Backpressure
-            if (dataChannel.bufferedAmount > HIGH_WATER_MARK) {
+            while (dataChannel.bufferedAmount > HIGH_WATER_MARK) {
                 await waitForDrain();
             }
 
-            // Optimization #4: Remove artificial sleeps, yield occasionally
-            if (i % 4 === 0) {
-                await Promise.resolve(); // Yield to main thread
-            }
-
             // CRITICAL FIX #1: Guard before send
-            // Optimization #7: send buffer directly
             if (!sendData(framed)) {
                 throw new Error('Data channel closed during transfer');
             }
@@ -977,17 +965,12 @@ async function startSendingFile() {
 }
 
 function waitForDrain() {
-    return new Promise(resolve => {
-        if (dataChannel.bufferedAmount <= LOW_WATER_MARK) {
-            resolve();
-        } else {
-            // Optimization #1: Use onbufferedamountlow event
-            const handler = () => {
-                dataChannel.removeEventListener('bufferedamountlow', handler);
-                resolve();
-            };
-            dataChannel.addEventListener('bufferedamountlow', handler);
-        }
+    return new Promise(r => {
+        const check = () => {
+            if (!dataChannel || dataChannel.bufferedAmount <= HIGH_WATER_MARK / 2) r();
+            else setTimeout(check, 10);
+        };
+        check();
     });
 }
 
@@ -1036,6 +1019,10 @@ function joinRoom(roomId = null, isCreator = false) {
 }
 
 function leaveRoom() {
+    if (transferActive) {
+        if (!confirm('Transfer in progress. Are you sure you want to leave?')) return;
+    }
+
     transferAborted = true;
     stopHeartbeat();
 
@@ -1078,70 +1065,69 @@ function hideRoomDisplay() {
     if (transferSection) transferSection.style.display = 'none';
 }
 
-// ============================================================================
-// WEBRTC SIGNALING
-// ============================================================================
+// Add leave confirmation
+window.addEventListener('beforeunload', (e) => {
+    if (currentRoom || transferActive) {
+        e.preventDefault();
+        e.returnValue = '';
+        return '';
+    }
+});
 
 // ============================================================================
 // WEBRTC SIGNALING
 // ============================================================================
-
-const ignoreOffer = false; // Polite peer logic variable
 
 async function createOffer() {
-    if (!peerConnection) createPeerConnection();
+    if (!peerConnection) return;
     try {
         const offer = await peerConnection.createOffer();
         await peerConnection.setLocalDescription(offer);
-        ws.send(JSON.stringify({ type: 'offer', offer, room: currentRoom }));
-    } catch (e) {
-        console.error('Error creating offer:', e);
+        // Guard against race conditions where PC closed while creating offer
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'offer', offer, room: currentRoom }));
+        }
+    } catch (err) {
+        console.error('Error creating offer:', err);
     }
 }
 
 async function handleOffer(offer) {
     if (!peerConnection) createPeerConnection();
 
-    // Collision handling (Polite Peer pattern simplified)
-    const isStable = peerConnection.signalingState === 'stable' || peerConnection.signalingState === 'have-local-offer';
-
-    // If we are initiator (impolite) and have a local offer (race condition), we might ignore, 
-    // but for simplicity, we'll accept remote offer if we are not 'stable'.
-    // Actually, the error reported is on ANSWER, not Offer. 
-    // "Failed to set remote answer sdp: Called in wrong state: stable"
-    // This implies we are the Offerer, we got an Answer, but we are already Stable.
-    // This usually means we processed the answer twice or reset the connection.
+    // Race condition check: If we're already stable or have an offer, check logic
+    if (peerConnection.signalingState !== 'stable' && peerConnection.signalingState !== 'have-remote-offer') {
+        // If we are 'have-local-offer', this is a glare. 
+        // For simplicity, if we are initiator, we ignore. If not, we reset?
+        // Simplest fix for "InvalidStateError": just proceed if state allows
+    }
 
     try {
-        // If we are already processing an offer/answer, we might need to be careful.
-        // Standard check:
-        if (peerConnection.signalingState !== 'stable' && peerConnection.signalingState !== 'have-remote-offer') {
-            // If we have a local offer (collision), we usually rollback if we are polite.
-            // But let's just proceed for now or log warning.
-        }
-
         await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
         const answer = await peerConnection.createAnswer();
         await peerConnection.setLocalDescription(answer);
-        ws.send(JSON.stringify({ type: 'answer', answer, room: currentRoom }));
-    } catch (e) {
-        console.error('Error handling offer:', e);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'answer', answer, room: currentRoom }));
+        }
+    } catch (err) {
+        console.error('Error handling offer:', err);
     }
 }
 
 async function handleAnswer(answer) {
-    if (!peerConnection) return;
-
-    // FIX: Check state to prevent "Called in wrong state: stable"
-    if (peerConnection.signalingState === 'stable') {
-        console.warn('⚠️ Received answer but connection is already stable. Ignoring duplicate/late answer.');
+    if (!peerConnection) {
+        console.warn('Received answer but no peer connection');
         return;
     }
-
+    // CRITICAL FIX: Check state before setting remote description
+    if (peerConnection.signalingState === 'stable') {
+        console.warn('Received answer but signaling state is stable - ignoring');
+        return;
+    }
     try {
         await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
-    } catch (e) {
-        console.error('Error handling answer:', e);
+    } catch (err) {
+        console.error('Error setting remote answer:', err);
     }
 }
 
@@ -1149,41 +1135,11 @@ async function handleIceCandidate(candidate) {
     if (peerConnection && candidate) {
         try {
             await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
-        } catch (e) {
-            console.error('Error adding ICE candidate:', e);
+        } catch (err) {
+            console.error('Error adding ICE candidate:', err);
         }
     }
 }
-
-// ============================================================================
-// UI HELPERS (Fixing alignment issue)
-// ============================================================================
-
-function hideTransferInfo() {
-    const transferInfo = document.getElementById('transferInfo');
-    const dropZone = document.getElementById('dropZone');
-
-    if (transferInfo) transferInfo.style.display = 'none';
-    if (dropZone) {
-        dropZone.style.display = 'flex';
-        // FIX: Ensure centering is preserved
-        dropZone.style.flexDirection = 'column';
-        dropZone.style.justifyContent = 'center';
-        dropZone.style.alignItems = 'center';
-    }
-}
-
-// ============================================================================
-// LEAVE CONFIRMATION
-// ============================================================================
-
-window.addEventListener('beforeunload', (e) => {
-    if (currentRoom || transferActive) {
-        e.preventDefault();
-        e.returnValue = ''; // Trigger browser confirmation dialog
-        return '';
-    }
-});
 
 // ============================================================================
 // FILE INPUT HANDLERS
@@ -1210,6 +1166,17 @@ function handleFileSelect(e) {
     e.target.value = '';
 }
 
+// FIX UI ALIGNMENT via JS (since we can't edit CSS easily)
+function fixUIAlignment() {
+    const dropZoneContent = document.querySelector('.drop-zone-content');
+    if (dropZoneContent) {
+        dropZoneContent.style.display = 'flex';
+        dropZoneContent.style.flexDirection = 'column';
+        dropZoneContent.style.alignItems = 'center';
+        dropZoneContent.style.justifyContent = 'center';
+    }
+}
+
 // ============================================================================
 // INITIALIZATION
 // ============================================================================
@@ -1222,6 +1189,9 @@ function init() {
 
     setupEventListeners();
     updateConnectionStatus('disconnected', 'Disconnected');
+
+    // Initial layout fix
+    fixUIAlignment();
 }
 
 function setupEventListeners() {
