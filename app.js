@@ -531,9 +531,9 @@ function handleSignalingMessage(msg) {
             dataChannelClosed = true;
             break;
 
-        case 'offer': handleOffer(msg.offer); break;
-        case 'answer': handleAnswer(msg.answer); break;
-        case 'ice-candidate': handleIceCandidate(msg.candidate); break;
+        case 'offer': handleOffer(msg.offer).catch(e => console.error('Offer error:', e)); break;
+        case 'answer': handleAnswer(msg.answer).catch(e => console.error('Answer error:', e)); break;
+        case 'ice-candidate': handleIceCandidate(msg.candidate).catch(e => console.error('ICE error:', e)); break;
         case 'pong': break;
         case 'error': console.error('Server error:', msg.message); showUserMessage(msg.message); break;
     }
@@ -555,9 +555,8 @@ function createPeerConnection() {
 
     peerConnection.onconnectionstatechange = () => {
         console.log(`🔗 State: ${peerConnection.connectionState}`);
-        if (peerConnection.connectionState === 'connected') {
-            updateConnectionStatus('connected', 'P2P Connected');
-        } else if (peerConnection.connectionState === 'failed') {
+        // RULE 5: UI state must NOT depend on ICE state (DataChannel is truth)
+        if (peerConnection.connectionState === 'failed') {
             updateConnectionStatus('disconnected', 'Connection failed');
         }
     };
@@ -573,11 +572,15 @@ function createPeerConnection() {
 }
 
 // ============================================================================
-// DUAL CHANNEL CREATION - CRITICAL FIX #2
+// DUAL CHANNEL CREATION - RULE 1: Only creator creates DataChannel
 // ============================================================================
 
 function createChannels() {
-    console.log('📡 Creating dual channels');
+    if (!isInitiator) {
+        console.warn('⚠️ Non-initiator tried to create channels - ignored');
+        return;
+    }
+    console.log('📡 Creating dual channels (Initiator only)');
 
     // CONTROL channel: ordered, reliable - ALWAYS ALIVE
     controlChannel = peerConnection.createDataChannel('control', {
@@ -600,6 +603,7 @@ function setupControlChannel(channel) {
     channel.onopen = () => {
         console.log('✅ Control channel opened');
         controlChannelClosed = false;
+        // RULE 5: UI state depends on DataChannel
         updateConnectionStatus('connected', 'Ready');
         startHeartbeat(); // FIX #3: Keep alive
 
@@ -611,7 +615,6 @@ function setupControlChannel(channel) {
     };
 
     // FIX #4: Do NOT close DataChannel on temporary state changes
-    // Only mark closed, let heartbeat/reconnect handle it
     channel.onclose = () => {
         console.warn('⚠️ Control channel closed - waiting for resume');
         controlChannelClosed = true;
@@ -626,6 +629,7 @@ function setupControlChannel(channel) {
     };
 }
 
+// RULE 2: setupDataChannel must be IDENTICAL on both sides
 function setupDataChannel(channel) {
     dataChannel = channel;
     dataChannelClosed = false;
@@ -636,7 +640,6 @@ function setupDataChannel(channel) {
         dataChannelClosed = false;
     };
 
-    // CRITICAL FIX #4: Don't nullify on close
     channel.onclose = () => {
         console.warn('⚠️ Data channel closed - waiting for resume');
         dataChannelClosed = true;
@@ -649,6 +652,20 @@ function setupDataChannel(channel) {
             handleBinaryChunk(e.data);
         }
     };
+}
+
+// ============================================================================
+// DIAGNOSTIC LOGGING
+// ============================================================================
+if (isInitiator) {
+    setTimeout(() => {
+        console.log("Creator state:", {
+            signaling: peerConnection?.signalingState,
+            ice: peerConnection?.iceConnectionState,
+            connection: peerConnection?.connectionState,
+            dc: dataChannel?.readyState
+        });
+    }, 5000);
 }
 
 // ============================================================================
