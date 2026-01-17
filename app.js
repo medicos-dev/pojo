@@ -4,7 +4,7 @@ const ICE_SERVERS = [
         urls: "stun:free.expressturn.com:3478"
     },
     {
-        urls: "turn:free.expressturn.com:3478?transport=tcp",
+        urls: "turn:free.expressturn.com:3478?transport=udp",
         username: "000000002083986270",
         credential: "yaZXTjsDpaLSnBGYVnDxMZ+acj8="
     }
@@ -1432,34 +1432,42 @@ function checkRelayStatus() {
     if (!peerConnection) return;
 
     peerConnection.getStats().then(stats => {
-        let isRelayed = false;
+        let selectedPair = null;
+        let localCandidate = null;
+        let remoteCandidate = null;
 
         stats.forEach(report => {
             if (report.type === 'candidate-pair' && report.selected) {
-                if (report.localCandidateId && report.remoteCandidateId) {
-                    const localCandidate = stats.get(report.localCandidateId);
-                    const remoteCandidate = stats.get(report.remoteCandidateId);
-
-                    if (localCandidate && remoteCandidate) {
-                        const localType = localCandidate.candidateType;
-                        const remoteType = remoteCandidate.candidateType;
-
-                        if (localType === 'relay' || remoteType === 'relay') {
-                            isRelayed = true;
-                        }
-                    }
-                }
+                selectedPair = report;
+                if (report.localCandidateId) localCandidate = stats.get(report.localCandidateId);
+                if (report.remoteCandidateId) remoteCandidate = stats.get(report.remoteCandidateId);
             }
         });
 
-        if (isRelayed) {
-            updateConnectionStatus('relayed', 'Relayed Connection');
-            warningMessage.style.display = 'flex';
-        } else {
-            warningMessage.style.display = 'none';
+        if (selectedPair && localCandidate && remoteCandidate) {
+            const localType = localCandidate.candidateType;
+            const remoteType = remoteCandidate.candidateType;
+            const protocol = localCandidate.protocol || 'unknown';
+
+            console.log(`📡 Connection Mode: ${localType} <-> ${remoteType} (${protocol.toUpperCase()})`);
+
+            const isRelayed = localType === 'relay' || remoteType === 'relay';
+
+            if (isRelayed) {
+                console.warn('⚠️ TURN Relay detected. Throttling transfer to 2.5 MBps to prevent congestion.');
+                currentTargetMbps = 2.5; // Cap to 2.5 MBps for relay
+                updateConnectionStatus('relayed', `Relayed (${protocol.toUpperCase()}) - Speed Capped`);
+                if (warningMessage) warningMessage.style.display = 'flex';
+            } else {
+                console.log('✅ Direct P2P connection detected. Full speed enabled.');
+                currentTargetMbps = TARGET_MBPS; // Restore full speed (5 MBps)
+                const typeInfo = (localType === 'host' && remoteType === 'host') ? 'Local Network' : 'P2P Direct';
+                updateConnectionStatus('connected', `${typeInfo} (${protocol.toUpperCase()})`);
+                if (warningMessage) warningMessage.style.display = 'none';
+            }
         }
     }).catch(error => {
-        console.error('Error checking relay status:', error);
+        console.error('❌ Error checking connection stats:', error);
     });
 }
 
