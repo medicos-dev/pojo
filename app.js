@@ -23,16 +23,18 @@ const ICE_SERVERS = [
 // ============================================================================
 // TRANSFER CONFIGURATION
 // ============================================================================
-const CHUNK_SIZE = 64 * 1024;              // 64KB chunks
-const HIGH_WATER_MARK = 16 * 1024 * 1024;  // 16MB backpressure threshold
+const CHUNK_SIZE = 256 * 1024;             // 256KB chunks (Recommended sweet spot)
+const HIGH_WATER_MARK = 48 * 1024 * 1024;  // 48MB backpressure threshold (Deeper buffering)
+const LOW_WATER_MARK = 8 * 1024 * 1024;    // 8MB low threshold for resume
 const MAX_RAM_MB = 256;
 const MAX_RAM_BYTES = MAX_RAM_MB * 1024 * 1024;
-const HEARTBEAT_INTERVAL_MS = 5000;        // 5 second heartbeat
+const HEARTBEAT_INTERVAL_MS = 5000;
 
 // ============================================================================
 // WEBSOCKET URL CONFIGURATION
 // ============================================================================
 function getWebSocketURL() {
+    // ... existing code ...
     const params = new URLSearchParams(window.location.search);
     const wsParam = params.get('ws');
 
@@ -46,6 +48,79 @@ function getWebSocketURL() {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     if (hostname.includes('onrender.com')) return `${protocol}//${hostname}`;
     return `${protocol}//${hostname}:${window.location.port || '8080'}`;
+}
+
+// ...
+
+function createChannels() {
+    console.log('📡 Creating dual channels');
+
+    // CONTROL channel: ordered, reliable - ALWAYS ALIVE
+    controlChannel = peerConnection.createDataChannel('control', {
+        ordered: true
+    });
+    setupControlChannel(controlChannel);
+
+    // DATA channel: unordered, RELIABLE (no maxPacketLifeTime) - DISPOSABLE
+    // Optimization #5 & #6: ordered: false, let WebRTC handle reliability
+    dataChannel = peerConnection.createDataChannel('data', {
+        ordered: false
+    });
+    setupDataChannel(dataChannel);
+}
+
+function setupControlChannel(channel) {
+    controlChannel = channel;
+    // ... existing setup ... (keep as is, just showing context)
+    controlChannelClosed = false;
+
+    channel.onopen = () => {
+        console.log('✅ Control channel opened');
+        controlChannelClosed = false;
+        updateConnectionStatus('connected', 'Ready');
+        startHeartbeat();
+    };
+
+    channel.onclose = () => {
+        console.warn('⚠️ Control channel closed - waiting for resume');
+        controlChannelClosed = true;
+        stopHeartbeat();
+    };
+
+    channel.onerror = (e) => console.error('Control channel error:', e);
+
+    channel.onmessage = (e) => {
+        try { handleControlMessage(JSON.parse(e.data)); }
+        catch (err) { console.error('Control parse error:', err); }
+    };
+}
+
+function setupDataChannel(channel) {
+    dataChannel = channel;
+    dataChannelClosed = false;
+    channel.binaryType = 'arraybuffer';
+
+    // Optimization #1: Increase bufferedAmountLowThreshold
+    // This fires onbufferedamountlow when buffer drains to this level
+    channel.bufferedAmountLowThreshold = LOW_WATER_MARK;
+
+    channel.onopen = () => {
+        console.log('✅ Data channel opened');
+        dataChannelClosed = false;
+    };
+
+    channel.onclose = () => {
+        console.warn('⚠️ Data channel closed - waiting for resume');
+        dataChannelClosed = true;
+    };
+
+    channel.onerror = (e) => console.error('Data channel error:', e);
+
+    channel.onmessage = (e) => {
+        if (e.data instanceof ArrayBuffer) {
+            handleBinaryChunk(e.data);
+        }
+    };
 }
 
 const WS_URL = getWebSocketURL();
@@ -578,73 +653,7 @@ function createPeerConnection() {
 // DUAL CHANNEL CREATION - CRITICAL FIX #2
 // ============================================================================
 
-function createChannels() {
-    console.log('📡 Creating dual channels');
-
-    // CONTROL channel: ordered, reliable - ALWAYS ALIVE
-    controlChannel = peerConnection.createDataChannel('control', {
-        ordered: true
-    });
-    setupControlChannel(controlChannel);
-
-    // DATA channel: unordered for speed - DISPOSABLE
-    dataChannel = peerConnection.createDataChannel('data', {
-        ordered: false,
-        maxPacketLifeTime: 300
-    });
-    setupDataChannel(dataChannel);
-}
-
-function setupControlChannel(channel) {
-    controlChannel = channel;
-    controlChannelClosed = false;
-
-    channel.onopen = () => {
-        console.log('✅ Control channel opened');
-        controlChannelClosed = false;
-        updateConnectionStatus('connected', 'Ready');
-        startHeartbeat();
-    };
-
-    // CRITICAL FIX #4: Don't nullify on close
-    channel.onclose = () => {
-        console.warn('⚠️ Control channel closed - waiting for resume');
-        controlChannelClosed = true;
-        stopHeartbeat();
-    };
-
-    channel.onerror = (e) => console.error('Control channel error:', e);
-
-    channel.onmessage = (e) => {
-        try { handleControlMessage(JSON.parse(e.data)); }
-        catch (err) { console.error('Control parse error:', err); }
-    };
-}
-
-function setupDataChannel(channel) {
-    dataChannel = channel;
-    dataChannelClosed = false;
-    channel.binaryType = 'arraybuffer';
-
-    channel.onopen = () => {
-        console.log('✅ Data channel opened');
-        dataChannelClosed = false;
-    };
-
-    // CRITICAL FIX #4: Don't nullify on close
-    channel.onclose = () => {
-        console.warn('⚠️ Data channel closed - waiting for resume');
-        dataChannelClosed = true;
-    };
-
-    channel.onerror = (e) => console.error('Data channel error:', e);
-
-    channel.onmessage = (e) => {
-        if (e.data instanceof ArrayBuffer) {
-            handleBinaryChunk(e.data);
-        }
-    };
-}
+// (Duplicate DataChannel setup removed - using optimized versions defined above)
 
 // ============================================================================
 // CONTROL MESSAGE HANDLERS
@@ -903,7 +912,7 @@ async function startSendingFile() {
         return;
     }
 
-    console.log(`📤 Starting: ${currentFile.name}`);
+    console.log(`📤 Starting: ${currentFile.name} (Chunk: ${CHUNK_SIZE / 1024}KB)`);
     transferActive = true;
     senderChunkIndex = 0;
     totalBytesSent = 0;
@@ -918,6 +927,11 @@ async function startSendingFile() {
 
     const file = currentFile;
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+
+    // Optimization #7: Avoid repeatedly converting buffers
+    // Note: slice() creates a Blob, arrayBuffer() reads it. 
+    // This is reasonably efficient but creates garbage. 
+    // Streams would be better but slice is robust for now.
 
     try {
         for (let i = 0; i < totalChunks; i++) {
@@ -934,11 +948,17 @@ async function startSendingFile() {
             new Uint8Array(framed, 4).set(new Uint8Array(buffer));
 
             // Backpressure
-            while (dataChannel.bufferedAmount > HIGH_WATER_MARK) {
+            if (dataChannel.bufferedAmount > HIGH_WATER_MARK) {
                 await waitForDrain();
             }
 
+            // Optimization #4: Remove artificial sleeps, yield occasionally
+            if (i % 4 === 0) {
+                await Promise.resolve(); // Yield to main thread
+            }
+
             // CRITICAL FIX #1: Guard before send
+            // Optimization #7: send buffer directly
             if (!sendData(framed)) {
                 throw new Error('Data channel closed during transfer');
             }
@@ -962,12 +982,17 @@ async function startSendingFile() {
 }
 
 function waitForDrain() {
-    return new Promise(r => {
-        const check = () => {
-            if (!dataChannel || dataChannel.bufferedAmount <= HIGH_WATER_MARK / 2) r();
-            else setTimeout(check, 10);
-        };
-        check();
+    return new Promise(resolve => {
+        if (dataChannel.bufferedAmount <= LOW_WATER_MARK) {
+            resolve();
+        } else {
+            // Optimization #1: Use onbufferedamountlow event
+            const handler = () => {
+                dataChannel.removeEventListener('bufferedamountlow', handler);
+                resolve();
+            };
+            dataChannel.addEventListener('bufferedamountlow', handler);
+        }
     });
 }
 
