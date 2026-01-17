@@ -457,12 +457,7 @@ function showTransferInfo(fileName, fileSize, label = 'Transferring...') {
     updateProgress(0);
 }
 
-function hideTransferInfo() {
-    const transferInfo = document.getElementById('transferInfo');
-    const dropZone = document.getElementById('dropZone');
-    if (transferInfo) transferInfo.style.display = 'none';
-    if (dropZone) dropZone.style.display = 'flex';
-}
+// (hideTransferInfo moved to UI HELPERS section with fix)
 
 function showSuccessMessage(text) {
     const el = document.getElementById('successMessage');
@@ -1087,29 +1082,108 @@ function hideRoomDisplay() {
 // WEBRTC SIGNALING
 // ============================================================================
 
+// ============================================================================
+// WEBRTC SIGNALING
+// ============================================================================
+
+const ignoreOffer = false; // Polite peer logic variable
+
 async function createOffer() {
-    const offer = await peerConnection.createOffer();
-    await peerConnection.setLocalDescription(offer);
-    ws.send(JSON.stringify({ type: 'offer', offer, room: currentRoom }));
+    if (!peerConnection) createPeerConnection();
+    try {
+        const offer = await peerConnection.createOffer();
+        await peerConnection.setLocalDescription(offer);
+        ws.send(JSON.stringify({ type: 'offer', offer, room: currentRoom }));
+    } catch (e) {
+        console.error('Error creating offer:', e);
+    }
 }
 
 async function handleOffer(offer) {
     if (!peerConnection) createPeerConnection();
-    await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
-    const answer = await peerConnection.createAnswer();
-    await peerConnection.setLocalDescription(answer);
-    ws.send(JSON.stringify({ type: 'answer', answer, room: currentRoom }));
+
+    // Collision handling (Polite Peer pattern simplified)
+    const isStable = peerConnection.signalingState === 'stable' || peerConnection.signalingState === 'have-local-offer';
+
+    // If we are initiator (impolite) and have a local offer (race condition), we might ignore, 
+    // but for simplicity, we'll accept remote offer if we are not 'stable'.
+    // Actually, the error reported is on ANSWER, not Offer. 
+    // "Failed to set remote answer sdp: Called in wrong state: stable"
+    // This implies we are the Offerer, we got an Answer, but we are already Stable.
+    // This usually means we processed the answer twice or reset the connection.
+
+    try {
+        // If we are already processing an offer/answer, we might need to be careful.
+        // Standard check:
+        if (peerConnection.signalingState !== 'stable' && peerConnection.signalingState !== 'have-remote-offer') {
+            // If we have a local offer (collision), we usually rollback if we are polite.
+            // But let's just proceed for now or log warning.
+        }
+
+        await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+        const answer = await peerConnection.createAnswer();
+        await peerConnection.setLocalDescription(answer);
+        ws.send(JSON.stringify({ type: 'answer', answer, room: currentRoom }));
+    } catch (e) {
+        console.error('Error handling offer:', e);
+    }
 }
 
 async function handleAnswer(answer) {
-    await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+    if (!peerConnection) return;
+
+    // FIX: Check state to prevent "Called in wrong state: stable"
+    if (peerConnection.signalingState === 'stable') {
+        console.warn('⚠️ Received answer but connection is already stable. Ignoring duplicate/late answer.');
+        return;
+    }
+
+    try {
+        await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+    } catch (e) {
+        console.error('Error handling answer:', e);
+    }
 }
 
 async function handleIceCandidate(candidate) {
     if (peerConnection && candidate) {
-        await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+        try {
+            await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (e) {
+            console.error('Error adding ICE candidate:', e);
+        }
     }
 }
+
+// ============================================================================
+// UI HELPERS (Fixing alignment issue)
+// ============================================================================
+
+function hideTransferInfo() {
+    const transferInfo = document.getElementById('transferInfo');
+    const dropZone = document.getElementById('dropZone');
+
+    if (transferInfo) transferInfo.style.display = 'none';
+    if (dropZone) {
+        dropZone.style.display = 'flex';
+        // FIX: Ensure centering is preserved
+        dropZone.style.flexDirection = 'column';
+        dropZone.style.justifyContent = 'center';
+        dropZone.style.alignItems = 'center';
+    }
+}
+
+// ============================================================================
+// LEAVE CONFIRMATION
+// ============================================================================
+
+window.addEventListener('beforeunload', (e) => {
+    if (currentRoom || transferActive) {
+        e.preventDefault();
+        e.returnValue = ''; // Trigger browser confirmation dialog
+        return '';
+    }
+});
 
 // ============================================================================
 // FILE INPUT HANDLERS
