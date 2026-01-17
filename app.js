@@ -23,7 +23,7 @@ const ICE_SERVERS = [
 // ============================================================================
 // TRANSFER CONFIGURATION
 // ============================================================================
-const CHUNK_SIZE = 64 * 1024;              // 64KB chunks
+const CHUNK_SIZE = 256 * 1024;             // 256KB chunks (Optimized)
 const HIGH_WATER_MARK = 16 * 1024 * 1024;  // 16MB backpressure threshold
 const MAX_RAM_MB = 256;
 const MAX_RAM_BYTES = MAX_RAM_MB * 1024 * 1024;
@@ -98,6 +98,7 @@ let receivedChunkCount = 0;
 let speedStartTime = null;
 let lastSpeedUpdate = null;
 let lastBytesForSpeed = 0;
+let lastUIUpdate = 0;
 
 // Pending file requests
 let pendingFileRequest = null;
@@ -720,6 +721,7 @@ function handleAcceptFile() {
     totalBytesReceived = 0;
     receivedChunkCount = 0;
     transferActive = true;
+    lastUIUpdate = 0; // Reset UI throttle
 
     // Send accept via CONTROL channel (not data channel)
     sendControl({ type: 'file-accept' });
@@ -782,11 +784,14 @@ function handleBinaryChunk(buffer) {
     // Update network stats IMMEDIATELY
     totalBytesReceived += payload.byteLength;
     receivedChunkCount++;
-    updateNetworkSpeed();
-
-    // Update progress from network bytes
-    const percent = Math.min(99.9, (totalBytesReceived / receivingFileSize) * 100);
-    updateProgress(percent);
+    // Update network stats & progress (THROTTLED)
+    const now = Date.now();
+    if (now - lastUIUpdate > 100 || totalBytesReceived >= receivingFileSize) { // Max 10 updates/sec
+        lastUIUpdate = now;
+        updateNetworkSpeed();
+        const percent = Math.min(99.9, (totalBytesReceived / receivingFileSize) * 100);
+        updateProgress(percent);
+    }
 
     // Push to RAM queue (NON-BLOCKING)
     RAM_QUEUE.push({ fileName: receivingFileName, chunkIndex, data: payload });
@@ -914,6 +919,7 @@ async function startSendingFile() {
     speedStartTime = Date.now();
     lastSpeedUpdate = Date.now();
     lastBytesForSpeed = 0;
+    lastUIUpdate = 0; // Reset UI throttle
 
     const progressLabel = document.getElementById('progressLabel');
     if (progressLabel) progressLabel.textContent = 'Uploading...';
@@ -950,8 +956,13 @@ async function startSendingFile() {
             totalBytesSent += buffer.byteLength;
             senderChunkIndex++;
 
-            updateProgress((totalBytesSent / file.size) * 100);
-            updateSenderSpeed();
+            // Throttle UI updates
+            const now = Date.now();
+            if (now - lastUIUpdate > 100 || totalBytesSent >= file.size) {
+                lastUIUpdate = now;
+                updateProgress((totalBytesSent / file.size) * 100);
+                updateSenderSpeed();
+            }
         }
 
         console.log('✅ All chunks sent');
