@@ -1,4 +1,4 @@
-import React, { Suspense, lazy } from 'react';
+import React, { Suspense, lazy, useState, useEffect } from 'react';
 import VersionSwitcher from './VersionSwitcher';
 
 const V2Loader = lazy(() => import('./v2/V2Loader'));
@@ -8,7 +8,14 @@ const MainWrapper: React.FC = () => {
     // Simple routing based on window.location.pathname
     // Default is V3 (since pathname '/' should render V3)
     const isV2 = window.location.pathname.startsWith('/v2');
-    const isRoom = window.location.search.includes('room=');
+    const [isRoom, setIsRoom] = useState(window.location.search.includes('room='));
+
+    useEffect(() => {
+        const interval = setInterval(() => {
+            setIsRoom(window.location.search.includes('room='));
+        }, 200);
+        return () => clearInterval(interval);
+    }, []);
 
     return (
         <>
