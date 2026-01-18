@@ -13,7 +13,7 @@ export const Footer = () => {
                         <span className="developer-name">AIKS</span>
                     </div>
                     <button className="btn-donate" onClick={() => setShowDonateModal(true)}>
-                        💌 Thank Me.
+                        💌 Thank Me
                     </button>
                 </div>
             </footer>
