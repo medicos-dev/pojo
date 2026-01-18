@@ -20,6 +20,7 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
     const [senderStatus, setSenderStatus] = useState<'idle' | 'waiting' | 'uploading' | 'complete' | 'paused' | 'error'>('idle');
     const [senderError, setSenderError] = useState<string | null>(null);
     const senderRef = useRef<FileSender | null>(null);
+    const [awaitingFileComplete, setAwaitingFileComplete] = useState(false);
 
     const [receiverMeta, setReceiverMeta] = useState<{ name: string, size: number, mimeType: string } | null>(null);
     const [receiverProgress, setReceiverProgress] = useState<InternalReceiverProgress | null>(null);
@@ -94,7 +95,10 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
                 break;
 
             case 'file-complete':
-                // Receiver has confirmed file completion
+                // Receiver has confirmed file completion - we can now send next file
+                if (modeRef.current === 'sender' && senderStatusRef.current === 'complete') {
+                    setAwaitingFileComplete(false);
+                }
                 break;
 
             case 'cancel':
@@ -153,8 +157,16 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
         });
     };
 
+    // Auto-advance to next file when current completes - wait for file-complete signal
     useEffect(() => {
         if (senderStatus === 'complete' && currentFileIndex < fileQueue.length - 1) {
+            setAwaitingFileComplete(true);
+        }
+    }, [senderStatus, currentFileIndex, fileQueue]);
+
+    // Advance to next file after file-complete received
+    useEffect(() => {
+        if (senderStatus === 'complete' && !awaitingFileComplete && currentFileIndex < fileQueue.length - 1) {
             const nextIndex = currentFileIndex + 1;
             setCurrentFileIndex(nextIndex);
             setSenderFile(fileQueue[nextIndex]);
@@ -162,9 +174,9 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
             setSenderProgress(null);
             setTimeout(() => {
                 handleSenderStart(fileQueue[nextIndex]);
-            }, 1000);
+            }, 500);
         }
-    }, [senderStatus, currentFileIndex, fileQueue]);
+    }, [awaitingFileComplete, senderStatus]);
 
     const handleSenderAbort = () => {
         if (senderRef.current) senderRef.current.abort();

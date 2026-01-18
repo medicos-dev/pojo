@@ -21,6 +21,7 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
     const [senderStatus, setSenderStatus] = useState<'idle' | 'waiting' | 'uploading' | 'complete' | 'paused' | 'error'>('idle');
     const [senderError, setSenderError] = useState<string | null>(null);
     const senderRef = useRef<FileSender | null>(null);
+    const [awaitingFileComplete, setAwaitingFileComplete] = useState(false);
 
     // Receiver State
     const [receiverMeta, setReceiverMeta] = useState<{ name: string, size: number, mimeType: string } | null>(null);
@@ -87,7 +88,9 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
 
             case 'file-complete':
                 // Receiver has confirmed file completion - we can now send next file
-                // This triggers the useEffect for auto-advancing
+                if (modeRef.current === 'sender' && senderStatusRef.current === 'complete') {
+                    setAwaitingFileComplete(false);
+                }
                 break;
 
             case 'cancel':
@@ -153,21 +156,35 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
         });
     };
 
-    // Auto-advance to next file when current completes
+    // Auto-advance to next file when current completes AND receiver confirms
     useEffect(() => {
         if (senderStatus === 'complete' && currentFileIndex < fileQueue.length - 1) {
-            // Auto-start next file
+            // Wait for file-complete signal from receiver
+            setAwaitingFileComplete(true);
+        }
+    }, [senderStatus, currentFileIndex, fileQueue]);
+
+    // Trigger next file once file-complete is received
+    useEffect(() => {
+        if (!awaitingFileComplete && senderStatus === 'complete' && currentFileIndex < fileQueue.length - 1) {
+            // This runs after file-complete received (awaitingFileComplete set to false)
+        }
+    }, [awaitingFileComplete]);
+
+    // The actual advance to next file - triggered by awaitingFileComplete becoming false
+    useEffect(() => {
+        if (senderStatus === 'complete' && !awaitingFileComplete && currentFileIndex < fileQueue.length - 1) {
             const nextIndex = currentFileIndex + 1;
             setCurrentFileIndex(nextIndex);
             setSenderFile(fileQueue[nextIndex]);
             setSenderStatus('idle');
             setSenderProgress(null);
-            // Auto-start after delay to let Receiver clean up IDB/Blobs
+            // Brief delay for UI update
             setTimeout(() => {
                 handleSenderStart(fileQueue[nextIndex]);
-            }, 1000);
+            }, 500);
         }
-    }, [senderStatus, currentFileIndex, fileQueue]);
+    }, [awaitingFileComplete, senderStatus]);
 
     const handleSenderAbort = () => {
         if (senderRef.current) senderRef.current.abort();
