@@ -41,16 +41,16 @@ export const Footer = () => {
                             e.currentTarget.style.borderColor = 'rgba(255, 255, 255, 0.06)';
                         }}
                     >
-                        <img 
-                            src="/aiks.jpg" 
-                            alt="Developer" 
+                        <img
+                            src="/aiks1.jpg"
+                            alt="Developer"
                             style={{
                                 width: '28px',
                                 height: '28px',
                                 borderRadius: '50%',
                                 objectFit: 'cover',
                                 border: '2px solid rgba(255, 255, 255, 0.15)'
-                            }} 
+                            }}
                         />
                         <span style={{
                             fontSize: '0.8125rem',
@@ -95,7 +95,7 @@ export const Footer = () => {
             </footer>
 
             {showDevModal && (
-                <div 
+                <div
                     style={{
                         position: 'fixed',
                         inset: 0,
@@ -110,14 +110,14 @@ export const Footer = () => {
                     }}
                     onClick={() => setShowDevModal(false)}
                 >
-                    <div 
+                    <div
                         style={{
                             position: 'relative',
                             animation: 'scaleIn 0.3s ease'
                         }}
                         onClick={e => e.stopPropagation()}
                     >
-                        <button 
+                        <button
                             onClick={() => setShowDevModal(false)}
                             style={{
                                 position: 'absolute',
@@ -149,9 +149,9 @@ export const Footer = () => {
                                 <line x1="6" y1="6" x2="18" y2="18"></line>
                             </svg>
                         </button>
-                        <img 
-                            src="/aiks.jpg" 
-                            alt="Developer" 
+                        <img
+                            src="/aiks1.jpg"
+                            alt="Developer"
                             style={{
                                 width: '240px',
                                 height: '240px',
@@ -159,14 +159,14 @@ export const Footer = () => {
                                 objectFit: 'cover',
                                 border: '4px solid rgba(255, 255, 255, 0.15)',
                                 boxShadow: '0 20px 50px rgba(0, 0, 0, 0.5)'
-                            }} 
+                            }}
                         />
                     </div>
                 </div>
             )}
 
             {showDonateModal && (
-                <div 
+                <div
                     style={{
                         position: 'fixed',
                         inset: 0,
@@ -181,7 +181,7 @@ export const Footer = () => {
                     }}
                     onClick={() => setShowDonateModal(false)}
                 >
-                    <div 
+                    <div
                         style={{
                             position: 'relative',
                             maxWidth: '90vw',
@@ -190,7 +190,7 @@ export const Footer = () => {
                         }}
                         onClick={e => e.stopPropagation()}
                     >
-                        <button 
+                        <button
                             onClick={() => setShowDonateModal(false)}
                             style={{
                                 position: 'absolute',
@@ -222,15 +222,15 @@ export const Footer = () => {
                                 <line x1="6" y1="6" x2="18" y2="18"></line>
                             </svg>
                         </button>
-                        <img 
-                            src="/donate.png" 
-                            alt="Donation QR" 
+                        <img
+                            src="/donate.png"
+                            alt="Donation QR"
                             style={{
                                 maxWidth: '100%',
                                 maxHeight: '75vh',
                                 borderRadius: '16px',
                                 boxShadow: '0 20px 50px rgba(0, 0, 0, 0.5)'
-                            }} 
+                            }}
                         />
                     </div>
                 </div>
