@@ -481,8 +481,8 @@ h2 {
 @media (max-width: 600px) {
     .app-container {
         padding: 1rem;
-        justify-content: flex-start;
-        /* Align top on mobile to avoid centering issues with keyboards */
+        justify-content: center;
+        /* Centering restored per user request */
     }
 
     .retro-card {

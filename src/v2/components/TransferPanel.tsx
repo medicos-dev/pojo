@@ -154,10 +154,10 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
             setSenderFile(fileQueue[nextIndex]);
             setSenderStatus('idle');
             setSenderProgress(null);
-            // Auto-start after brief delay to let UI update
+            // Auto-start after delay to let Receiver clean up IDB/Blobs
             setTimeout(() => {
                 handleSenderStart(fileQueue[nextIndex]);
-            }, 500);
+            }, 1000);
         }
     }, [senderStatus, currentFileIndex, fileQueue]);
 

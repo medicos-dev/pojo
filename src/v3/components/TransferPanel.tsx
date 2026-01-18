@@ -47,7 +47,7 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
                     text: `Join room ${roomId} to share files`,
                     url: shareUrl
                 });
-            } catch {}
+            } catch { }
         } else {
             navigator.clipboard.writeText(shareUrl);
             setCopyFeedback(true);
@@ -56,7 +56,7 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
     };
 
     const handleChannelState = useCallback((type: 'control' | 'data', open: boolean) => {
-        if (type === 'data' && !open) {}
+        if (type === 'data' && !open) { }
     }, []);
 
     const handleControlMessage = useCallback((msg: ControlMessage) => {
@@ -155,7 +155,7 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
             setSenderProgress(null);
             setTimeout(() => {
                 handleSenderStart(fileQueue[nextIndex]);
-            }, 500);
+            }, 1000);
         }
     }, [senderStatus, currentFileIndex, fileQueue]);
 
@@ -239,7 +239,7 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
     return (
         <div className="app-container">
             <div style={{ maxWidth: '480px', width: '100%' }}>
-                <div 
+                <div
                     className="glass-card-static"
                     style={{
                         display: 'flex',
@@ -280,7 +280,7 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
                             <button
                                 className="btn-ghost"
                                 onClick={copyRoomId}
-                                style={{ 
+                                style={{
                                     padding: '0.5rem 0.875rem',
                                     fontSize: '0.8125rem'
                                 }}
@@ -305,7 +305,7 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
                             <button
                                 className="btn-ghost"
                                 onClick={shareRoom}
-                                style={{ 
+                                style={{
                                     padding: '0.5rem 0.875rem',
                                     fontSize: '0.8125rem'
                                 }}

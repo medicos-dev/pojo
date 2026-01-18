@@ -29,7 +29,7 @@ const VersionSwitcher: React.FC = () => {
                 alignItems: 'center',
                 justifyContent: 'center',
                 cursor: 'pointer',
-                zIndex: 9999,
+                zIndex: 10001,
                 fontWeight: 'bold',
                 boxShadow: '0 4px 6px rgba(0,0,0,0.1)',
                 border: '2px solid rgba(128, 128, 128, 0.3)',
