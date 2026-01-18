@@ -140,7 +140,12 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
             (progress) => setSenderProgress(progress),
             (status, err) => {
                 if (status === 'uploading') setSenderStatus('uploading');
-                if (status === 'complete') setSenderStatus('complete');
+                if (status === 'complete') {
+                    if (currentFileIndex < fileQueue.length - 1) {
+                        setAwaitingFileComplete(true);
+                    }
+                    setSenderStatus('complete');
+                }
                 if (status === 'error') {
                     setSenderStatus('error');
                     setSenderError(err || 'Unknown error');
@@ -157,12 +162,7 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
         });
     };
 
-    // Auto-advance to next file when current completes - wait for file-complete signal
-    useEffect(() => {
-        if (senderStatus === 'complete' && currentFileIndex < fileQueue.length - 1) {
-            setAwaitingFileComplete(true);
-        }
-    }, [senderStatus, currentFileIndex, fileQueue]);
+    // Auto-advance logic now driven by awaitingFileComplete + file-complete message
 
     // Advance to next file after file-complete received
     useEffect(() => {
