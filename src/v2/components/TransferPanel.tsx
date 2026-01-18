@@ -21,7 +21,6 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
     const [senderStatus, setSenderStatus] = useState<'idle' | 'waiting' | 'uploading' | 'complete' | 'paused' | 'error'>('idle');
     const [senderError, setSenderError] = useState<string | null>(null);
     const senderRef = useRef<FileSender | null>(null);
-    const [awaitingFileComplete, setAwaitingFileComplete] = useState(false);
 
     // Receiver State
     const [receiverMeta, setReceiverMeta] = useState<{ name: string, size: number, mimeType: string } | null>(null);
@@ -88,9 +87,7 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
 
             case 'file-complete':
                 // Receiver has confirmed file completion - we can now send next file
-                if (modeRef.current === 'sender' && senderStatusRef.current === 'complete') {
-                    setAwaitingFileComplete(false);
-                }
+                // This triggers the useEffect for auto-advancing
                 break;
 
             case 'cancel':
@@ -138,14 +135,7 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
             (progress) => setSenderProgress(progress),
             (status, err) => {
                 if (status === 'uploading') setSenderStatus('uploading');
-                if (status === 'complete') {
-                    // CRITICAL: Set waiting flag BEFORE setting complete status to avoid race condition
-                    // The useEffect checks (senderStatus === 'complete' && !awaitingFileComplete)
-                    if (currentFileIndex < fileQueue.length - 1) {
-                        setAwaitingFileComplete(true);
-                    }
-                    setSenderStatus('complete');
-                }
+                if (status === 'complete') setSenderStatus('complete');
                 if (status === 'error') {
                     setSenderStatus('error');
                     setSenderError(err || 'Unknown error');
@@ -163,32 +153,21 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
         });
     };
 
-    // Auto-advance logic now driven by awaitingFileComplete + file-complete message
-    // 1. Sender finishes -> sets awaitingFileComplete=true -> status=complete
-    // 2. Receiver sends file-complete -> awaitingFileComplete=false
-    // 3. Effect below triggers next file
-
-    // Trigger next file once file-complete is received
+    // Auto-advance to next file when current completes
     useEffect(() => {
-        if (!awaitingFileComplete && senderStatus === 'complete' && currentFileIndex < fileQueue.length - 1) {
-            // This runs after file-complete received (awaitingFileComplete set to false)
-        }
-    }, [awaitingFileComplete]);
-
-    // The actual advance to next file - triggered by awaitingFileComplete becoming false
-    useEffect(() => {
-        if (senderStatus === 'complete' && !awaitingFileComplete && currentFileIndex < fileQueue.length - 1) {
+        if (senderStatus === 'complete' && currentFileIndex < fileQueue.length - 1) {
+            // Auto-start next file
             const nextIndex = currentFileIndex + 1;
             setCurrentFileIndex(nextIndex);
             setSenderFile(fileQueue[nextIndex]);
             setSenderStatus('idle');
             setSenderProgress(null);
-            // Brief delay for UI update
+            // Auto-start after delay to let Receiver clean up IDB/Blobs
             setTimeout(() => {
                 handleSenderStart(fileQueue[nextIndex]);
-            }, 500);
+            }, 1000);
         }
-    }, [awaitingFileComplete, senderStatus]);
+    }, [senderStatus, currentFileIndex, fileQueue]);
 
     const handleSenderAbort = () => {
         if (senderRef.current) senderRef.current.abort();

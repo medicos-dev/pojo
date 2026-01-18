@@ -11,27 +11,14 @@ export const StatusBar = (_props: Props) => {
     const [pcState, setPcState] = useState<RTCPeerConnectionState>('new');
 
     useEffect(() => {
-        const checkWsState = () => {
-            const ws = getSocket();
-            if (ws) {
-                if (ws.readyState === WebSocket.OPEN) {
-                    setWsState('Connected');
-                } else if (ws.readyState === WebSocket.CONNECTING) {
-                    setWsState('Connecting...');
-                } else {
-                    setWsState('Disconnected');
-                }
-            } else {
-                setWsState('Connecting...');
-            }
-        };
-
-        // Check immediately
-        checkWsState();
-
-        // Then poll
-        const interval = setInterval(checkWsState, 1000);
-        return () => clearInterval(interval);
+        const ws = getSocket();
+        if (ws) {
+            setWsState(ws.readyState === WebSocket.OPEN ? 'Connected' : 'Disconnected');
+            const interval = setInterval(() => {
+                setWsState(ws.readyState === WebSocket.OPEN ? 'Connected' : 'Connecting...');
+            }, 2000);
+            return () => clearInterval(interval);
+        }
     }, []);
 
     useEffect(() => {
