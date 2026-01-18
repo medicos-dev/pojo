@@ -62,10 +62,11 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
     const handleControlMessage = useCallback((msg: ControlMessage) => {
         switch (msg.type) {
             case 'file-request':
-                // Don't accept file requests while actively sending
-                if (modeRef.current === 'sender' && senderStatusRef.current !== 'idle' && senderStatusRef.current !== 'complete') {
-                    return;
-                }
+                // Reset receiver state to accept new file, even if previous was complete
+                setReceiverProgress(null);
+                receiverRef.current = null;
+
+                if (modeRef.current === 'sender') return;
                 setMode('receiver');
                 setReceiverMeta({
                     name: msg.name!,
@@ -74,7 +75,6 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
                 });
                 setReceiverStatus('offering');
                 setReceiverError(null);
-                setReceiverProgress(null);
                 break;
 
             case 'file-accept':
@@ -94,10 +94,7 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
                 break;
 
             case 'file-complete':
-                // Receiver has finished downloading, sender can now proceed to next file
-                if (modeRef.current === 'sender') {
-                    console.log('Receiver confirmed file-complete, ready for next file');
-                }
+                // Receiver has confirmed file completion
                 break;
 
             case 'cancel':
@@ -201,23 +198,13 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
             receiverMeta,
             (progress) => setReceiverProgress(progress),
             (status, data) => {
+                if (status === 'receiving') setReceiverStatus('receiving');
                 if (status === 'receiving' && data === 'finalizing') {
                     setReceiverStatus('finalizing');
-                } else if (status === 'receiving') {
-                    setReceiverStatus('receiving');
                 }
                 if (status === 'complete') {
                     setReceiverStatus('complete');
                     triggerDownload(data as Blob, receiverMeta.name);
-                    // Auto-reset receiver after a brief delay to show completion
-                    setTimeout(() => {
-                        setMode('idle');
-                        setReceiverMeta(null);
-                        setReceiverStatus('idle');
-                        setReceiverError(null);
-                        setReceiverProgress(null);
-                        receiverRef.current = null;
-                    }, 500);
                 }
                 if (status === 'error') {
                     setReceiverStatus('error');
