@@ -8,6 +8,7 @@ const MainWrapper: React.FC = () => {
     // Simple routing based on window.location.pathname
     // Default is V3 (since pathname '/' should render V3)
     const isV2 = window.location.pathname.startsWith('/v2');
+    const isRoom = window.location.search.includes('room=');
 
     return (
         <>
@@ -22,7 +23,7 @@ const MainWrapper: React.FC = () => {
             }}>Loading...</div>}>
                 {isV2 ? <V2Loader /> : <V3Loader />}
             </Suspense>
-            <VersionSwitcher />
+            {!isRoom && <VersionSwitcher />}
         </>
     );
 };

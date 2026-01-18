@@ -1,3 +1,4 @@
+import { useState, useEffect } from 'react';
 import { formatFileSize } from '../utils/format';
 import { InternalReceiverProgress } from '../transfer/receiver';
 
@@ -20,6 +21,16 @@ export const ReceiverPanel = ({
     onReject,
     onReset
 }: Props) => {
+
+    const [showReset, setShowReset] = useState(false);
+    useEffect(() => {
+        if (status === 'complete') {
+            const t = setTimeout(() => setShowReset(true), 2500);
+            return () => clearTimeout(t);
+        } else {
+            setShowReset(false);
+        }
+    }, [status]);
 
     const getFileIcon = (fileName: string) => {
         const ext = fileName.split('.').pop()?.toLowerCase();
@@ -183,10 +194,10 @@ export const ReceiverPanel = ({
                         fontSize: '0.6875rem',
                         color: 'var(--accent-green)'
                     }}>
-                        {status === 'offering' ? 'Accept to download' : 
-                         status === 'receiving' ? 'Downloading...' :
-                         status === 'finalizing' ? 'Finalizing...' :
-                         status === 'complete' ? 'Complete' : 'Transfer'}
+                        {status === 'offering' ? 'Accept to download' :
+                            status === 'receiving' ? 'Downloading...' :
+                                status === 'finalizing' ? 'Finalizing...' :
+                                    status === 'complete' ? 'Complete' : 'Transfer'}
                     </p>
                 </div>
             </div>
@@ -284,9 +295,9 @@ export const ReceiverPanel = ({
                             </span>
                         </div>
                         <div className="progress-bar">
-                            <div 
-                                className="progress-fill" 
-                                style={{ width: `${progress.percent}%` }} 
+                            <div
+                                className="progress-fill"
+                                style={{ width: `${progress.percent}%` }}
                             />
                         </div>
                         <div style={{
@@ -375,9 +386,11 @@ export const ReceiverPanel = ({
                             Saved to downloads
                         </p>
                     </div>
-                    <button className="btn-secondary" onClick={onReset} style={{ fontSize: '0.75rem' }}>
-                        Ready for Next
-                    </button>
+                    {showReset && (
+                        <button className="btn-secondary" onClick={onReset} style={{ fontSize: '0.75rem' }}>
+                            Ready for Next
+                        </button>
+                    )}
                 </div>
             )}
 
@@ -402,7 +415,7 @@ export const ReceiverPanel = ({
                             <line x1="12" y1="8" x2="12" y2="12"></line>
                             <line x1="12" y1="16" x2="12.01" y2="16"></line>
                         </svg>
-                        <span style={{ 
+                        <span style={{
                             fontSize: '0.75rem',
                             color: 'var(--accent-red)'
                         }}>

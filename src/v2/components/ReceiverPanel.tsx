@@ -1,3 +1,4 @@
+import { useState, useEffect } from 'react';
 import { formatFileSize } from '../utils/format';
 import { InternalReceiverProgress } from '../transfer/receiver';
 
@@ -20,6 +21,16 @@ export const ReceiverPanel = ({
     onReject,
     onReset
 }: Props) => {
+
+    const [showReset, setShowReset] = useState(false);
+    useEffect(() => {
+        if (status === 'complete') {
+            const t = setTimeout(() => setShowReset(true), 2500);
+            return () => clearTimeout(t);
+        } else {
+            setShowReset(false);
+        }
+    }, [status]);
 
     // handleDownload removed (trust parent)
 
@@ -80,9 +91,11 @@ export const ReceiverPanel = ({
                 <div className="text-green font-mono" style={{ marginTop: '1rem' }}>
                     <div>✓ RECEPTION COMPLETE</div>
                     <div style={{ fontSize: '0.8rem', opacity: 0.7 }}>File saved to Downloads</div>
-                    <button className="retro-btn" style={{ marginTop: '1rem', marginLeft: '0.5rem' }} onClick={onReset}>
-                        READY FOR NEXT
-                    </button>
+                    {showReset && (
+                        <button className="retro-btn" style={{ marginTop: '1rem', marginLeft: '0.5rem' }} onClick={onReset}>
+                            READY FOR NEXT
+                        </button>
+                    )}
                 </div>
             )}
 
