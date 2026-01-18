@@ -54,8 +54,8 @@ export const StatusBar = (_props: Props) => {
                 <span className={`status-text ${getStatusClass()}`}>{getStatusText()}</span>
             </div>
             <div className="status-right">
-                <span className={wsState === 'Connected' ? 'text-green' : 'text-amber'}>
-                    ● {wsState.toUpperCase()}
+                <span className={wsState === 'Connected' || pcState === 'connected' ? 'text-green' : 'text-amber'}>
+                    ● {wsState === 'Connected' || pcState === 'connected' ? 'CONNECTED' : wsState.toUpperCase()}
                 </span>
             </div>
         </div>

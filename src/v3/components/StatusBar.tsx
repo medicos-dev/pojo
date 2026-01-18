@@ -128,23 +128,23 @@ export const StatusBar = (_props: Props) => {
                 alignItems: 'center',
                 gap: '0.375rem',
                 padding: '0.25rem 0.5rem',
-                background: wsState === 'Connected' ? 'rgba(48, 209, 88, 0.06)' : 'rgba(255, 159, 10, 0.06)',
+                background: wsState === 'Connected' || pcState === 'connected' ? 'rgba(48, 209, 88, 0.06)' : 'rgba(255, 159, 10, 0.06)',
                 borderRadius: '100px'
             }}>
                 <div style={{
                     width: '5px',
                     height: '5px',
                     borderRadius: '50%',
-                    background: wsState === 'Connected' ? 'var(--accent-green)' : 'var(--accent-orange)'
+                    background: wsState === 'Connected' || pcState === 'connected' ? 'var(--accent-green)' : 'var(--accent-orange)'
                 }} />
                 <span style={{
                     fontSize: '0.625rem',
                     fontWeight: 500,
-                    color: wsState === 'Connected' ? 'var(--accent-green)' : 'var(--accent-orange)',
+                    color: wsState === 'Connected' || pcState === 'connected' ? 'var(--accent-green)' : 'var(--accent-orange)',
                     textTransform: 'uppercase',
                     letterSpacing: '0.04em'
                 }}>
-                    {wsState}
+                    {wsState === 'Connected' || pcState === 'connected' ? 'Connected' : wsState}
                 </span>
             </div>
         </div>

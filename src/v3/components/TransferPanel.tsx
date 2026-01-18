@@ -17,7 +17,7 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
     const [fileQueue, setFileQueue] = useState<File[]>([]);
     const [currentFileIndex, setCurrentFileIndex] = useState(0);
     const [senderProgress, setSenderProgress] = useState<InternalTransferProgress | null>(null);
-    const [senderStatus, setSenderStatus] = useState<'idle' | 'waiting' | 'uploading' | 'complete' | 'paused' | 'error'>('idle');
+    const [senderStatus, setSenderStatus] = useState<'idle' | 'waiting' | 'uploading' | 'finalizing' | 'complete' | 'paused' | 'error'>('idle');
     const [senderError, setSenderError] = useState<string | null>(null);
     const senderRef = useRef<FileSender | null>(null);
 
@@ -95,6 +95,9 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
 
             case 'file-complete':
                 // Receiver has confirmed file completion
+                if (modeRef.current === 'sender') {
+                    setSenderStatus('complete');
+                }
                 break;
 
             case 'cancel':
@@ -136,7 +139,7 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
             (progress) => setSenderProgress(progress),
             (status, err) => {
                 if (status === 'uploading') setSenderStatus('uploading');
-                if (status === 'complete') setSenderStatus('complete');
+                if (status === 'complete') setSenderStatus('finalizing'); // Wait for receiver
                 if (status === 'error') {
                     setSenderStatus('error');
                     setSenderError(err || 'Unknown error');
@@ -169,7 +172,7 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
     const handleSenderAbort = () => {
         if (senderRef.current) senderRef.current.abort();
 
-        if (mode === 'sender' && (senderStatus === 'uploading' || senderStatus === 'waiting' || senderStatus === 'paused')) {
+        if (mode === 'sender' && (senderStatus === 'uploading' || senderStatus === 'waiting' || senderStatus === 'finalizing' || senderStatus === 'paused')) {
             sendControl({ type: 'cancel' } as any);
         }
 

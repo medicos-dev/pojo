@@ -7,7 +7,7 @@ interface Props {
     fileQueue: File[];
     currentIndex: number;
     progress: InternalTransferProgress | null;
-    status: 'idle' | 'waiting' | 'uploading' | 'complete' | 'paused' | 'error';
+    status: 'idle' | 'waiting' | 'uploading' | 'finalizing' | 'complete' | 'paused' | 'error';
     error: string | null;
     onFilesSelect: (files: File[]) => void;
     onStart: () => void;
@@ -226,7 +226,7 @@ export const SenderPanel = ({ file, fileQueue, currentIndex, progress, status, e
                         </div>
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
                             {fileQueue.map((f, idx) => (
-                                <div 
+                                <div
                                     key={idx}
                                     className={`file-item ${idx === currentIndex ? 'active' : ''} ${idx < currentIndex ? 'completed' : ''}`}
                                 >
@@ -352,7 +352,7 @@ export const SenderPanel = ({ file, fileQueue, currentIndex, progress, status, e
                         </div>
                     )}
 
-                    {(status === 'uploading' || status === 'paused') && progress && (
+                    {(status === 'uploading' || status === 'finalizing' || status === 'paused') && progress && (
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
                             <div>
                                 <div style={{
@@ -371,16 +371,16 @@ export const SenderPanel = ({ file, fileQueue, currentIndex, progress, status, e
                                         fontSize: '0.75rem',
                                         color: status === 'paused' ? 'var(--accent-orange)' : 'var(--accent-green)'
                                     }}>
-                                        {status === 'paused' ? 'Paused' : `${formatFileSize(progress.speedBps)}/s`}
+                                        {status === 'paused' ? 'Paused' : status === 'finalizing' ? 'Finalizing...' : `${formatFileSize(progress.speedBps)}/s`}
                                     </span>
                                 </div>
                                 <div className="progress-bar">
-                                    <div 
-                                        className="progress-fill" 
-                                        style={{ 
+                                    <div
+                                        className="progress-fill"
+                                        style={{
                                             width: `${progress.percent}%`,
                                             opacity: status === 'paused' ? 0.6 : 1
-                                        }} 
+                                        }}
                                     />
                                 </div>
                                 <div style={{
@@ -442,7 +442,7 @@ export const SenderPanel = ({ file, fileQueue, currentIndex, progress, status, e
                                 <line x1="12" y1="8" x2="12" y2="12"></line>
                                 <line x1="12" y1="16" x2="12.01" y2="16"></line>
                             </svg>
-                            <span style={{ 
+                            <span style={{
                                 fontSize: '0.75rem',
                                 color: 'var(--accent-red)'
                             }}>

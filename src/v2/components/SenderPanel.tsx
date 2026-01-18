@@ -7,7 +7,7 @@ interface Props {
     fileQueue: File[];
     currentIndex: number;
     progress: InternalTransferProgress | null;
-    status: 'idle' | 'waiting' | 'uploading' | 'complete' | 'paused' | 'error';
+    status: 'idle' | 'waiting' | 'uploading' | 'finalizing' | 'complete' | 'paused' | 'error';
     error: string | null;
     onFilesSelect: (files: File[]) => void;
     onStart: () => void;
@@ -124,7 +124,7 @@ export const SenderPanel = ({ file, fileQueue, currentIndex, progress, status, e
                         </div>
                     )}
 
-                    {(status === 'uploading' || status === 'paused') && progress && (
+                    {(status === 'uploading' || status === 'finalizing' || status === 'paused') && progress && (
                         <div>
                             <div className="progress-container">
                                 <div
@@ -138,7 +138,7 @@ export const SenderPanel = ({ file, fileQueue, currentIndex, progress, status, e
                             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.9rem', marginBottom: '1rem' }}>
                                 <span className="font-mono">{progress.percent.toFixed(1)}%</span>
                                 <span className="font-mono">
-                                    {status === 'paused' ? 'PAUSED' : `${formatFileSize(progress.speedBps)}/s`}
+                                    {status === 'paused' ? 'PAUSED' : status === 'finalizing' ? 'FINALIZING...' : `${formatFileSize(progress.speedBps)}/s`}
                                 </span>
                                 <span className="text-muted">{formatFileSize(progress.bytesSent)} / {formatFileSize(progress.totalBytes)}</span>
                             </div>
