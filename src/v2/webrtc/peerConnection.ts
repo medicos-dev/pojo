@@ -1,4 +1,4 @@
-import { getIceServers } from '../config';
+import { getIceServers, updateChunkSize } from '../config';
 import { sendSignal, getSocket } from './signaling';
 import { setupControlChannel, setupDataChannel } from './dataChannel';
 
@@ -28,6 +28,13 @@ export const createPeerConnection = async (room: string, isInitiator: boolean) =
     iceRestartAttempts = 0;
     const iceServers = await getIceServers();
     peerConnection = new RTCPeerConnection({ iceServers });
+
+    // Throughput safety: clamp chunk size to SCTP maxMessageSize when available.
+    // (maxMessageSize is in bytes; we reserve 4 bytes for our chunk index header.)
+    const sctpMax = peerConnection.sctp?.maxMessageSize;
+    if (typeof sctpMax === 'number' && Number.isFinite(sctpMax) && sctpMax > 4096) {
+        updateChunkSize(Math.floor(sctpMax - 4));
+    }
 
     peerConnection.onicecandidate = (e) => {
         const ws = getSocket();

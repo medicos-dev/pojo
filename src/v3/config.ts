@@ -1,11 +1,13 @@
-export let CHUNK_SIZE = 250 * 1024; // 256KB - safe for most browsers
-export const HIGH_WATER_MARK = 4 * 1024 * 1024; // 4MB - safe browser buffer limit
-export const LOW_WATER_MARK = 1 * 1024 * 1024; // 1MB - resume sending threshold
+export let CHUNK_SIZE = 1024 * 1024; // 1MB default, will be clamped to SCTP maxMessageSize at runtime
+export const HIGH_WATER_MARK = 32 * 1024 * 1024; // 32MB - higher throughput, still safe
+export const LOW_WATER_MARK = 8 * 1024 * 1024; // 8MB - resume sending threshold
 export const MAX_RAM_MB = 512;
 export const MAX_RAM_BYTES = MAX_RAM_MB * 1024 * 1024;
 
 export const updateChunkSize = (size: number) => {
-    CHUNK_SIZE = size;
+    // Clamp to reasonable bounds: min 64KB, max 1MB (and still clamped again by SCTP)
+    const next = Math.max(64 * 1024, Math.min(size, 1024 * 1024));
+    CHUNK_SIZE = next;
 
 };
 
