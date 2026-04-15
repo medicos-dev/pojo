@@ -29,13 +29,6 @@ export const createPeerConnection = async (room: string, isInitiator: boolean) =
     const iceServers = await getIceServers();
     peerConnection = new RTCPeerConnection({ iceServers });
 
-    // Throughput safety: clamp chunk size to SCTP maxMessageSize when available.
-    // (maxMessageSize is in bytes; we reserve 4 bytes for our chunk index header.)
-    const sctpMax = peerConnection.sctp?.maxMessageSize;
-    if (typeof sctpMax === 'number' && Number.isFinite(sctpMax) && sctpMax > 4096) {
-        updateChunkSize(Math.floor(sctpMax - 4));
-    }
-
     peerConnection.onicecandidate = (e) => {
         const ws = getSocket();
         if (e.candidate && ws && ws.readyState === WebSocket.OPEN) {
@@ -112,6 +105,14 @@ function createChannels(pc: RTCPeerConnection) {
         ordered: true  // Reliable delivery - critical for large files
     });
     setupDataChannel(dataChannel);
+
+    // Set a safe chunk size once SCTP is available (post-negotiation).
+    dataChannel.addEventListener('open', () => {
+        const sctpMax = pc.sctp?.maxMessageSize;
+        if (typeof sctpMax === 'number' && Number.isFinite(sctpMax) && sctpMax > 4096) {
+            updateChunkSize(Math.floor(sctpMax - 4));
+        }
+    });
 }
 
 export const getPeerConnection = () => peerConnection;

@@ -52,7 +52,8 @@ function handleHealthCheck(req, res) {
 // ICE CONFIG (for WebRTC NAT traversal)
 // ============================================================================
 // Safe-by-default: if TURN env vars aren't set, clients will just use STUN.
-function getIceServersFromEnv() {
+function getIceServersFromEnv(options = {}) {
+    const forceDirectOnly = options.forceDirectOnly === true;
     const stunUrls = (process.env.STUN_URLS || 'stun:stun.l.google.com:19302')
         .split(',')
         .map(s => s.trim())
@@ -70,7 +71,8 @@ function getIceServersFromEnv() {
     for (const url of stunUrls) iceServers.push({ urls: url });
 
     // Only include TURN if it's fully configured
-    if (turnUrls.length > 0 && turnUsername && turnCredential) {
+    const envDirectOnly = process.env.P2P_ONLY === '1' || process.env.DIRECT_ONLY === '1';
+    if (!forceDirectOnly && !envDirectOnly && turnUrls.length > 0 && turnUsername && turnCredential) {
         iceServers.push({
             urls: turnUrls,
             username: turnUsername,
@@ -82,13 +84,16 @@ function getIceServersFromEnv() {
 }
 
 function handleIceConfig(req, res) {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const directParam = url.searchParams.get('direct');
+    const forceDirectOnly = directParam === '1' || directParam === 'true';
     res.writeHead(200, {
         'Content-Type': 'application/json',
         // avoid caching stale creds; still fine if behind CDN
         'Cache-Control': 'no-store'
     });
     res.end(JSON.stringify({
-        iceServers: getIceServersFromEnv()
+        iceServers: getIceServersFromEnv({ forceDirectOnly })
     }));
 }
 
