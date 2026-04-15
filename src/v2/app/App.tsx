@@ -78,7 +78,7 @@ function App() {
                     */
                     // YES. We must wait for peer-joined to create offer if we are initiator.
                     if (isInitiator) {
-                        const pc = createPeerConnection(room, true);
+                        const pc = await createPeerConnection(room, true);
                         const offer = await pc.createOffer();
                         await pc.setLocalDescription(offer);
                         sendSignal({ type: 'offer', offer, room });
@@ -94,7 +94,7 @@ function App() {
                 } else if (msg.type === 'offer') {
                     if (!isInitiator) {
                         // We are joiner.
-                        createPeerConnection(room, false);
+                        await createPeerConnection(room, false);
                         if (msg.offer) await handleOffer(msg.offer);
                     }
                 } else if (msg.type === 'answer') {

@@ -1,4 +1,4 @@
-import { ICE_SERVERS } from '../config';
+import { getIceServers } from '../config';
 import { sendSignal, getSocket } from './signaling';
 import { setupControlChannel, setupDataChannel } from './dataChannel';
 
@@ -13,7 +13,11 @@ export const registerPCStateCallback = (cb: PCStateCallback) => {
     onStateChange = cb;
 };
 
-export const createPeerConnection = (room: string, isInitiator: boolean) => {
+let iceRestartAttempts = 0;
+const MAX_ICE_RESTARTS = 2;
+const CONNECTING_WATCHDOG_MS = 25000;
+
+export const createPeerConnection = async (room: string, isInitiator: boolean) => {
 
     if (peerConnection) {
         peerConnection.close();
@@ -21,7 +25,9 @@ export const createPeerConnection = (room: string, isInitiator: boolean) => {
 
     currentRoom = room;
 
-    peerConnection = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    iceRestartAttempts = 0;
+    const iceServers = await getIceServers();
+    peerConnection = new RTCPeerConnection({ iceServers });
 
     peerConnection.onicecandidate = (e) => {
         const ws = getSocket();
@@ -30,10 +36,42 @@ export const createPeerConnection = (room: string, isInitiator: boolean) => {
         }
     };
 
+    // Watchdog: prevent infinite "connecting..." hangs on strict NAT/CGNAT.
+    const startConnectingWatchdog = () => {
+        const pc = peerConnection;
+        if (!pc) return;
+
+        setTimeout(async () => {
+            if (peerConnection !== pc) return;
+            if (pc.connectionState === 'connected' || pc.connectionState === 'closed') return;
+            if (pc.connectionState !== 'connecting') return;
+            if (iceRestartAttempts >= MAX_ICE_RESTARTS) return;
+
+            iceRestartAttempts++;
+            try {
+                if (typeof pc.restartIce === 'function') {
+                    pc.restartIce();
+                }
+            } catch { }
+
+            if (isInitiator && currentRoom) {
+                try {
+                    const offer = await pc.createOffer({ iceRestart: true });
+                    await pc.setLocalDescription(offer);
+                    sendSignal({ type: 'offer', offer, room: currentRoom });
+                } catch { }
+            }
+        }, CONNECTING_WATCHDOG_MS);
+    };
+
     peerConnection.onconnectionstatechange = () => {
 
         if (onStateChange && peerConnection) {
             onStateChange(peerConnection.connectionState);
+        }
+
+        if (peerConnection?.connectionState === 'connecting') {
+            startConnectingWatchdog();
         }
     };
 
@@ -95,7 +133,7 @@ async function flushCandidateQueue() {
 
 export const handleOffer = async (offer: RTCSessionDescriptionInit) => {
 
-    if (!peerConnection) createPeerConnection(currentRoom!, false);
+    if (!peerConnection) await createPeerConnection(currentRoom!, false);
     if (!peerConnection) {
 
         return;

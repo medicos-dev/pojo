@@ -48,6 +48,50 @@ function handleHealthCheck(req, res) {
     }));
 }
 
+// ============================================================================
+// ICE CONFIG (for WebRTC NAT traversal)
+// ============================================================================
+// Safe-by-default: if TURN env vars aren't set, clients will just use STUN.
+function getIceServersFromEnv() {
+    const stunUrls = (process.env.STUN_URLS || 'stun:stun.l.google.com:19302')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
+
+    const turnUrls = (process.env.TURN_URLS || '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
+
+    const turnUsername = process.env.TURN_USERNAME;
+    const turnCredential = process.env.TURN_CREDENTIAL;
+
+    const iceServers = [];
+    for (const url of stunUrls) iceServers.push({ urls: url });
+
+    // Only include TURN if it's fully configured
+    if (turnUrls.length > 0 && turnUsername && turnCredential) {
+        iceServers.push({
+            urls: turnUrls,
+            username: turnUsername,
+            credential: turnCredential
+        });
+    }
+
+    return iceServers;
+}
+
+function handleIceConfig(req, res) {
+    res.writeHead(200, {
+        'Content-Type': 'application/json',
+        // avoid caching stale creds; still fine if behind CDN
+        'Cache-Control': 'no-store'
+    });
+    res.end(JSON.stringify({
+        iceServers: getIceServersFromEnv()
+    }));
+}
+
 // Store active rooms and their connections
 const rooms = new Map();
 
@@ -407,6 +451,12 @@ const server = http.createServer(async (req, res) => {
     // Health check endpoint
     if (pathname === '/health' || pathname === '/healthz') {
         handleHealthCheck(req, res);
+        return;
+    }
+
+    // ICE config endpoint (v2/v3 fetch from here)
+    if (pathname === '/ice' && req.method === 'GET') {
+        handleIceConfig(req, res);
         return;
     }
 
