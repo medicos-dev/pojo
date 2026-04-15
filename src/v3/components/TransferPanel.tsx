@@ -197,12 +197,6 @@ export const TransferPanel = ({ roomId, onLeave }: { roomId: string, onLeave: ()
         if (!receiverMeta) return;
 
         setReceiverStatus('receiving');
-        setReceiverProgress({
-            bytesReceived: 0,
-            totalBytes: receiverMeta.size,
-            percent: 0,
-            speedBps: 0
-        });
         receiverRef.current = new FileReceiver(
             receiverMeta,
             (progress) => setReceiverProgress(progress),

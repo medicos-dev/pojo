@@ -1,13 +1,11 @@
-export let CHUNK_SIZE = 256 * 1024; // 256KB default (high compatibility); may be increased safely at runtime
-export const HIGH_WATER_MARK = 32 * 1024 * 1024; // 32MB - higher throughput, still safe
-export const LOW_WATER_MARK = 8 * 1024 * 1024; // 8MB - resume sending threshold
+export let CHUNK_SIZE = 250 * 1024; // 256KB - safe for most browsers
+export const HIGH_WATER_MARK = 4 * 1024 * 1024; // 4MB - safe browser buffer limit
+export const LOW_WATER_MARK = 1 * 1024 * 1024; // 1MB - resume sending threshold
 export const MAX_RAM_MB = 512;
 export const MAX_RAM_BYTES = MAX_RAM_MB * 1024 * 1024;
 
 export const updateChunkSize = (size: number) => {
-    // Clamp to reasonable bounds: min 64KB, max 512KB (safe across browsers / networks)
-    const next = Math.max(64 * 1024, Math.min(size, 512 * 1024));
-    CHUNK_SIZE = next;
+    CHUNK_SIZE = size;
 
 };
 
@@ -57,10 +55,7 @@ export async function getIceServers(): Promise<RTCIceServer[]> {
 
     inflight = (async () => {
         try {
-            const url = new URL(window.location.href);
-            const direct = url.searchParams.get('direct');
-            const iceUrl = direct === '1' || direct === 'true' ? '/ice?direct=1' : '/ice';
-            const res = await fetchWithTimeout(iceUrl, 2000);
+            const res = await fetchWithTimeout('/ice', 2000);
             if (!res.ok) return DEFAULT_ICE_SERVERS;
             const data = await res.json();
             if (!data || !Array.isArray(data.iceServers) || data.iceServers.length === 0) {

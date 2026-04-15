@@ -1,4 +1,4 @@
-import { getIceServers, updateChunkSize } from '../config';
+import { getIceServers } from '../config';
 import { sendSignal, getSocket } from './signaling';
 import { setupControlChannel, setupDataChannel } from './dataChannel';
 
@@ -105,14 +105,6 @@ function createChannels(pc: RTCPeerConnection) {
         ordered: true  // Reliable delivery - critical for large files
     });
     setupDataChannel(dataChannel);
-
-    // Set a safe chunk size once SCTP is available (post-negotiation).
-    dataChannel.addEventListener('open', () => {
-        const sctpMax = pc.sctp?.maxMessageSize;
-        if (typeof sctpMax === 'number' && Number.isFinite(sctpMax) && sctpMax > 4096) {
-            updateChunkSize(Math.floor(sctpMax - 4));
-        }
-    });
 }
 
 export const getPeerConnection = () => peerConnection;
